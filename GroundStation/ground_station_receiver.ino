@@ -158,9 +158,15 @@ void loop() {
       case 'E':
         exportThermalData();  // Export received data as CSV
         break;
+      case 'u': // command for captureThermalImageUART() on satellite
+      case 'U':
+      case 'r': // command for sendViaRadio() on satellite
+      case 'R':
+        forwardToSatellite(cmd);
+        break;
       default:
         if (!autoMode) {
-          Serial.println("Unknown command. Use 'a' for auto mode, 'e' for export");
+          Serial.println("Unknown command. Use 'a' for auto mode, 'e' for export, 'u' to trigger image capture, 'r' to downlink data");
         }
     }
   }
@@ -350,7 +356,7 @@ void runAutoMode() {
   
   // Clear any key press from input buffer
   while (Serial.available()) Serial.read();
-  autoMode = false;  // Exit auto mode
+  autoMode = false;  // Exit auto mode if end packet not received
   
   // Handle different completion scenarios
   if (!imageComplete && !headerReceived) {
@@ -444,3 +450,45 @@ void exportThermalData() {
   Serial.println(" plt.show()");
 }
 
+/**
+ * Forwards commands to the satellite via radio
+ * Since commands are small, we can send them without packetization
+ *
+ * @param cmd Character command to forward ('u' for capture, 'r' for receive)
+ */
+void forwardToSatellite(char cmd) {
+  if (cmd.toLowerCase() == 'u') {
+    Serial.println("\n--- UART THERMAL CAPTURE ---");
+  } else if (cmd.toLowerCase() == 'r') {
+    Serial.println("\n--- REQUESTING THERMAL DATA DOWNLINK ---");
+  } else {
+    return; // Ignore unknown commands
+  }
+
+  Serial.println("Forwarding command to satellite...");
+
+  // Set radio to transmit mode
+  rf23.setModeTx();
+  digitalWrite(31, HIGH); // Turn on LED during transmission
+  delay(10); // Allow time for TX_ON to stabilize   
+
+  // Send the command
+  if (!rf23.send((uint8_t *) &cmd, 1)) { // a command should be a single byte
+    Serial.print("Failed to queue command for transmission: ");
+    Serial.println(cmd);
+  }
+  else {
+    if (!rf23.waitPacketSent(500)) {
+      Serial.print("Failed to send command: ");
+      Serial.println(cmd);
+    } else {
+      Serial.print("Command sent successfully: ");
+      Serial.println(cmd);
+    }
+  }
+
+  digitalWrite(31, LOW); // Turn off LED
+  rf23.setModeRx();  // Return to receive mode
+  return;
+
+}
