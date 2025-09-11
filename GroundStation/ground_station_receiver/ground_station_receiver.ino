@@ -151,24 +151,19 @@ void loop() {
     char cmd = Serial.read();
     while (Serial.available()) Serial.read();  // Clear input buffer
 
-    switch (cmd) {
-    case 'a':
-    case 'A':
+    if (cmd.toLowerCase() == 'a') {
       runAutoMode();  // Start automatic reception mode
-      break;
-    case 'e':
-    case 'E':
+    } else if (cmd.toLowerCase() == 'e') {
       exportThermalData();  // Export received data as CSV
-      break;
-    case 'u': // command for captureThermalImageUART() on satellite
-    case 'U':
-    case 'r': // command for sendViaRadio() on satellite
-    case 'R':
-      forwardToSatellite(cmd);
-      break;
-    default:
+    } else if (cmd.toLowerCase() == 'u' || cmd.toLowerCase() == 'r') {
+      forwardToSatellite(cmd); // Forward command to satellite
+    } else {
       if (!autoMode) {
-        Serial.println("Unknown command. Use 'a' for auto mode, 'e' for export, 'u' for capture, 'r' for receive data");
+        Serial.println("Unknown command. Available commands:");
+        Serial.println("'a' - Run auto reception mode");
+        Serial.println("'u' - Command satellite to capture thermal data");
+        Serial.println("'r' - Request thermal data downlink from satellite");
+        Serial.println("'e' - Export received thermal data as CSV");
       }
     }
   }

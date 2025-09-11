@@ -519,17 +519,15 @@ void listenForCommands() {
     if (rf23.recv(buf, &len)) {
       // Process received command
       char cmd = (char) buf[0];
-      switch (cmd) {
-      case 'u':
-      case 'U':
+
+      if (cmd.toLowerCase() == 'u') {
         captureThermalImageUART();
-        break;
-      case 'r':
-      case 'R':
+      } else if (cmd.toLowerCase() == 'r') {
         sendViaRadio();
-        break;
-      default:
-        Serial.println("Unknown command");
+      }
+      else {
+        Serial.println("Unknown command received via radio");
+        return;
       }
     }
   }
