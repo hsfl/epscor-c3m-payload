@@ -165,7 +165,7 @@ sampleTeensy4.1/
 ## Development
 
 ### Adding New Features
-1. Modify `teensySerial.py` to add new functionality
+1. Modify `teensySerial.py` and `teensy_ground_station.ino` to add new functionality
 2. Test with your specific hardware setup
 
 ### Contributing

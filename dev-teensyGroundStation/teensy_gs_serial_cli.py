@@ -95,7 +95,7 @@ def main():
                 print()  # This ensures we're on a new line after Teensy output
                 user_input = input().strip()
                 
-                if user_input.lower() in ['quit', 'exit', 'q']:
+                if user_input.lower() in ['quit', 'exit']:
                     break
                 
                 if user_input:

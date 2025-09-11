@@ -21,9 +21,9 @@
 #define VERSION_MAJOR 1
 #define VERSION_MINOR 0
 #define VERSION_PATCH 0
-#define VERSION_BUILD "2025-08-05"
+#define VERSION_BUILD "2025-09-10"
 #define VERSION_STRING "1.0.0"
-#define BUILD_INFO "Arduino Ground Station Command Interpreter"
+#define BUILD_INFO "Arduino Teensy 4.1 Ground Station Command Interpreter"
 
 // Command structure definition
 struct Command
@@ -39,6 +39,7 @@ String commandHistory[10];
 int historyIndex = 0;
 bool commandComplete = false;
 bool serialConnected = false;
+bool interruptRequested = false;
 const int RASPBERRY_PI_GPIO_PIN = 36;
 
 // Forward declarations
@@ -48,6 +49,9 @@ void printPrompt();
 void addToHistory(const String &command);
 void showHistory();
 void clearHistory();
+void checkForInterrupt();
+void resetInterrupt();
+bool isInterruptRequested();
 
 // Command function prototypes
 void cmdHelp(const char *args);
@@ -63,6 +67,7 @@ void cmdReset(const char *args);
 void cmdHistory(const char *args);
 void cmdClear(const char *args);
 void cmdRPIControl(const char *args);
+void cmdTestInterrupt(const char *args);
 
 // Command table - easily extensible
 const Command commands[] = {
@@ -78,12 +83,14 @@ const Command commands[] = {
     {"reset", "Reset the system", cmdReset},
     {"history", "Show command history", cmdHistory},
     {"clear", "Clear screen", cmdClear},
-    {"rpi", "Control Raspberry Pi (rpi <on|off|status>)", cmdRPIControl}};
+    {"rpi", "Control Raspberry Pi (rpi <on|off|status>)", cmdRPIControl},
+    {"testint", "Test interrupt functionality (testint <seconds>)", cmdTestInterrupt}};
 
 const int numCommands = sizeof(commands) / sizeof(commands[0]);
 
 void setup()
 {
+    
     // Initialize serial communication
     Serial.begin(115200);
 
@@ -122,6 +129,7 @@ void setup()
     Serial.println("Type 'help' for available commands");
     Serial.println("Type 'version' for detailed version info");
     Serial.println("Type 'clear' to clear the screen");
+    Serial.println("Type 'Q' during command execution to interrupt");
     Serial.println("================================================\n");
 
     printPrompt();
@@ -146,6 +154,9 @@ void loop()
     
     serialConnected = currentlyConnected;
     
+    // Check for interrupt character (Q) at any time
+    checkForInterrupt();
+    
     // Read entire line when available
     if (Serial.available())
     {
@@ -154,6 +165,8 @@ void loop()
         
         if (input.length() > 0)
         {
+            // Reset interrupt flag before processing new command
+            resetInterrupt();
             parseCommand(input);
             addToHistory(input);
             printPrompt();
@@ -243,6 +256,47 @@ void clearHistory()
     historyIndex = 0;
 }
 
+void checkForInterrupt()
+{
+    // Check for interrupt character (Q) without blocking
+    if (Serial.available())
+    {
+        char c = Serial.peek(); // Look at next character without consuming it
+        if (c == 'Q' || c == 'q')
+        {
+            // Consume the interrupt character
+            Serial.read();
+            interruptRequested = true;
+            Serial.println("\n*** INTERRUPT REQUESTED ***");
+            Serial.println("Returning to command prompt...");
+            printPrompt();
+        }
+    }
+}
+
+// Function to check for interrupt during command execution
+bool isInterruptRequested()
+{
+    // Check for Q key during command execution
+    if (Serial.available())
+    {
+        char c = Serial.peek();
+        if (c == 'Q' || c == 'q')
+        {
+            Serial.read(); // Consume the Q
+            interruptRequested = true;
+            Serial.println("\n*** INTERRUPT REQUESTED ***");
+            return true;
+        }
+    }
+    return interruptRequested;
+}
+
+void resetInterrupt()
+{
+    interruptRequested = false;
+}
+
 // Command implementations
 void cmdHelp(const char *args)
 {
@@ -259,6 +313,7 @@ void cmdHelp(const char *args)
 
     Serial.println("\nUsage: command [arguments]");
     Serial.println("Example: led on, analog 0, digital 13 1");
+    Serial.println("\nInterrupt: Press 'Q' during command execution to interrupt and return to prompt");
 }
 
 void cmdVersion(const char *args)
@@ -276,7 +331,7 @@ void cmdVersion(const char *args)
     Serial.println(VERSION_BUILD);
     Serial.print("Arduino Version: ");
     Serial.println(ARDUINO);
-    Serial.print("Board: ");
+    Serial.print("Board: Teensy 4.1");
     Serial.println(F_CPU);
     Serial.println("========================");
 }
@@ -436,7 +491,19 @@ void cmdTime(const char *args)
 void cmdReset(const char *args)
 {
     Serial.println("Resetting system... manually reconnect to serial after 20 seconds.");
-    delay(1000);
+    Serial.println("Press 'Q' to cancel reset within 1 second...");
+    
+    // Check for interrupt during the 1-second delay
+    unsigned long startTime = millis();
+    while (millis() - startTime < 1000)
+    {
+        if (isInterruptRequested())
+        {
+            Serial.println("\nReset cancelled by user!");
+            return;
+        }
+        delay(50);
+    }
 
     // Software reset for Teensy 4.1 (ARM Cortex-M7)
     SCB_AIRCR = 0x05FA0004;
@@ -503,4 +570,56 @@ void cmdRPIControl(const char *args)
     {
         Serial.println("Usage: rpi [on|off|status]");
     }
+}
+
+void cmdTestInterrupt(const char *args)
+{
+    if (strlen(args) == 0)
+    {
+        Serial.println("Usage: testint <seconds>");
+        Serial.println("Example: testint 10 (runs for 10 seconds, press Q to interrupt)");
+        return;
+    }
+
+    int duration = atoi(args);
+    if (duration <= 0 || duration > 60)
+    {
+        Serial.println("Error: Duration must be between 1 and 60 seconds");
+        return;
+    }
+
+    Serial.print("Starting test for ");
+    Serial.print(duration);
+    Serial.println(" seconds...");
+    Serial.println("Press 'Q' at any time to interrupt and return to prompt");
+    
+    unsigned long startTime = millis();
+    unsigned long endTime = startTime + (duration * 1000);
+    
+    while (millis() < endTime)
+    {
+        // Check for interrupt every 100ms
+        if (isInterruptRequested())
+        {
+            Serial.println("\nTest interrupted by user!");
+            return;
+        }
+        
+        // Show progress every second
+        unsigned long elapsed = (millis() - startTime) / 1000;
+        static unsigned long lastPrint = 0;
+        if (elapsed != lastPrint)
+        {
+            Serial.print("Test running... ");
+            Serial.print(elapsed);
+            Serial.print("/");
+            Serial.print(duration);
+            Serial.println(" seconds");
+            lastPrint = elapsed;
+        }
+        
+        delay(100); // Small delay to allow interrupt checking
+    }
+    
+    Serial.println("Test completed successfully!");
 }
