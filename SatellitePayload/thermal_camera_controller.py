@@ -49,7 +49,7 @@ UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
 UART_BAUD = 921600         # High-speed UART to match Teensy baud rate
 
 # Camera Configuration
-MAX_FRAMES = 100           # Number of frames to capture and average
+MAX_FRAMES = 1           # Number of frames to capture and average
 THERMAL_QUEUE_SIZE = 2     # Size of frame queue for thermal data
 thermal_queue = Queue(THERMAL_QUEUE_SIZE)  # Queue for thermal frame data
 

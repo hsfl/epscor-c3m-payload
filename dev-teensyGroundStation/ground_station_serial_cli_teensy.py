@@ -2,6 +2,7 @@
 """
 Simple Serial Port Reader/Writer
 Reads data from serial port and allows user to send commands back
+Enhanced with CSV export detection and thermal data visualization
 """
 
 import serial
@@ -9,9 +10,16 @@ import threading
 import sys
 import time
 import signal
+import os
+import subprocess
+import glob
 from serial.tools import list_ports
 
 BAUD_RATE = 115200
+
+# CSV export detection constants
+CSV_START_MARKER = "=== START CSV ==="
+CSV_END_MARKER = "=== END CSV ==="
 
 def find_serial_port():
     """Find available serial ports"""
@@ -28,8 +36,65 @@ def find_serial_port():
     # If no specific match, return first available port
     return ports[0].device
 
+def get_next_thermal_filename():
+    """Get the next available thermal data filename with incrementing number"""
+    # Look for existing thermal data files
+    existing_files = glob.glob("thermal_data_*.csv")
+    
+    if not existing_files:
+        return "thermal_data_001.csv"
+    
+    # Extract numbers from existing filenames and find the highest
+    max_num = 0
+    for filename in existing_files:
+        try:
+            # Extract number from filename like "thermal_data_001.csv"
+            num_str = filename.split('_')[2].split('.')[0]
+            num = int(num_str)
+            if num > max_num:
+                max_num = num
+        except (IndexError, ValueError):
+            continue
+    
+    # Return next filename with zero-padded number
+    next_num = max_num + 1
+    return f"thermal_data_{next_num:03d}.csv"
+
+def save_thermal_data(csv_data, filename):
+    """Save CSV data to file"""
+    try:
+        with open(filename, 'w') as f:
+            f.write(csv_data)
+        print(f"\n✅ Thermal data saved to: {filename}")
+        return True
+    except Exception as e:
+        print(f"\n❌ Error saving thermal data: {e}")
+        return False
+
+def run_thermal_viewer(filename):
+    """Run the thermal data viewer with the specified file"""
+    try:
+        # Get the directory of the current script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        viewer_script = os.path.join(script_dir, "thermal_data_viewer.py")
+        
+        if not os.path.exists(viewer_script):
+            print(f"❌ Thermal viewer script not found: {viewer_script}")
+            return False
+        
+        # Run the thermal viewer with the filename as argument
+        print(f"🖼️  Opening thermal data viewer for: {filename}")
+        subprocess.Popen([sys.executable, viewer_script, filename])
+        return True
+    except Exception as e:
+        print(f"❌ Error running thermal viewer: {e}")
+        return False
+
 def read_serial(ser, stop_event):
     """Read data from serial port in a separate thread"""
+    csv_capture_mode = False
+    csv_data = []
+    
     while not stop_event.is_set():
         try:
             if ser.in_waiting > 0:
@@ -38,9 +103,40 @@ def read_serial(ser, stop_event):
                     # Print the data as-is, preserving original newlines
                     print(f"Teensy: {data}", end='', flush=True)
                     
+                    # Check for CSV start marker
+                    if CSV_START_MARKER in data:
+                        print(f"\n🎯 CSV export detected! Starting data capture...")
+                        csv_capture_mode = True
+                        csv_data = []
+                        continue
+                    
+                    # Check for CSV end marker
+                    if CSV_END_MARKER in data:
+                        if csv_capture_mode:
+                            print(f"\n🏁 CSV export complete! Processing data...")
+                            csv_capture_mode = False
+                            
+                            # Save the captured data
+                            csv_content = '\n'.join(csv_data)
+                            filename = get_next_thermal_filename()
+                            
+                            if save_thermal_data(csv_content, filename):
+                                # Run the thermal viewer
+                                run_thermal_viewer(filename)
+                            
+                            csv_data = []  # Clear for next capture
+                        continue
+                    
+                    # If in CSV capture mode, collect the data
+                    if csv_capture_mode:
+                        # Remove the "Teensy: " prefix and store clean data
+                        clean_data = data.replace("Teensy: ", "").rstrip('\n\r')
+                        if clean_data:  # Only add non-empty lines
+                            csv_data.append(clean_data)
+                    
                     # Check for reset message
                     if "Resetting system..." in data:
-                        print("\nDetected system reset. Press enter twice to exit.")
+                        print("\nDetected system reset. Press 'Enter' twice to exit.")
                         stop_event.set()
                         # Send SIGINT to interrupt the main thread
                         signal.raise_signal(signal.SIGINT)
