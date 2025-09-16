@@ -48,6 +48,19 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
+// === UART / Framing constants ===
+#define UART_BAUD 115200 // <-- set this to match the Pi; 921600 is fine on Teensy 4.1
+
+const uint8_t UART_MAGIC[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+const uint8_t UART_END[2] = {0xFF, 0xFF};
+
+const uint32_t UART_HEADER_TIMEOUT_MS = 2000;   // 2s to see header
+const uint32_t UART_PAYLOAD_TIMEOUT_MS = 30000; // 30s to receive payload
+const uint32_t UART_END_TIMEOUT_MS = 1000;      // 1s to see end markers
+
+// Simple max for STATUS messages
+const uint16_t MAX_STATUS_LEN = 256;
+
 // Image data storage and tracking
 uint16_t capturedImageLength = 0; // Length of captured thermal image
 
@@ -56,15 +69,15 @@ const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
 uint8_t imgBuf[MAX_IMG];        // Buffer to store thermal image data
 
 // Serial output redirection
-String serialBuffer = "";       // Buffer to accumulate serial output
-bool radioReady = false;        // Flag to indicate if radio is ready for transmission
+String serialBuffer = ""; // Buffer to accumulate serial output
+bool radioReady = false;  // Flag to indicate if radio is ready for transmission
 
 // Radio transmission parameters
 const uint8_t PACKET_DATA_SIZE = 45; // Data payload size per packet
 const uint16_t PACKET_DELAY_MS = 20; // Delay between packet transmissions
 
 // Serial message radio transmission parameters
-const uint8_t SERIAL_MSG_TYPE = 0xAA; // Message type identifier for serial output
+const uint8_t SERIAL_MSG_TYPE = 0xAA;  // Message type identifier for serial output
 const uint8_t MAX_SERIAL_MSG_LEN = 60; // Maximum serial message length per packet
 
 // Define the analog input pins for the temperature sensors and their labels (pulled from Artemis Manual AIN# should be 7 pins)
@@ -95,6 +108,158 @@ const char *currentSensorsLabels[] = {"Solar Panel 1", "Solar Panel 2", "Solar P
 const int numCurrentSensors = 5;
 
 /**
+ * Sends a serial message via radio to ground station
+ *
+ * @param message The message string to send
+ */
+void radioPrint(const String &message)
+{
+  if (!radioReady)
+    return;
+
+  //Keep if debugging 
+  Serial.println(message);
+
+  // Add message to buffer
+  serialBuffer = serialBuffer + "SAT> " + message;
+
+  // Send buffer when it gets long enough or contains newlines
+  if (serialBuffer.length() >= MAX_SERIAL_MSG_LEN || serialBuffer.indexOf('\n') != -1)
+  {
+    Serial.println("buffer long enough, sending it via radioPrint");
+    sendSerialBuffer();
+  }
+}
+
+/**
+ * Sends a serial message with newline via radio to ground station
+ *
+ * @param message The message string to send (optional)
+ */
+void radioPrintln(const String &message = "")
+{
+  radioPrint(message + "\n");
+  sendSerialBuffer(); // Force send after newline
+}
+
+/**
+ * Sends accumulated serial buffer via radio
+ */
+void sendSerialBuffer()
+{
+  Serial.println("Inside serial buffer");
+  if (!radioReady || serialBuffer.length() == 0)
+    return;
+
+  Serial.println("Creating packet");
+  // Create packet: [MSG_TYPE][LENGTH][MESSAGE_DATA]
+  uint8_t packet[MAX_SERIAL_MSG_LEN + 2];
+  packet[0] = SERIAL_MSG_TYPE;
+
+  // Split long messages into chunks
+  while (serialBuffer.length() > 0)
+  {
+    Serial.println("Serial buffer large than zero.");
+    uint8_t chunkSize = min(serialBuffer.length(), (unsigned int)MAX_SERIAL_MSG_LEN);
+    packet[1] = chunkSize;
+
+    // Copy message data
+    for (uint8_t i = 0; i < chunkSize; i++)
+    {
+      packet[2 + i] = serialBuffer.charAt(i);
+    }
+
+    // Send packet
+    if (sendPacketReliable(packet, chunkSize + 2))
+    {
+      // Remove sent chunk from buffer
+      serialBuffer = serialBuffer.substring(chunkSize);
+    }
+    else
+    {
+      // Failed to send, keep buffer for retry
+      break;
+    }
+
+    delay(10); // Small delay between chunks
+  }
+}
+
+/**
+ * Listens for commands from ground station via radio and handles them
+ *
+ */
+void listenForCommands()
+{
+  uint8_t buf[8];
+  uint8_t len = sizeof(buf);
+
+  while (rf23.available())
+  {
+    len = sizeof(buf);
+    if (rf23.recv(buf, &len))
+    {
+      if (len == 0)
+        continue;
+      char cmd = (char)buf[0];
+
+      if (cmd == 'u' || cmd == 'U')
+      {
+        captureThermalImageUART();
+        continue;
+      }
+      else if (cmd == 'r' || cmd == 'R')
+      {
+        sendViaRadio();
+        continue;
+      }
+
+      // Power control: ['p','1'] on, ['p','0'] off, ['p','s'] status
+      if (cmd == 'p' || cmd == 'P')
+      {
+        if (len >= 2)
+        {
+          char sub = (char)buf[1];
+          if (sub == '1')
+          {
+            digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
+            radioPrintln("RPi POWER: ON");
+          }
+          else if (sub == '0')
+          {
+            digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
+            radioPrintln("RPi POWER: OFF");
+          }
+          else if (sub == 's' || sub == 'S')
+          {
+            int state = digitalRead(RPI_ENABLE);
+            radioPrint("RPi POWER STATE: ");
+            radioPrintln(state ? "ON" : "OFF");
+          }
+          else
+          {
+            radioPrintln("RPi POWER: Unknown subcommand");
+          }
+        }
+        else
+        {
+          radioPrintln("RPi POWER: missing arg");
+        }
+        continue;
+      }
+
+      if (cmd == 'g' || cmd == 'G')
+      {
+        radioPrintln("SAT PONG"); // reply back to GS
+        continue;
+      }
+
+      radioPrintln("Unknown command received via radio");
+    }
+  }
+}
+
+/**
  * Setup function - initializes the satellite payload transmitter
  *
  * Configures serial communication, GPIO pins, radio module, and UART
@@ -105,18 +270,24 @@ void setup()
   /* Don't need unless debugging.
    Serial.begin(115200);
     while (!Serial && millis() < 5000); */
-  
+
   // Initialize radio first so we can send setup messages
   initRadio();
-  
+
+  radioPrintln("OUTSIDE initRadio but after inside setup waiting 10 sec");
+
+  delay(10000);
+
   // Send startup message via radio instead of serial
   radioPrintln("\n=== Artemis Cubesat Teensy 4.1 Flat Sat Transmitter ===");
 
-  initTemperatureSensors();
+  delay(10000);
 
-  initCurrentSensors();
+  //initTemperatureSensors();
 
-  //TODO: Implement initPDU
+  //initCurrentSensors();
+
+  // TODO: Implement initPDU
 
   // init the RPI for thermal images
   initRPI();
@@ -125,12 +296,12 @@ void setup()
   delay(5000);
 
   // Perform initial temperature sensor check
-  checkTemperatureSensors();
+  //checkTemperatureSensors();
 
   // Perform initial current sensor check
-  checkCurrentSensors();
+  //checkCurrentSensors();
 
-  //TODO: Implement checkPingPDU to ensure a pong is receivied from PDU
+  // TODO: Implement checkPingPDU to ensure a pong is receivied from PDU
 
   radioPrintln("\nCommands:");
   radioPrintln(" 'u' - UART thermal capture (fast!)");
@@ -429,7 +600,7 @@ void initRPI()
   digitalWrite(TRIGGER_PIN, HIGH);
 
   // Initialize UART for RPi communication
-  Serial2.begin(115200); // High-speed UART for data transfer
+  Serial2.begin(UART_BAUD); // High-speed UART for data transfer
   radioPrintln("RPI UART initialized at 115200 baud");
 }
 /**
@@ -441,7 +612,7 @@ void initRPI()
  */
 void initRadio()
 {
-  radioPrintln("Initializing radio");
+  //radioPrintln("Initializing radio");
 
   // Configure RX/TX control pins
   pinMode(30, OUTPUT);    // RX_ON pin
@@ -461,7 +632,7 @@ void initRadio()
   // Initialize RF22 radio module
   if (!rf23.init())
   {
-    radioPrintln("Radio init failed!");
+    //radioPrintln("Radio init failed!");
     radioReady = false;
     return; // init failed dont setup the rest.
   }
@@ -473,7 +644,7 @@ void initRadio()
   rf23.setModeIdle();                           // Set radio to idle mode
   delay(100);
   radioReady = true;
-  radioPrintln("Radio ready");
+  radioPrintln("INSIDE INIT RADIO: Satellite Radio ready");
 }
 
 /**
@@ -499,6 +670,10 @@ void loop()
 
     switch (cmd)
     {
+    case 'z':
+    case 'Z':
+      radioPrintln("SAT PONG"); // reply back to GS
+      break;
     case 'u':
     case 'U':
       captureThermalImageUART();
@@ -516,11 +691,182 @@ void loop()
       checkCurrentSensors();
       break;
     default:
-      radioPrintln("Unknown command. Use 'u' for capture, 'r' for transmit, 't' for temperature check, 'c' for current check");
+      radioPrintln("Unknown command. Use 'z' for ping, Use 'u' for capture, 'r' for transmit, 't' for temperature check, 'c' for current check");
     }
   }
 }
 
+// Read exactly 'len' bytes from 'port' with a deadline
+bool readExact(HardwareSerial &port, uint8_t *buf, size_t len, uint32_t timeout_ms)
+{
+  uint32_t start = millis();
+  size_t got = 0;
+  while (got < len)
+  {
+    if (millis() - start > timeout_ms)
+      return false;
+    int avail = port.available();
+    if (avail > 0)
+    {
+      size_t toRead = (size_t)avail;
+      size_t needed = len - got;
+      if (toRead > needed)
+        toRead = needed;
+
+      size_t r = port.readBytes(buf + got, toRead);
+      if (r > 0)
+      {
+        got += r;
+      }
+      else
+      {
+        delay(1);
+      }
+    }
+    else
+    {
+      delay(1);
+    }
+  }
+  return true;
+}
+
+// Validate magic
+bool magicOK(const uint8_t *h)
+{
+  return h[0] == UART_MAGIC[0] && h[1] == UART_MAGIC[1] && h[2] == UART_MAGIC[2] && h[3] == UART_MAGIC[3];
+}
+
+// Validate end markers
+bool endOK(const uint8_t *e)
+{
+  return e[0] == UART_END[0] && e[1] == UART_END[1];
+}
+
+// Identify STATUS vs IMAGE by looking for ASCII "STATUS:" prefix
+bool payloadIsStatus(const uint8_t *payload, uint16_t len)
+{
+  const char *prefix = "STATUS:";
+  const size_t L = 7; // includes colon
+  if (len < L)
+    return false;
+  for (size_t i = 0; i < L; ++i)
+  {
+    if ((char)payload[i] != prefix[i])
+      return false;
+  }
+  return true;
+}
+
+// Receive ONE framed message from the Pi into 'dest' (up to destMax)
+// Returns: true on success; writes outLen and sets isStatus accordingly.
+bool recvFramedFromPi(HardwareSerial &port,
+                      uint8_t *dest, uint16_t destMax,
+                      uint16_t &outLen, bool &isStatus)
+{
+  outLen = 0;
+  isStatus = false;
+
+  // 1) Header: 4 magic + 2 length
+  uint8_t header[6];
+  if (!readExact(port, header, 6, UART_HEADER_TIMEOUT_MS))
+  {
+    radioPrintln("ERROR: UART header timeout");
+    return false;
+  }
+  if (!magicOK(header))
+  {
+    radioPrint("ERROR: Bad magic: ");
+    for (int i = 0; i < 4; i++)
+    {
+      radioPrint("0x");
+      radioPrint(String(header[i], HEX));
+      radioPrint(" ");
+    }
+    radioPrintln();
+    return false;
+  }
+
+  uint16_t len = (uint16_t)header[4] | ((uint16_t)header[5] << 8);
+  if (len == 0)
+  {
+    radioPrintln("ERROR: Zero-length payload");
+    return false;
+  }
+
+  if (len > destMax)
+  {
+    radioPrint("ERROR: Payload too large (");
+    radioPrint(String(len));
+    radioPrintln(" bytes) for buffer");
+    // Drain and discard payload + end markers to resync
+    uint8_t dump[64];
+    uint32_t remaining = (uint32_t)len + 2;
+    uint32_t start = millis();
+    while (remaining > 0 && (millis() - start) < UART_PAYLOAD_TIMEOUT_MS)
+    {
+      size_t toRead = (remaining < sizeof(dump)) ? (size_t)remaining : sizeof(dump);
+      size_t r = port.readBytes(dump, toRead);
+      if (r > 0)
+      {
+        remaining -= (uint32_t)r;
+      }
+      else
+      {
+        delay(1);
+      }
+    }
+  }
+
+  // 2) Payload
+  if (!readExact(port, dest, len, UART_PAYLOAD_TIMEOUT_MS))
+  {
+    radioPrintln("ERROR: UART payload timeout");
+    return false;
+  }
+
+  // 3) End markers
+  uint8_t ender[2];
+  if (!readExact(port, ender, 2, UART_END_TIMEOUT_MS))
+  {
+    radioPrintln("ERROR: UART end-marker timeout");
+    return false;
+  }
+  if (!endOK(ender))
+  {
+    radioPrint("ERROR: Bad end markers: 0x");
+    radioPrint(String(ender[0], HEX));
+    radioPrint(" 0x");
+    radioPrintln(String(ender[1], HEX));
+    return false;
+  }
+
+  outLen = len;
+  isStatus = payloadIsStatus(dest, len);
+  return true;
+}
+
+// Pretty-print a STATUS payload (strip "STATUS:")
+void handleStatusPayload(const uint8_t *payload, uint16_t len)
+{
+  const size_t L = 7;
+  String msg;
+  if (len > L)
+  {
+    // copy ASCII into a String safely
+    for (uint16_t i = L; i < len; ++i)
+    {
+      char c = (char)payload[i];
+      if (c == '\r' || c == '\n')
+        continue;
+      msg += c;
+    }
+  }
+  if (msg.length() == 0)
+    msg = "(empty)";
+  radioPrint("RPi STATUS: ");
+  radioPrintln(msg);
+}
 /**
  * Captures thermal image data from Raspberry Pi via UART
  *
@@ -533,175 +879,69 @@ void captureThermalImageUART()
   radioPrintln("\n--- UART THERMAL CAPTURE ---");
   radioPrintln("Triggering RPi capture...");
 
-  // Clear any pending UART data
+  // Clear any pending UART bytes
   while (Serial2.available())
-  {
     Serial2.read();
-  }
 
-  // Send trigger signal to RPi (falling edge)
+  // Trigger pulse (active-low)
   digitalWrite(TRIGGER_PIN, LOW);
   delay(10);
   digitalWrite(TRIGGER_PIN, HIGH);
 
-  radioPrintln("Waiting for RPi processing...");
-  delay(10000); // Wait for RPi to capture and process //TODO get alert from RPI instead of delay.
+  radioPrintln("Waiting for framed message from RPi...");
 
-  radioPrintln("\n--- RECEIVING DATA VIA UART ---");
+  // Receive one framed message (either STATUS or IMAGE)
+  uint16_t rxLen = 0;
+  bool isStatus = false;
 
-  // Wait for data to start arriving with timeout
-  unsigned long timeout = millis() + 20000; // 20 second timeout
-  while (!Serial2.available() && millis() < timeout)
+  if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
   {
-    delay(10);
-  }
-
-  if (!Serial2.available())
-  {
-    radioPrintln("ERROR: No UART data received within timeout!");
+    radioPrintln("ERROR: Failed to receive framed message");
     return;
   }
 
-  radioPrintln("UART data detected, receiving...");
-
-  // Read header (magic bytes + length)
-  uint8_t header[6];
-  size_t headerRead = Serial2.readBytes(header, 6);
-
-  if (headerRead != 6)
+  if (isStatus)
   {
-    radioPrintln("ERROR: Incomplete header received!");
+    // Interpret imgBuf[0..rxLen-1] as ASCII "STATUS:...."
+    handleStatusPayload(imgBuf, rxLen);
+    // Nothing else to do; not an image
     return;
   }
 
-  // Validate magic bytes (0xDE 0xAD 0xBE 0xEF)
-  if (header[0] != 0xDE || header[1] != 0xAD || header[2] != 0xBE || header[3] != 0xEF)
-  {
-    radioPrint("ERROR: Invalid magic bytes: ");
-    for (int i = 0; i < 4; i++)
-    {
-      radioPrint("0x");
-      radioPrint(String(header[i], HEX));
-      radioPrint(" ");
-    }
-    radioPrintln();
-    return;
-  }
+  // Otherwise it's image data
+  capturedImageLength = rxLen;
 
-  radioPrintln("Valid header received!");
-
-  // Extract data length (little-endian format)
-  uint16_t dataLen = header[4] | (header[5] << 8);
-
-  radioPrint("Expected data length: ");
-  radioPrint(String(dataLen));
-  radioPrintln(" bytes");
-
-  if (dataLen == 0 || dataLen > MAX_IMG)
-  {
-    radioPrintln("ERROR: Invalid data length!");
-    return;
-  }
-
-  // Receive image data with progress tracking
-  radioPrintln("Receiving thermal data via UART...");
-  unsigned long startTime = millis();
-  uint16_t totalReceived = 0;
-
-  while (totalReceived < dataLen)
-  {
-    // Check for timeout (30 seconds total)
-    if (millis() - startTime > 30000)
-    {
-      radioPrintln("ERROR: UART receive timeout!");
-      break;
-    }
-
-    // Read available data
-    int available = Serial2.available();
-    if (available > 0)
-    {
-      // Don't read more than we need
-      int toRead = min(available, (int)(dataLen - totalReceived));
-      size_t actualRead = Serial2.readBytes(&imgBuf[totalReceived], toRead);
-      totalReceived += actualRead;
-
-      // Progress update every 2KB
-      if (totalReceived % 2048 == 0 || totalReceived == dataLen)
-      {
-        float progress = (float)totalReceived / dataLen * 100;
-        float elapsed = (millis() - startTime) / 1000.0;
-        float rate = totalReceived / elapsed;
-
-        radioPrint("Progress: ");
-        radioPrint(String(totalReceived));
-        radioPrint("/");
-        radioPrint(String(dataLen));
-        radioPrint(" (");
-        radioPrint(String(progress, 1));
-        radioPrint("%) - ");
-        radioPrint(String(rate, 0));
-        radioPrintln(" bytes/sec");
-      }
-    }
-    else
-    {
-      delay(1); // Small delay if no data available
-    }
-  }
-
-  // Read end markers
-  uint8_t endMarkers[2];
-  Serial2.readBytes(endMarkers, 2);
-
-  float totalTime = (millis() - startTime) / 1000.0;
-
-  radioPrintln("\n--- UART RECEPTION COMPLETE ---");
+  radioPrintln("\n--- UART IMAGE RECEPTION COMPLETE ---");
   radioPrint("Received ");
-  radioPrint(String(totalReceived));
-  radioPrint(" bytes in ");
-  radioPrint(String(totalTime, 2));
-  radioPrintln(" seconds");
+  radioPrint(String(capturedImageLength));
+  radioPrintln(" image bytes");
 
-  radioPrint("Average rate: ");
-  radioPrint(String(totalReceived / totalTime, 0));
-  radioPrintln(" bytes/sec");
-
-  capturedImageLength = totalReceived;
-
-  // Validate thermal data quality
-  if (totalReceived >= 38400)
-  { // Expected thermal image size
+  // Quick quality check (same logic you already had)
+  if (capturedImageLength >= 38400)
+  {
     int validPixels = 0;
-    for (int i = 0; i < totalReceived - 1; i += 2)
+    for (uint32_t i = 0; i + 1 < capturedImageLength; i += 2)
     {
-      uint16_t pixel = imgBuf[i] | (imgBuf[i + 1] << 8);
-      float tempC = (pixel - 27315) / 100.0;
+      uint16_t pixel = imgBuf[i] | (uint16_t(imgBuf[i + 1]) << 8);
+      float tempC = (pixel - 27315) / 100.0f;
       if (tempC >= 0 && tempC <= 60)
-        validPixels++; // Reasonable temperature range
+        validPixels++;
     }
-
-    float validPct = (float)validPixels * 100.0 / (totalReceived / 2);
+    float validPct = (float)validPixels * 100.0f / (capturedImageLength / 2);
     radioPrint("Data quality: ");
     radioPrint(String(validPct, 1));
     radioPrintln("% valid temperature pixels");
 
     if (validPct > 80)
-    {
       radioPrintln("✓ Excellent data quality! Ready for radio transmission - press 'r'");
-    }
     else if (validPct > 50)
-    {
       radioPrintln("⚠️ Moderate data quality - may still be usable");
-    }
     else
-    {
       radioPrintln("❌ Poor data quality detected");
-    }
   }
   else
   {
-    radioPrintln("⚠️ Received data size doesn't match expected thermal image size");
+    radioPrintln("⚠️ Received size smaller than expected for thermal image");
   }
 }
 
@@ -718,6 +958,7 @@ void captureThermalImageUART()
  */
 bool sendPacketReliable(uint8_t *data, uint8_t len)
 {
+  Serial.println("Sending packet reliably now");
   const int MAX_RETRIES = 3;
   for (int retry = 0; retry < MAX_RETRIES; retry++)
   {
@@ -822,7 +1063,8 @@ void sendViaRadio()
 
   while (bytesSent < capturedImageLength)
   {
-    uint16_t chunkSize = min((int)PACKET_DATA_SIZE, capturedImageLength - bytesSent);
+    uint16_t remaining = capturedImageLength - bytesSent;
+    uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
     uint8_t packet[PACKET_DATA_SIZE + 2];
 
     // Packet number (little-endian)
@@ -904,109 +1146,5 @@ void sendViaRadio()
   else
   {
     radioPrintln("\n⚠️ Some packets lost");
-  }
-}
-
-/**
- * Sends a serial message via radio to ground station
- *
- * @param message The message string to send
- */
-void radioPrint(const String &message)
-{
-  if (!radioReady)
-    return;
-
-  // Add message to buffer
-  serialBuffer += message;
-  
-  // Send buffer when it gets long enough or contains newlines
-  if (serialBuffer.length() >= MAX_SERIAL_MSG_LEN || serialBuffer.indexOf('\n') != -1)
-  {
-    sendSerialBuffer();
-  }
-}
-
-/**
- * Sends a serial message with newline via radio to ground station
- *
- * @param message The message string to send (optional)
- */
-void radioPrintln(const String &message = "")
-{
-  radioPrint(message + "\n");
-  sendSerialBuffer(); // Force send after newline
-}
-
-/**
- * Sends accumulated serial buffer via radio
- */
-void sendSerialBuffer()
-{
-  if (!radioReady || serialBuffer.length() == 0)
-    return;
-
-  // Create packet: [MSG_TYPE][LENGTH][MESSAGE_DATA]
-  uint8_t packet[MAX_SERIAL_MSG_LEN + 2];
-  packet[0] = SERIAL_MSG_TYPE;
-  
-  // Split long messages into chunks
-  while (serialBuffer.length() > 0)
-  {
-    uint8_t chunkSize = min(serialBuffer.length(), (unsigned int)MAX_SERIAL_MSG_LEN);
-    packet[1] = chunkSize;
-    
-    // Copy message data
-    for (uint8_t i = 0; i < chunkSize; i++)
-    {
-      packet[2 + i] = serialBuffer.charAt(i);
-    }
-    
-    // Send packet
-    if (sendPacketReliable(packet, chunkSize + 2))
-    {
-      // Remove sent chunk from buffer
-      serialBuffer = serialBuffer.substring(chunkSize);
-    }
-    else
-    {
-      // Failed to send, keep buffer for retry
-      break;
-    }
-    
-    delay(10); // Small delay between chunks
-  }
-}
-
-/**
- * Listens for commands from ground station via radio and handles them
- *
- */
-void listenForCommands()
-{
-  uint8_t buf[1];
-  uint8_t len = sizeof(buf);
-
-  while (rf23.available())
-  {
-    if (rf23.recv(buf, &len))
-    {
-      // Process received command
-      char cmd = (char)buf[0];
-
-      if (cmd.toLowerCase() == 'u')
-      {
-        captureThermalImageUART();
-      }
-      else if (cmd.toLowerCase() == 'r')
-      {
-        sendViaRadio();
-      }
-      else
-      {
-        radioPrintln("Unknown command received via radio");
-        return;
-      }
-    }
   }
 }

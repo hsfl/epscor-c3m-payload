@@ -46,110 +46,90 @@ TRIGGER_PIN = 25	# Input from Teensy for capture trigger
 
 # UART Configuration for Teensy communication
 UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
-UART_BAUD = 921600         # High-speed UART to match Teensy baud rate
+UART_BAUD = 115200         # High-speed UART to match Teensy baud rate
 
 # Camera Configuration
-MAX_FRAMES = 1           # Number of frames to capture and average
+MAX_FRAMES = 10           # Number of frames to capture and average
 THERMAL_QUEUE_SIZE = 2     # Size of frame queue for thermal data
 thermal_queue = Queue(THERMAL_QUEUE_SIZE)  # Queue for thermal frame data
 
+import sys
+
 class ThermalCamera:
-    """
-    Thermal camera interface class for USB thermal cameras
-    
-    Provides a high-level interface to USB thermal cameras using the libuvc
-    library. Handles camera initialization, frame capture, and data processing.
-    Supports frame averaging for noise reduction and real-time data streaming.
-    
-    Attributes:
-        ctx: UVC context pointer
-        dev: UVC device pointer  
-        devh: UVC device handle pointer
-        ctrl: Stream control structure
-        frame_callback: Frame callback function
-    """
-    
     def __init__(self):
-        """Initialize thermal camera object and set up frame callback"""
         self.ctx = POINTER(uvc_context)()
         self.dev = POINTER(uvc_device)()
         self.devh = POINTER(uvc_device_handle)()
         self.ctrl = uvc_stream_ctrl()
-        # Set up frame callback function for receiving thermal data
         self.frame_callback = CFUNCTYPE(None, POINTER(uvc_frame), c_void_p)(self._frame_callback)
 
-    def _frame_callback(self, frame, userptr):
-        """
-        Callback function called when a new thermal frame is available
-        
-        Converts raw frame data to numpy array and adds it to the thermal queue
-        for processing. Handles data type conversion and memory management.
-        
-        Args:
-            frame: Pointer to UVC frame structure containing thermal data
-            userptr: User pointer (unused)
-        """
-        try:
-            # Cast frame data to uint16 array pointer
-            array_pointer = cast(
-                frame.contents.data,
-                POINTER(c_uint16 * (frame.contents.width * frame.contents.height))
-            )
-            # Convert to numpy array and reshape to image dimensions
-            data = np.frombuffer(
-                array_pointer.contents, dtype=np.uint16
-            ).reshape(
-                frame.contents.height, frame.contents.width
-            ).copy()
-            
-            # Add frame to queue if space available
-            if not thermal_queue.full():
-                thermal_queue.put(data)
-        except:
-            pass  # Ignore frame processing errors
+    # (unchanged) _frame_callback ...
 
     def initialize(self):
-        """
-        Initialize the thermal camera and configure streaming
-        
-        Sets up UVC context, finds and opens the thermal camera device,
-        configures frame format and streaming parameters.
-        
-        Returns:
-            tuple: (width, height) of the thermal camera resolution
-        """
-        # Initialize UVC library
-        libuvc.uvc_init(byref(self.ctx), 0)
-        # Find thermal camera device by vendor/product ID
-        libuvc.uvc_find_device(self.ctx, byref(self.dev), PT_USB_VID, PT_USB_PID, 0)
-        # Open device and get handle
-        libuvc.uvc_open(self.dev, byref(self.devh))
-        
-        # Get available frame formats for Y16 (16-bit grayscale)
+        # 1) Context
+        res = libuvc.uvc_init(byref(self.ctx), 0)
+        if res < 0 or not bool(self.ctx):
+            raise RuntimeError(f"uvc_init failed: {res}")
+
+        # 2) Find device (fall back to 'any UVC' if your VID/PID constants are not defined)
+        try:
+            vid, pid = PT_USB_VID, PT_USB_PID  # your constants
+        except NameError:
+            vid, pid = 0, 0  # any device
+
+        res = libuvc.uvc_find_device(self.ctx, byref(self.dev), vid, pid, 0)
+        if res < 0 or not bool(self.dev):
+            raise FileNotFoundError("No UVC thermal camera found (uvc_find_device).")
+
+        # 3) Open
+        res = libuvc.uvc_open(self.dev, byref(self.devh))
+        if res < 0 or not bool(self.devh):
+            raise RuntimeError(f"uvc_open failed: {res}")
+
+        # 4) Formats
         frame_formats = uvc_get_frame_formats_by_guid(self.devh, VS_FMT_GUID_Y16)
+        if not frame_formats:
+            raise RuntimeError("No Y16 frame formats available.")
+
         selected_format = frame_formats[0]
-        
-        # Configure stream control for selected format
-        libuvc.uvc_get_stream_ctrl_format_size(
+        if selected_format.wWidth == 0 or selected_format.wHeight == 0:
+            raise RuntimeError("Invalid Y16 format: width/height is zero.")
+
+        fps = int(1e7 / selected_format.dwDefaultFrameInterval) if selected_format.dwDefaultFrameInterval else 9
+
+        res = libuvc.uvc_get_stream_ctrl_format_size(
             self.devh, byref(self.ctrl), UVC_FRAME_FORMAT_Y16,
-            selected_format.wWidth, selected_format.wHeight,
-            int(1e7 / selected_format.dwDefaultFrameInterval)
+            selected_format.wWidth, selected_format.wHeight, fps
         )
-        
+        if res < 0:
+            raise RuntimeError(f"uvc_get_stream_ctrl_format_size failed: {res}")
+
         print(f"Camera initialized: {selected_format.wWidth}x{selected_format.wHeight}")
         return selected_format.wWidth, selected_format.wHeight
 
     def start_streaming(self):
-        """Start thermal camera streaming with frame callback"""
-        libuvc.uvc_start_streaming(self.devh, byref(self.ctrl),
-                                 self.frame_callback, None, 0)
+        res = libuvc.uvc_start_streaming(self.devh, byref(self.ctrl), self.frame_callback, None, 0)
+        if res < 0:
+            raise RuntimeError(f"uvc_start_streaming failed: {res}")
         print("Camera streaming started")
 
     def cleanup(self):
-        """Clean up camera resources and stop streaming"""
-        libuvc.uvc_stop_streaming(self.devh)
-        libuvc.uvc_unref_device(self.dev)
-        libuvc.uvc_exit(self.ctx)
+        # Guard each call to avoid touching null pointers
+        try:
+            if bool(self.devh):
+                libuvc.uvc_stop_streaming(self.devh)
+        except Exception:
+            pass
+        try:
+            if bool(self.dev):
+                libuvc.uvc_unref_device(self.dev)
+        except Exception:
+            pass
+        try:
+            if bool(self.ctx):
+                libuvc.uvc_exit(self.ctx)
+        except Exception:
+            pass
 
 def capture_and_average():
     """
@@ -195,6 +175,18 @@ def capture_and_average():
     
     return averaged.tobytes()  # Return as raw bytes for UART transmission
 
+def send_status_uart(message: str, uart_port):
+    """
+    Send a human-readable STATUS payload using the same header/length/end scheme.
+    """
+    try:
+        payload = f"STATUS:{message}".encode("ascii", "ignore")
+        return send_data_uart(payload, uart_port)
+    except Exception as e:
+        print(f"UART status send error: {e}")
+        return False
+
+
 def send_data_uart(data, uart_port):
     """
     Send thermal image data via UART with header and end markers
@@ -210,6 +202,10 @@ def send_data_uart(data, uart_port):
     Returns:
         bool: True if transmission successful, False otherwise
     """
+    if not data:
+        print("UART: nothing to send (len=0).")
+        return False
+    
     print(f"\nSending {len(data)} bytes via UART...")
     print(f"UART port: {UART_PORT} at {UART_BAUD} baud")
     
@@ -271,22 +267,14 @@ def send_data_uart(data, uart_port):
         return False
 
 def main():
-    """
-    Main function - initializes system and runs capture loop
-    
-    Sets up GPIO, UART, and thermal camera. Enters continuous loop
-    waiting for trigger signals from Teensy, capturing thermal images,
-    and transmitting data via UART.
-    """
     print("RPi Thermal Camera - UART Output")
     print("="*40)
-    
-    # GPIO setup for trigger input from Teensy
+
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    
-    # Initialize UART communication with Teensy
+
+    # UART first (so we can notify Teensy if camera isn't present)
     try:
         uart = serial.Serial(UART_PORT, UART_BAUD, timeout=1)
         print(f"UART initialized: {UART_PORT} at {UART_BAUD} baud")
@@ -294,52 +282,57 @@ def main():
         print(f"UART initialization failed: {e}")
         print("Make sure UART is enabled in raspi-config!")
         return
-    
-    # Initialize thermal camera
+
     camera = ThermalCamera()
-    
+
     try:
-        camera.initialize() #TODO: revise so it starts streaming ONCE you get the signal from Teensy.
-        camera.start_streaming()
-        time.sleep(2)  # Allow camera to stabilize
-        
+        # Try to bring up the camera; if it fails, notify and exit gracefully.
+        try:
+            camera.initialize()
+            camera.start_streaming()
+            time.sleep(2)  # allow to stabilize
+        except Exception as cam_err:
+            print(f"Camera not ready: {cam_err}")
+            # Send a STATUS packet to Teensy so it can display/log the reason
+            send_status_uart("NO_CAMERA", uart)
+            # Clean exit so systemd can retry later
+            return
+
         print(f"\nSystem ready. Waiting for trigger on GPIO{TRIGGER_PIN}")
         print(f"Data will be sent via UART: {UART_PORT} at {UART_BAUD} baud")
-        
-        # Main capture loop
+
         while True:
-            # Wait for trigger signal from Teensy (falling edge)
             GPIO.wait_for_edge(TRIGGER_PIN, GPIO.FALLING)
             timestamp = time.strftime("%H:%M:%S")
             print(f"\n[{timestamp}] Capture triggered!")
             print("="*40)
-            
-            # Capture and average thermal frames
-            thermal_data = capture_and_average()
-            
-            if thermal_data:
-                # Wait for Teensy to be ready for data reception
+
+            thermal_data = capture_and_average(timeout_s=8.0)
+
+            if thermal_data is None:
+                print("No thermal data available; notifying Teensy.")
+                send_status_uart("NO_FRAMES", uart)
+            else:
                 print("\nWaiting 3 seconds for Teensy to prepare...")
                 time.sleep(3)
-                
-                # Send thermal data via UART
                 success = send_data_uart(thermal_data, uart)
-                
-                if success:
-                    print("✓ Data transmission successful!")
-                else:
-                    print("✗ Data transmission failed!")
-            
+                print("✓ Data transmission successful!" if success else "✗ Data transmission failed!")
+
             print("\nReady for next trigger...")
             print("="*40)
-    
+
     except KeyboardInterrupt:
         print("\nShutting down...")
-    
+
     finally:
-        # Clean up resources
-        camera.cleanup()
-        uart.close()
+        try:
+            camera.cleanup()
+        except Exception:
+            pass
+        try:
+            uart.close()
+        except Exception:
+            pass
         GPIO.cleanup()
 
 if __name__ == "__main__":

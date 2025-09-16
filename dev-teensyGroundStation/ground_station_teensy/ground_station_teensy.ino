@@ -31,9 +31,9 @@
 // Command structure definition
 struct Command
 {
-    const char *name;
-    const char *description;
-    void (*function)(const char *args);
+  const char *name;
+  const char *description;
+  void (*function)(const char *args);
 };
 
 // Radio configuration pins and object
@@ -106,7 +106,7 @@ void forwardToSatellite(char cmd);
 void cmdHelp(const char *args);
 void cmdVersion(const char *args);
 void cmdStatus(const char *args);
-void cmdGSPing(const char *args);
+void cmdPing(const char *args);
 void cmdEcho(const char *args);
 void cmdLed(const char *args);
 void cmdAnalog(const char *args);
@@ -129,7 +129,7 @@ const Command commands[] = {
     {"help", "Show available commands", cmdHelp},
     {"version", "Show GS version information", cmdVersion},
     {"status", "Show system status", cmdStatus},
-    {"ping", "Test GS communication", cmdGSPing},
+    {"ping", "Test communication between GS and Satellite", cmdPing},
     {"echo", "Echo back the arguments", cmdEcho},
     {"led", "Control LED (on/off/toggle)", cmdLed},
     {"analog", "Read analog pin (analog <pin>)", cmdAnalog},
@@ -149,227 +149,153 @@ const Command commands[] = {
 
 const int numCommands = sizeof(commands) / sizeof(commands[0]);
 
-void setup()
+// Helper: send 2-byte packet to satellite ('p', <sub>) and wait for send
+bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeout_ms = 500)
 {
+  digitalWrite(LED_BUILTIN, HIGH);
+  rf23.setModeTx();
+  bool ok = false;
 
-    // Initialize serial communication
-    Serial.begin(115200);
+  if (!rf23.send((uint8_t *)data, len))
+  {
+    Serial.println("Failed to queue radio packet");
+  }
+  else
+  {
+    if (rf23.waitPacketSent(timeout_ms))
+      ok = true;
+    else
+      Serial.println("Timeout waiting for packet send");
+  }
 
-    // Wait for serial port to connect (optional for some boards)
-    while (!Serial)
-    {
-        delay(10);
-    }
-
-    // Mark serial as connected and clear any existing buffer
-    serialConnected = true;
-    inputBuffer = "";
-
-    // Initialize built-in LED to off.
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
-
-    // Configure the Raspberry Pi control pin
-    pinMode(RASPBERRY_PI_GPIO_PIN, OUTPUT);
-    // Set Raspberry Pi to off state initially
-    digitalWrite(RASPBERRY_PI_GPIO_PIN, LOW);
-
-    // Initialize radio module
-    initRadio();
-    
-    // Initialize reception state
-    clearReception();
-
-    // Clear command history
-    clearHistory();
-
-    // Welcome message with version info
-    Serial.println("\n================================================");
-    Serial.println("    Artemis Ground Station Command Interpreter");
-    Serial.println("================================================");
-    Serial.print("GS Version: ");
-    Serial.println(VERSION_STRING);
-    Serial.print("Build Date: ");
-    Serial.println(VERSION_BUILD);
-    Serial.print("Build Info: ");
-    Serial.println(BUILD_INFO);
-    Serial.println("================================================");
-    Serial.println("Type 'help' for available commands");
-    Serial.println("Type 'version' for detailed version info");
-    Serial.println("Type 'clear' to clear the screen");
-    Serial.println("Type 'auto' to start thermal image reception");
-    Serial.println("Type 'Q' during command execution to interrupt");
-    Serial.println("================================================\n");
-
-    printPrompt();
-}
-
-void loop()
-{
-    // Check for serial connection state changes
-    bool currentlyConnected = Serial;
-
-    // Handle serial reconnection
-    if (!serialConnected && currentlyConnected)
-    {
-        Serial.println("\nSerial connection restored.");
-        printPrompt();
-    }
-    // Handle serial disconnection
-    else if (serialConnected && !currentlyConnected)
-    {
-        // Serial disconnected - no action needed
-    }
-
-    serialConnected = currentlyConnected;
-
-    // Check for interrupt character (Q) at any time
-    checkForInterrupt();
-
-    // Check for incoming radio packets (always listen for serial messages)
-    if (rf23.available())
-    {
-        handlePacket();
-    }
-
-    // Read entire line when available
-    if (Serial.available())
-    {
-        String input = Serial.readStringUntil('\n');
-        input.trim(); // Remove whitespace and newlines
-
-        if (input.length() > 0)
-        {
-            // Reset interrupt flag before processing new command
-            resetInterrupt();
-            parseCommand(input);
-            addToHistory(input);
-            printPrompt();
-        }
-    }
+  // small safety gap then go to idle
+  delay(5);
+  digitalWrite(LED_BUILTIN, LOW);
+  rf23.setModeIdle();
+  return ok;
 }
 
 void parseCommand(const String &input)
 {
-    // Trim whitespace
-    String trimmed = input;
-    trimmed.trim();
+  // Trim whitespace
+  String trimmed = input;
+  trimmed.trim();
 
-    if (trimmed.length() == 0)
-    {
-        return;
-    }
+  if (trimmed.length() == 0)
+  {
+    return;
+  }
 
-    // Find space to separate command and arguments
-    int spaceIndex = trimmed.indexOf(' ');
-    String command;
-    String args;
+  // Find space to separate command and arguments
+  int spaceIndex = trimmed.indexOf(' ');
+  String command;
+  String args;
 
-    if (spaceIndex == -1)
-    {
-        command = trimmed;
-        args = "";
-    }
-    else
-    {
-        command = trimmed.substring(0, spaceIndex);
-        args = trimmed.substring(spaceIndex + 1);
-    }
+  if (spaceIndex == -1)
+  {
+    command = trimmed;
+    args = "";
+  }
+  else
+  {
+    command = trimmed.substring(0, spaceIndex);
+    args = trimmed.substring(spaceIndex + 1);
+  }
 
-    // Convert to lowercase for case-insensitive matching
-    command.toLowerCase();
+  // Convert to lowercase for case-insensitive matching
+  command.toLowerCase();
 
-    // Execute the command
-    executeCommand(command.c_str(), args.c_str());
+  // Execute the command
+  executeCommand(command.c_str(), args.c_str());
 }
 
 void executeCommand(const char *cmd, const char *args)
 {
-    // Search for command in command table
-    for (int i = 0; i < numCommands; i++)
+  // Search for command in command table
+  for (int i = 0; i < numCommands; i++)
+  {
+    if (strcmp(cmd, commands[i].name) == 0)
     {
-        if (strcmp(cmd, commands[i].name) == 0)
-        {
-            commands[i].function(args);
-            return;
-        }
+      commands[i].function(args);
+      return;
     }
+  }
 
-    // Command not found
-    Serial.print("Error: Unknown command '");
-    Serial.print(cmd);
-    Serial.println("'");
-    Serial.println("Type 'help' for available commands");
+  // Command not found
+  Serial.print("Error: Unknown command '");
+  Serial.print(cmd);
+  Serial.println("'");
+  Serial.println("Type 'help' for available commands");
 }
 
 void printPrompt()
 {
-    Serial.print("GS> ");
+  Serial.print("GS> ");
 }
 
 void addToHistory(const String &command)
 {
-    // Shift history array
-    for (int i = 9; i > 0; i--)
-    {
-        commandHistory[i] = commandHistory[i - 1];
-    }
-    commandHistory[0] = command;
+  // Shift history array
+  for (int i = 9; i > 0; i--)
+  {
+    commandHistory[i] = commandHistory[i - 1];
+  }
+  commandHistory[0] = command;
 
-    if (historyIndex < 10)
-    {
-        historyIndex++;
-    }
+  if (historyIndex < 10)
+  {
+    historyIndex++;
+  }
 }
 
 void clearHistory()
 {
-    for (int i = 0; i < 10; i++)
-    {
-        commandHistory[i] = "";
-    }
-    historyIndex = 0;
+  for (int i = 0; i < 10; i++)
+  {
+    commandHistory[i] = "";
+  }
+  historyIndex = 0;
 }
 
 void checkForInterrupt()
 {
-    // Check for interrupt character (Q) without blocking
-    if (Serial.available())
+  // Check for interrupt character (Q) without blocking
+  if (Serial.available())
+  {
+    char c = Serial.peek(); // Look at next character without consuming it
+    if (c == 'Q' || c == 'q')
     {
-        char c = Serial.peek(); // Look at next character without consuming it
-        if (c == 'Q' || c == 'q')
-        {
-            // Consume the interrupt character
-            Serial.read();
-            interruptRequested = true;
-            Serial.println("\n*** INTERRUPT REQUESTED ***");
-            Serial.println("Returning to command prompt...");
-            printPrompt();
-        }
+      // Consume the interrupt character
+      Serial.read();
+      interruptRequested = true;
+      Serial.println("\n*** INTERRUPT REQUESTED ***");
+      Serial.println("Returning to command prompt...");
+      printPrompt();
     }
+  }
 }
 
 // Function to check for interrupt during command execution
 bool isInterruptRequested()
 {
-    // Check for Q key during command execution
-    if (Serial.available())
+  // Check for Q key during command execution
+  if (Serial.available())
+  {
+    char c = Serial.peek();
+    if (c == 'Q' || c == 'q')
     {
-        char c = Serial.peek();
-        if (c == 'Q' || c == 'q')
-        {
-            Serial.read(); // Consume the Q
-            interruptRequested = true;
-            Serial.println("\n*** INTERRUPT REQUESTED ***");
-            return true;
-        }
+      Serial.read(); // Consume the Q
+      interruptRequested = true;
+      Serial.println("\n*** INTERRUPT REQUESTED ***");
+      return true;
     }
-    return interruptRequested;
+  }
+  return interruptRequested;
 }
 
 void resetInterrupt()
 {
-    interruptRequested = false;
+  interruptRequested = false;
 }
 
 // Radio function implementations
@@ -428,17 +354,19 @@ void handlePacket()
     lastPacketTime = millis();
     lastRSSI = rf23.lastRssi(); // Store signal strength
     packetsReceived++;
-    processPacket(buf, len); // Process the received packet
-    digitalWrite(LED_BUILTIN, LOW);   // Turn off LED
+    processPacket(buf, len);        // Process the received packet
+    digitalWrite(LED_BUILTIN, LOW); // Turn off LED
   }
 }
 
 void processPacket(uint8_t *buf, uint8_t len)
 {
+  Serial.println("Inside processPacket");
   // Check for serial message packet (MSG_TYPE + LENGTH + MESSAGE_DATA)
   if (len >= 2 && buf[0] == SERIAL_MSG_TYPE)
   {
     handleSerialMessage(buf, len);
+    Serial.println("leaving processPacket");
     return;
   }
 
@@ -466,6 +394,7 @@ void processPacket(uint8_t *buf, uint8_t len)
 
 void handleHeaderPacket(uint8_t *buf)
 {
+  Serial.println("Inside satellite header packet");
   // Extract image size and packet count (little-endian format)
   expectedLength = buf[2] | (buf[3] << 8);
   expectedPackets = buf[4] | (buf[5] << 8);
@@ -495,6 +424,7 @@ void handleHeaderPacket(uint8_t *buf)
 
 void handleEndPacket(uint8_t *buf)
 {
+  Serial.println("Inside satellite end packet");
   uint16_t finalCount = buf[2] | (buf[3] << 8); // Extract final packet count
   Serial.println("\n🏁 END PACKET RECEIVED!");
   Serial.print("Transmitter sent ");
@@ -508,6 +438,7 @@ void handleEndPacket(uint8_t *buf)
 
 void handleDataPacket(uint8_t *buf, uint8_t len)
 {
+  Serial.println("Inside satellite data packet");
   if (len < 3)
     return; // Minimum packet size check
 
@@ -551,11 +482,12 @@ void handleDataPacket(uint8_t *buf, uint8_t len)
 
 void handleSerialMessage(uint8_t *buf, uint8_t len)
 {
+  Serial.println("Inside satellite serial message");
   if (len < 2)
     return; // Minimum packet size check
 
   uint8_t msgLen = buf[1]; // Message length from second byte
-  
+
   if (msgLen == 0 || len < msgLen + 2)
     return; // Invalid message length or packet too short
 
@@ -565,9 +497,9 @@ void handleSerialMessage(uint8_t *buf, uint8_t len)
   {
     message += (char)buf[2 + i];
   }
-  
+
   // Print the message to serial (this is the satellite's serial output)
-  Serial.print(message);
+  Serial.println(message);
 }
 
 void runAutoMode()
@@ -669,7 +601,7 @@ void exportThermalData()
   {
     for (int col = 0; col < 160; col++)
     {
-      int idx = (row * 160 + col) * 2; // 2 bytes per pixel
+      uint32_t idx = (row * 160 + col) * 2; // 2 bytes per pixel
       if (idx < MAX_IMG - 1)
       {
         // Convert raw 16-bit value to temperature in Celsius
@@ -746,407 +678,582 @@ void forwardToSatellite(char cmd)
   }
 
   digitalWrite(LED_BUILTIN, LOW); // Turn off LED
-  rf23.setModeIdle();    // Return to idle mode
+  // rf23.setModeIdle();             // Return to idle mode
   return;
 }
 
 // Command implementations
 void cmdHelp(const char *args)
 {
-    Serial.println("\nAvailable Commands:");
-    Serial.println("==================");
+  Serial.println("\nAvailable Commands:");
+  Serial.println("==================");
 
-    for (int i = 0; i < numCommands; i++)
-    {
-        Serial.print("  ");
-        Serial.print(commands[i].name);
-        Serial.print(" - ");
-        Serial.println(commands[i].description);
-    }
+  for (int i = 0; i < numCommands; i++)
+  {
+    Serial.print("  ");
+    Serial.print(commands[i].name);
+    Serial.print(" - ");
+    Serial.println(commands[i].description);
+  }
 
-    Serial.println("\nUsage: command [arguments]");
-    Serial.println("Example: led on, analog 0, digital 13 1");
-    Serial.println("\nInterrupt: Press 'Q' during command execution to interrupt and return to prompt");
+  Serial.println("\nUsage: command [arguments]");
+  Serial.println("Example: led on, analog 0, digital 13 1");
+  Serial.println("\nInterrupt: Press 'Q' during command execution to interrupt and return to prompt");
 }
 
 void cmdVersion(const char *args)
 {
-    Serial.println("\n=== GS Version Information ===");
-    Serial.print("Software: ");
-    Serial.println(BUILD_INFO);
-    Serial.print("GS Version: ");
-    Serial.print(VERSION_MAJOR);
-    Serial.print(".");
-    Serial.print(VERSION_MINOR);
-    Serial.print(".");
-    Serial.println(VERSION_PATCH);
-    Serial.print("Build Date: ");
-    Serial.println(VERSION_BUILD);
-    Serial.print("GS Arduino Version: ");
-    Serial.println(ARDUINO);
-    Serial.print("Board: Teensy 4.1");
-    Serial.println(F_CPU);
-    Serial.println("========================");
+  Serial.println("\n=== GS Version Information ===");
+  Serial.print("Software: ");
+  Serial.println(BUILD_INFO);
+  Serial.print("GS Version: ");
+  Serial.print(VERSION_MAJOR);
+  Serial.print(".");
+  Serial.print(VERSION_MINOR);
+  Serial.print(".");
+  Serial.println(VERSION_PATCH);
+  Serial.print("Build Date: ");
+  Serial.println(VERSION_BUILD);
+  Serial.print("GS Arduino Version: ");
+  Serial.println(ARDUINO);
+  Serial.print("Board: Teensy 4.1");
+  Serial.println(F_CPU);
+  Serial.println("========================");
 }
 
 void cmdStatus(const char *args)
 {
-    Serial.println("\n=== GS System Status ===");
-    cmdTime(args);
+  Serial.println("\n=== GS System Status ===");
+  cmdTime(args);
 
-    Serial.print("GS LED Status: ");
-    Serial.println(digitalRead(LED_BUILTIN) ? "ON" : "OFF");
+  Serial.print("GS LED Status: ");
+  Serial.println(digitalRead(LED_BUILTIN) ? "ON" : "OFF");
 
-    Serial.print("Commands in history: ");
-    Serial.println(historyIndex);
+  Serial.print("Commands in history: ");
+  Serial.println(historyIndex);
 }
 
-void cmdGSPing(const char *args)
+void cmdPing(const char *args)
 {
-    Serial.println("GS Teensy 4.1: PONG");
+  Serial.println("\nPinging satellite...");
+
+  // --- DRain any stale RX packets so we don't match old messages ---
+  rf23.setModeRx();
+  unsigned long drainStart = millis();
+  while (millis() - drainStart < 50) {
+    uint8_t dump[64]; uint8_t dlen = sizeof(dump);
+    if (!rf23.recv(dump, &dlen)) break;
+  }
+
+  // --- Send single-byte ping ('g') ---
+  uint8_t ping = 'g';
+  if (!sendBytesToSatellite(&ping, 1, 500)) {
+    Serial.println("Failed to send ping to satellite");
+    return;
+  }
+
+  // --- Wait for "SAT PONG" reply (ignore other messages like boot banners) ---
+  const unsigned long WAIT_MS = 3000;
+  rf23.setModeRx();
+  delay(10); // settle into RX
+
+  Serial.println("Waiting for reply...");
+
+  bool gotPong = false;
+  unsigned long start = millis();
+
+  while (!gotPong && (millis() - start) < WAIT_MS) {
+    // wait in small slices so we can ignore unrelated packets and keep listening
+    if (rf23.waitAvailableTimeout(2000)) {
+      Serial.println("Radio received something....");
+      uint8_t buf[64]; uint8_t len = sizeof(buf);
+      if (rf23.recv(buf, &len)) {
+        // Case A: serial-message packet [MSG_TYPE][LENGTH][DATA...]
+        if (len >= 2 && buf[0] == SERIAL_MSG_TYPE) {
+          uint8_t msgLen = buf[1];
+          if (msgLen > 0 && len >= (uint8_t)(msgLen + 2)) {
+            String msg; msg.reserve(msgLen);
+            for (uint8_t i = 0; i < msgLen; ++i) msg += (char)buf[2 + i];
+            msg.trim();
+            if (msg == "SAT PONG") {
+              Serial.print("RX RSSI: "); Serial.println(rf23.lastRssi());
+              Serial.println("✅ Satellite replied: SAT PONG");
+              gotPong = true;
+              break;
+            }
+            // Not the PONG; keep waiting
+          }
+        } else {
+          // Case B: raw ASCII payload
+          String raw; raw.reserve(len);
+          for (uint8_t i = 0; i < len; ++i) raw += (char)buf[i];
+          raw.trim();
+          if (raw.indexOf("SAT PONG") != -1) {
+            Serial.print("RX RSSI: "); Serial.println(rf23.lastRssi());
+            Serial.println("✅ Satellite replied: SAT PONG");
+            gotPong = true;
+            break;
+          }
+          // Not the PONG; keep waiting
+        }
+      }
+    }
+  }
+
+  rf23.setModeIdle();
+
+  if (!gotPong) {
+    Serial.println("❌ No reply from satellite (timeout or non-matching payload)");
+  }
 }
 
 void cmdEcho(const char *args)
 {
-    if (strlen(args) > 0)
-    {
-        Serial.print("Echo: ");
-        Serial.println(args);
-    }
-    else
-    {
-        Serial.println("Usage: echo <message>");
-    }
+  if (strlen(args) > 0)
+  {
+    Serial.print("Echo: ");
+    Serial.println(args);
+  }
+  else
+  {
+    Serial.println("Usage: echo <message>");
+  }
 }
 
 void cmdLed(const char *args)
 {
-    String argStr = String(args);
-    argStr.toLowerCase();
+  String argStr = String(args);
+  argStr.toLowerCase();
 
-    if (argStr == "on")
-    {
-        digitalWrite(LED_BUILTIN, HIGH);
-        Serial.println("LED turned ON");
-    }
-    else if (argStr == "off")
-    {
-        digitalWrite(LED_BUILTIN, LOW);
-        Serial.println("LED turned OFF");
-    }
-    else if (argStr == "toggle")
-    {
-        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-        Serial.print("LED toggled to ");
-        Serial.println(digitalRead(LED_BUILTIN) ? "ON" : "OFF");
-    }
-    else
-    {
-        Serial.println("Usage: led [on|off|toggle]");
-    }
+  if (argStr == "on")
+  {
+    digitalWrite(LED_BUILTIN, HIGH);
+    Serial.println("LED turned ON");
+  }
+  else if (argStr == "off")
+  {
+    digitalWrite(LED_BUILTIN, LOW);
+    Serial.println("LED turned OFF");
+  }
+  else if (argStr == "toggle")
+  {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    Serial.print("LED toggled to ");
+    Serial.println(digitalRead(LED_BUILTIN) ? "ON" : "OFF");
+  }
+  else
+  {
+    Serial.println("Usage: led [on|off|toggle]");
+  }
 }
 
 void cmdAnalog(const char *args)
 {
-    if (strlen(args) == 0)
-    {
-        Serial.println("Usage: analog <pin>");
-        return;
-    }
+  if (strlen(args) == 0)
+  {
+    Serial.println("Usage: analog <pin>");
+    return;
+  }
 
-    int pin = atoi(args);
-    if (pin < 0 || pin > 15)
-    { // Adjust based on your board
-        Serial.println("Error: Invalid pin number (0-15)");
-        return;
-    }
+  int pin = atoi(args);
+  if (pin < 0 || pin > 15)
+  { // Adjust based on your board
+    Serial.println("Error: Invalid pin number (0-15)");
+    return;
+  }
 
-    int value = analogRead(pin);
-    float voltage = (value * 5.0) / 1024.0; // Assuming 5V reference
+  int value = analogRead(pin);
+  float voltage = (value * 5.0) / 1024.0; // Assuming 5V reference
 
-    Serial.print("Analog pin ");
-    Serial.print(pin);
-    Serial.print(": ");
-    Serial.print(value);
-    Serial.print(" (");
-    Serial.print(voltage, 2);
-    Serial.println("V)");
+  Serial.print("Analog pin ");
+  Serial.print(pin);
+  Serial.print(": ");
+  Serial.print(value);
+  Serial.print(" (");
+  Serial.print(voltage, 2);
+  Serial.println("V)");
 }
 
 void cmdDigital(const char *args)
 {
-    String argStr = String(args);
-    int spaceIndex = argStr.indexOf(' ');
+  String argStr = String(args);
+  int spaceIndex = argStr.indexOf(' ');
 
-    if (spaceIndex == -1)
-    {
-        Serial.println("Usage: digital <pin> [value]");
-        return;
-    }
+  if (spaceIndex == -1)
+  {
+    Serial.println("Usage: digital <pin> [value]");
+    return;
+  }
 
-    int pin = argStr.substring(0, spaceIndex).toInt();
-    String valueStr = argStr.substring(spaceIndex + 1);
+  int pin = argStr.substring(0, spaceIndex).toInt();
+  String valueStr = argStr.substring(spaceIndex + 1);
 
-    if (pin < 0 || pin > 13)
-    { // Adjust based on your board
-        Serial.println("Error: Invalid pin number (0-13)");
-        return;
-    }
+  if (pin < 0 || pin > 13)
+  { // Adjust based on your board
+    Serial.println("Error: Invalid pin number (0-13)");
+    return;
+  }
 
-    if (valueStr.length() == 0)
-    {
-        // Read mode
-        pinMode(pin, INPUT);
-        int value = digitalRead(pin);
-        Serial.print("Digital pin ");
-        Serial.print(pin);
-        Serial.print(": ");
-        Serial.println(value ? "HIGH" : "LOW");
-    }
-    else
-    {
-        // Write mode
-        pinMode(pin, OUTPUT);
-        int value = valueStr.toInt();
-        digitalWrite(pin, value);
-        Serial.print("Digital pin ");
-        Serial.print(pin);
-        Serial.print(" set to ");
-        Serial.println(value ? "HIGH" : "LOW");
-    }
+  if (valueStr.length() == 0)
+  {
+    // Read mode
+    pinMode(pin, INPUT);
+    int value = digitalRead(pin);
+    Serial.print("Digital pin ");
+    Serial.print(pin);
+    Serial.print(": ");
+    Serial.println(value ? "HIGH" : "LOW");
+  }
+  else
+  {
+    // Write mode
+    pinMode(pin, OUTPUT);
+    int value = valueStr.toInt();
+    digitalWrite(pin, value);
+    Serial.print("Digital pin ");
+    Serial.print(pin);
+    Serial.print(" set to ");
+    Serial.println(value ? "HIGH" : "LOW");
+  }
 }
 
 void cmdTime(const char *args)
 {
-    unsigned long uptime = millis();
-    unsigned long seconds = uptime / 1000;
-    unsigned long minutes = seconds / 60;
-    unsigned long hours = minutes / 60;
+  unsigned long uptime = millis();
+  unsigned long seconds = uptime / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
 
-    seconds = seconds % 60;
-    minutes = minutes % 60;
+  seconds = seconds % 60;
+  minutes = minutes % 60;
 
-    Serial.print("GS Uptime: ");
-    if (hours > 0)
-    {
-        Serial.print(hours);
-        Serial.print("h ");
-    }
-    if (minutes > 0)
-    {
-        Serial.print(minutes);
-        Serial.print("m ");
-    }
-    Serial.print(seconds);
-    Serial.println("s");
+  Serial.print("GS Uptime: ");
+  if (hours > 0)
+  {
+    Serial.print(hours);
+    Serial.print("h ");
+  }
+  if (minutes > 0)
+  {
+    Serial.print(minutes);
+    Serial.print("m ");
+  }
+  Serial.print(seconds);
+  Serial.println("s");
 }
 
 void cmdReset(const char *args)
 {
-    Serial.println("Resetting GS system... manually reconnect to serial after 20 seconds.");
-    Serial.println("Press 'Q' to cancel reset within 1 second...");
+  Serial.println("Resetting GS system... manually reconnect to serial after 20 seconds.");
+  Serial.println("Press 'Q' to cancel reset within 1 second...");
 
-    // Check for interrupt during the 1-second delay
-    unsigned long startTime = millis();
-    while (millis() - startTime < 1000)
+  // Check for interrupt during the 1-second delay
+  unsigned long startTime = millis();
+  while (millis() - startTime < 1000)
+  {
+    if (isInterruptRequested())
     {
-        if (isInterruptRequested())
-        {
-            Serial.println("\nReset cancelled by user!");
-            return;
-        }
-        delay(50);
+      Serial.println("\nReset cancelled by user!");
+      return;
     }
+    delay(50);
+  }
 
-    // Software reset for Teensy 4.1 (ARM Cortex-M7)
-    SCB_AIRCR = 0x05FA0004;
+  // Software reset for Teensy 4.1 (ARM Cortex-M7)
+  SCB_AIRCR = 0x05FA0004;
 }
 
 void cmdHistory(const char *args)
 {
-    Serial.println("\nGS Command History:");
-    Serial.println("================");
+  Serial.println("\nGS Command History:");
+  Serial.println("================");
 
-    for (int i = 0; i < historyIndex && i < 10; i++)
-    {
-        Serial.print(i + 1);
-        Serial.print(": ");
-        Serial.println(commandHistory[i]);
-    }
+  for (int i = 0; i < historyIndex && i < 10; i++)
+  {
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(commandHistory[i]);
+  }
 
-    if (historyIndex == 0)
-    {
-        Serial.println("No commands in history");
-    }
+  if (historyIndex == 0)
+  {
+    Serial.println("No commands in history");
+  }
 }
 
 void cmdClear(const char *args)
 {
-    // Clear screen by printing newlines
-    for (int i = 0; i < 50; i++)
-    {
-        Serial.println();
-    }
+  // Clear screen by printing newlines
+  for (int i = 0; i < 50; i++)
+  {
+    Serial.println();
+  }
 
-    // Re-print welcome message with version
-    Serial.println("================================================");
-    Serial.println("    Artemis Ground Station Command Interpreter");
-    Serial.println("================================================");
-    Serial.print("GS Version: ");
-    Serial.println(VERSION_STRING);
-    Serial.print("Build Date: ");
-    Serial.println(VERSION_BUILD);
-    Serial.println("================================================\n");
+  // Re-print welcome message with version
+  Serial.println("================================================");
+  Serial.println("    Artemis Ground Station Command Interpreter");
+  Serial.println("================================================");
+  Serial.print("GS Version: ");
+  Serial.println(VERSION_STRING);
+  Serial.print("Build Date: ");
+  Serial.println(VERSION_BUILD);
+  Serial.println("================================================\n");
 }
 
 void cmdRPIControl(const char *args)
 {
-    String argStr = String(args);
-    argStr.toLowerCase();
+  String argStr = String(args);
+  argStr.trim();
+  argStr.toLowerCase();
 
+  if (argStr == "on" || argStr == "off" || argStr == "status")
+  {
+    uint8_t packet[2];
+    packet[0] = 'p';
     if (argStr == "on")
-    {
-        digitalWrite(RASPBERRY_PI_GPIO_PIN, HIGH);
-        Serial.println("RPI turned ON");
-    }
+      packet[1] = '1';
     else if (argStr == "off")
-    {
-        digitalWrite(RASPBERRY_PI_GPIO_PIN, LOW);
-        Serial.println("RPI turned OFF");
-    }
-    else if (argStr == "status")
-    {
-        Serial.print("RPI Status: ");
-        Serial.println(digitalRead(RASPBERRY_PI_GPIO_PIN));
-    }
+      packet[1] = '0';
+    else // status
+      packet[1] = 's';
+
+    Serial.print("Forwarding RPI command to satellite: rpi ");
+    Serial.println(argStr);
+
+    if (sendBytesToSatellite(packet, 2))
+      Serial.println("Command forwarded");
     else
-    {
-        Serial.println("Usage: rpi [on|off|status]");
-    }
+      Serial.println("Failed to forward command");
+    return;
+  }
+
+  // fallback usage
+  Serial.println("Usage: rpi [on|off|status]");
 }
 
 void cmdTestInterrupt(const char *args)
 {
-    if (strlen(args) == 0)
+  if (strlen(args) == 0)
+  {
+    Serial.println("Usage: testint <seconds>");
+    Serial.println("Example: testint 10 (runs for 10 seconds, press Q to interrupt)");
+    return;
+  }
+
+  int duration = atoi(args);
+  if (duration <= 0 || duration > 60)
+  {
+    Serial.println("Error: Duration must be between 1 and 60 seconds");
+    return;
+  }
+
+  Serial.print("Starting test for ");
+  Serial.print(duration);
+  Serial.println(" seconds...");
+  Serial.println("Press 'Q' at any time to interrupt and return to prompt");
+
+  unsigned long startTime = millis();
+  unsigned long endTime = startTime + (duration * 1000);
+
+  while (millis() < endTime)
+  {
+    // Check for interrupt every 100ms
+    if (isInterruptRequested())
     {
-        Serial.println("Usage: testint <seconds>");
-        Serial.println("Example: testint 10 (runs for 10 seconds, press Q to interrupt)");
-        return;
+      Serial.println("\nTest interrupted by user!");
+      return;
     }
 
-    int duration = atoi(args);
-    if (duration <= 0 || duration > 60)
+    // Show progress every second
+    unsigned long elapsed = (millis() - startTime) / 1000;
+    static unsigned long lastPrint = 0;
+    if (elapsed != lastPrint)
     {
-        Serial.println("Error: Duration must be between 1 and 60 seconds");
-        return;
+      Serial.print("Test running... ");
+      Serial.print(elapsed);
+      Serial.print("/");
+      Serial.print(duration);
+      Serial.println(" seconds");
+      lastPrint = elapsed;
     }
 
-    Serial.print("Starting test for ");
-    Serial.print(duration);
-    Serial.println(" seconds...");
-    Serial.println("Press 'Q' at any time to interrupt and return to prompt");
+    delay(100); // Small delay to allow interrupt checking
+  }
 
-    unsigned long startTime = millis();
-    unsigned long endTime = startTime + (duration * 1000);
-
-    while (millis() < endTime)
-    {
-        // Check for interrupt every 100ms
-        if (isInterruptRequested())
-        {
-            Serial.println("\nTest interrupted by user!");
-            return;
-        }
-
-        // Show progress every second
-        unsigned long elapsed = (millis() - startTime) / 1000;
-        static unsigned long lastPrint = 0;
-        if (elapsed != lastPrint)
-        {
-            Serial.print("Test running... ");
-            Serial.print(elapsed);
-            Serial.print("/");
-            Serial.print(duration);
-            Serial.println(" seconds");
-            lastPrint = elapsed;
-        }
-
-        delay(100); // Small delay to allow interrupt checking
-    }
-
-    Serial.println("Test completed successfully!");
+  Serial.println("Test completed successfully!");
 }
 
 // Radio command implementations
 void cmdRadio(const char *args)
 {
-    String argStr = String(args);
-    argStr.toLowerCase();
+  String argStr = String(args);
+  argStr.toLowerCase();
 
-    if (argStr == "init")
+  if (argStr == "init")
+  {
+    initRadio();
+  }
+  else if (argStr == "status")
+  {
+    Serial.println("\n=== RADIO STATUS ===");
+    Serial.print("Frequency: 433.0 MHz");
+    Serial.println();
+    Serial.print("Last RSSI: ");
+    Serial.println(lastRSSI);
+    Serial.print("Packets received: ");
+    Serial.println(packetsReceived);
+    Serial.print("Auto mode: ");
+    Serial.println(autoMode ? "ON" : "OFF");
+    Serial.print("Header received: ");
+    Serial.println(headerReceived ? "YES" : "NO");
+    Serial.print("Image complete: ");
+    Serial.println(imageComplete ? "YES" : "NO");
+    if (headerReceived)
     {
-        initRadio();
+      Serial.print("Expected packets: ");
+      Serial.println(expectedPackets);
+      Serial.print("Received packets: ");
+      Serial.println(receivedPackets);
     }
-    else if (argStr == "status")
-    {
-        Serial.println("\n=== RADIO STATUS ===");
-        Serial.print("Frequency: 433.0 MHz");
-        Serial.println();
-        Serial.print("Last RSSI: ");
-        Serial.println(lastRSSI);
-        Serial.print("Packets received: ");
-        Serial.println(packetsReceived);
-        Serial.print("Auto mode: ");
-        Serial.println(autoMode ? "ON" : "OFF");
-        Serial.print("Header received: ");
-        Serial.println(headerReceived ? "YES" : "NO");
-        Serial.print("Image complete: ");
-        Serial.println(imageComplete ? "YES" : "NO");
-        if (headerReceived)
-        {
-            Serial.print("Expected packets: ");
-            Serial.println(expectedPackets);
-            Serial.print("Received packets: ");
-            Serial.println(receivedPackets);
-        }
-    }
-    else if (argStr == "tx")
-    {
-        rf23.setModeTx();
-        Serial.println("Radio set to transmit mode");
-    }
-    else if (argStr == "rx")
-    {
-        rf23.setModeRx();
-        Serial.println("Radio set to receive mode");
-    }
-    else
-    {
-        Serial.println("Usage: radio [init|status|tx|rx]");
-    }
+  }
+  else if (argStr == "tx")
+  {
+    rf23.setModeTx();
+    Serial.println("Radio set to transmit mode");
+  }
+  else if (argStr == "rx")
+  {
+    rf23.setModeRx();
+    Serial.println("Radio set to receive mode");
+  }
+  else
+  {
+    Serial.println("Usage: radio [init|status|tx|rx]");
+  }
 }
 
 void cmdAutoMode(const char *args)
 {
-    runAutoMode();
+  runAutoMode();
 }
 
 void cmdExport(const char *args)
 {
-    exportThermalData();
+  exportThermalData();
 }
 
 void cmdCapture(const char *args)
 {
-    forwardToSatellite('u');
+  forwardToSatellite('u');
 }
 
 void cmdRequest(const char *args)
 {
-    forwardToSatellite('r');
+  forwardToSatellite('r');
 }
 
 void cmdRadioStatus(const char *args)
 {
-    showReceptionSummary();
+  showReceptionSummary();
+}
+
+void setup()
+{
+
+  // Initialize serial communication
+  Serial.begin(115200);
+
+  // Wait for serial port to connect (optional for some boards)
+  while (!Serial)
+  {
+    delay(10);
+  }
+
+  // Mark serial as connected and clear any existing buffer
+  serialConnected = true;
+  inputBuffer = "";
+
+  // Initialize built-in LED to off.
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // Configure the Raspberry Pi control pin
+  pinMode(RASPBERRY_PI_GPIO_PIN, OUTPUT);
+  // Set Raspberry Pi to off state initially
+  digitalWrite(RASPBERRY_PI_GPIO_PIN, LOW);
+
+  // Initialize radio module
+  initRadio();
+
+  // Initialize reception state
+  clearReception();
+
+  // Clear command history
+  clearHistory();
+
+  // Welcome message with version info
+  Serial.println("\n================================================");
+  Serial.println("    Artemis Ground Station Command Interpreter");
+  Serial.println("================================================");
+  Serial.print("GS Version: ");
+  Serial.println(VERSION_STRING);
+  Serial.print("Build Date: ");
+  Serial.println(VERSION_BUILD);
+  Serial.print("Build Info: ");
+  Serial.println(BUILD_INFO);
+  Serial.println("================================================");
+  Serial.println("Type 'help' for available commands");
+  Serial.println("Type 'version' for detailed version info");
+  Serial.println("Type 'clear' to clear the screen");
+  Serial.println("Type 'auto' to start thermal image reception");
+  Serial.println("Type 'Q' during command execution to interrupt");
+  Serial.println("================================================\n");
+
+  printPrompt();
+}
+
+void loop()
+{
+  // Check for serial connection state changes
+  bool currentlyConnected = Serial;
+
+  // Handle serial reconnection
+  if (!serialConnected && currentlyConnected)
+  {
+    Serial.println("\nSerial connection restored.");
+    printPrompt();
+  }
+  // Handle serial disconnection
+  else if (serialConnected && !currentlyConnected)
+  {
+    // Serial disconnected - no action needed
+  }
+
+  serialConnected = currentlyConnected;
+
+  // Check for interrupt character (Q) at any time
+  checkForInterrupt();
+
+  // Check for incoming radio packets (always listen for serial messages)
+  if (rf23.available())
+  {
+    Serial.println("Handling packet FROM LOOP METHOD");
+    handlePacket();
+  }
+
+  // Read entire line when available
+  if (Serial.available())
+  {
+    String input = Serial.readStringUntil('\n');
+    input.trim(); // Remove whitespace and newlines
+
+    if (input.length() > 0)
+    {
+      // Reset interrupt flag before processing new command
+      resetInterrupt();
+      parseCommand(input);
+      addToHistory(input);
+      printPrompt();
+    }
+  }
 }
