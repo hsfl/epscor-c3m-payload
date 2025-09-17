@@ -101,7 +101,7 @@ def read_serial(ser, stop_event):
                 data = ser.readline().decode('utf-8', errors='ignore')
                 if data:
                     # Print the data as-is, preserving original newlines
-                    print(f"Teensy: {data}", end='', flush=True)
+                    print(f"{data}", end='', flush=True)
                     
                     # Check for CSV start marker
                     if CSV_START_MARKER in data:

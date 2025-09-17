@@ -361,12 +361,12 @@ void handlePacket()
 
 void processPacket(uint8_t *buf, uint8_t len)
 {
-  Serial.println("Inside processPacket");
-  // Check for serial message packet (MSG_TYPE + LENGTH + MESSAGE_DATA)
+  // Serial.println("Inside processPacket");
+  //  Check for serial message packet (MSG_TYPE + LENGTH + MESSAGE_DATA)
   if (len >= 2 && buf[0] == SERIAL_MSG_TYPE)
   {
     handleSerialMessage(buf, len);
-    Serial.println("leaving processPacket");
+    // Serial.println("leaving processPacket");
     return;
   }
 
@@ -394,8 +394,8 @@ void processPacket(uint8_t *buf, uint8_t len)
 
 void handleHeaderPacket(uint8_t *buf)
 {
-  Serial.println("Inside satellite header packet");
-  // Extract image size and packet count (little-endian format)
+  // Serial.println("Inside satellite header packet");
+  //  Extract image size and packet count (little-endian format)
   expectedLength = buf[2] | (buf[3] << 8);
   expectedPackets = buf[4] | (buf[5] << 8);
 
@@ -424,7 +424,7 @@ void handleHeaderPacket(uint8_t *buf)
 
 void handleEndPacket(uint8_t *buf)
 {
-  Serial.println("Inside satellite end packet");
+  // Serial.println("Inside satellite end packet");
   uint16_t finalCount = buf[2] | (buf[3] << 8); // Extract final packet count
   Serial.println("\n🏁 END PACKET RECEIVED!");
   Serial.print("Transmitter sent ");
@@ -438,7 +438,7 @@ void handleEndPacket(uint8_t *buf)
 
 void handleDataPacket(uint8_t *buf, uint8_t len)
 {
-  Serial.println("Inside satellite data packet");
+  // Serial.println("Inside satellite data packet");
   if (len < 3)
     return; // Minimum packet size check
 
@@ -482,7 +482,7 @@ void handleDataPacket(uint8_t *buf, uint8_t len)
 
 void handleSerialMessage(uint8_t *buf, uint8_t len)
 {
-  Serial.println("Inside satellite serial message");
+  // Serial.println("Inside satellite serial message");
   if (len < 2)
     return; // Minimum packet size check
 
@@ -737,17 +737,10 @@ void cmdPing(const char *args)
 {
   Serial.println("\nPinging satellite...");
 
-  // --- DRain any stale RX packets so we don't match old messages ---
-  rf23.setModeRx();
-  unsigned long drainStart = millis();
-  while (millis() - drainStart < 50) {
-    uint8_t dump[64]; uint8_t dlen = sizeof(dump);
-    if (!rf23.recv(dump, &dlen)) break;
-  }
-
   // --- Send single-byte ping ('g') ---
   uint8_t ping = 'g';
-  if (!sendBytesToSatellite(&ping, 1, 500)) {
+  if (!sendBytesToSatellite(&ping, 1, 500))
+  {
     Serial.println("Failed to send ping to satellite");
     return;
   }
@@ -762,39 +755,30 @@ void cmdPing(const char *args)
   bool gotPong = false;
   unsigned long start = millis();
 
-  while (!gotPong && (millis() - start) < WAIT_MS) {
+  while (!gotPong && (millis() - start) < WAIT_MS)
+  {
     // wait in small slices so we can ignore unrelated packets and keep listening
-    if (rf23.waitAvailableTimeout(2000)) {
+    if (rf23.waitAvailableTimeout(50))
+    {
       Serial.println("Radio received something....");
-      uint8_t buf[64]; uint8_t len = sizeof(buf);
-      if (rf23.recv(buf, &len)) {
+      uint8_t buf[64];
+      uint8_t len = sizeof(buf);
+      if (rf23.recv(buf, &len))
+      {
         // Case A: serial-message packet [MSG_TYPE][LENGTH][DATA...]
-        if (len >= 2 && buf[0] == SERIAL_MSG_TYPE) {
-          uint8_t msgLen = buf[1];
-          if (msgLen > 0 && len >= (uint8_t)(msgLen + 2)) {
-            String msg; msg.reserve(msgLen);
-            for (uint8_t i = 0; i < msgLen; ++i) msg += (char)buf[2 + i];
-            msg.trim();
-            if (msg == "SAT PONG") {
-              Serial.print("RX RSSI: "); Serial.println(rf23.lastRssi());
-              Serial.println("✅ Satellite replied: SAT PONG");
-              gotPong = true;
-              break;
-            }
-            // Not the PONG; keep waiting
-          }
-        } else {
-          // Case B: raw ASCII payload
-          String raw; raw.reserve(len);
-          for (uint8_t i = 0; i < len; ++i) raw += (char)buf[i];
-          raw.trim();
-          if (raw.indexOf("SAT PONG") != -1) {
-            Serial.print("RX RSSI: "); Serial.println(rf23.lastRssi());
-            Serial.println("✅ Satellite replied: SAT PONG");
-            gotPong = true;
-            break;
-          }
-          // Not the PONG; keep waiting
+
+        handleSerialMessage(buf, len);
+
+        // Extract message data and print to serial
+        String message = "";
+        for (uint8_t i = 0; i < len; i++)
+        {
+          message += (char)buf[2 + i];
+        }
+
+        if(message.indexOf("pong") != -1) {
+          gotPong = true;
+          Serial.println("pong acquired from satellite ✅");
         }
       }
     }
@@ -802,7 +786,8 @@ void cmdPing(const char *args)
 
   rf23.setModeIdle();
 
-  if (!gotPong) {
+  if (!gotPong)
+  {
     Serial.println("❌ No reply from satellite (timeout or non-matching payload)");
   }
 }
@@ -1237,7 +1222,6 @@ void loop()
   // Check for incoming radio packets (always listen for serial messages)
   if (rf23.available())
   {
-    Serial.println("Handling packet FROM LOOP METHOD");
     handlePacket();
   }
 

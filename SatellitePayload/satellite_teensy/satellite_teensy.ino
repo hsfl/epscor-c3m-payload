@@ -78,7 +78,7 @@ const uint16_t PACKET_DELAY_MS = 20; // Delay between packet transmissions
 
 // Serial message radio transmission parameters
 const uint8_t SERIAL_MSG_TYPE = 0xAA;  // Message type identifier for serial output
-const uint8_t MAX_SERIAL_MSG_LEN = 60; // Maximum serial message length per packet
+const uint8_t MAX_SERIAL_MSG_LEN = 45; // Maximum serial message length per packet
 
 // Define the analog input pins for the temperature sensors and their labels (pulled from Artemis Manual AIN# should be 7 pins)
 const int temperatureSensorPins[] = {14, 15, 41, 20, 21, 22, 23};
@@ -126,7 +126,6 @@ void radioPrint(const String &message)
   // Send buffer when it gets long enough or contains newlines
   if (serialBuffer.length() >= MAX_SERIAL_MSG_LEN || serialBuffer.indexOf('\n') != -1)
   {
-    Serial.println("buffer long enough, sending it via radioPrint");
     sendSerialBuffer();
   }
 }
@@ -147,11 +146,9 @@ void radioPrintln(const String &message = "")
  */
 void sendSerialBuffer()
 {
-  Serial.println("Inside serial buffer");
   if (!radioReady || serialBuffer.length() == 0)
     return;
 
-  Serial.println("Creating packet");
   // Create packet: [MSG_TYPE][LENGTH][MESSAGE_DATA]
   uint8_t packet[MAX_SERIAL_MSG_LEN + 2];
   packet[0] = SERIAL_MSG_TYPE;
@@ -159,7 +156,6 @@ void sendSerialBuffer()
   // Split long messages into chunks
   while (serialBuffer.length() > 0)
   {
-    Serial.println("Serial buffer large than zero.");
     uint8_t chunkSize = min(serialBuffer.length(), (unsigned int)MAX_SERIAL_MSG_LEN);
     packet[1] = chunkSize;
 
@@ -191,12 +187,11 @@ void sendSerialBuffer()
  */
 void listenForCommands()
 {
-  uint8_t buf[8];
+  uint8_t buf[50];
   uint8_t len = sizeof(buf);
 
   while (rf23.available())
   {
-    len = sizeof(buf);
     if (rf23.recv(buf, &len))
     {
       if (len == 0)
@@ -233,24 +228,24 @@ void listenForCommands()
           else if (sub == 's' || sub == 'S')
           {
             int state = digitalRead(RPI_ENABLE);
-            radioPrint("RPi POWER STATE: ");
+            radioPrint("RPI POWER STATE: ");
             radioPrintln(state ? "ON" : "OFF");
           }
           else
           {
-            radioPrintln("RPi POWER: Unknown subcommand");
+            radioPrintln("RPI POWER: Unknown subcommand");
           }
         }
         else
         {
-          radioPrintln("RPi POWER: missing arg");
+          radioPrintln("RPI POWER: missing arg");
         }
         continue;
       }
 
       if (cmd == 'g' || cmd == 'G')
       {
-        radioPrintln("SAT PONG"); // reply back to GS
+        radioPrintln("pong from satellite"); // reply back to GS
         continue;
       }
 
@@ -274,14 +269,8 @@ void setup()
   // Initialize radio first so we can send setup messages
   initRadio();
 
-  radioPrintln("OUTSIDE initRadio but after inside setup waiting 10 sec");
-
-  delay(10000);
-
   // Send startup message via radio instead of serial
   radioPrintln("\n=== Artemis Cubesat Teensy 4.1 Flat Sat Transmitter ===");
-
-  delay(10000);
 
   //initTemperatureSensors();
 
@@ -644,7 +633,6 @@ void initRadio()
   rf23.setModeIdle();                           // Set radio to idle mode
   delay(100);
   radioReady = true;
-  radioPrintln("INSIDE INIT RADIO: Satellite Radio ready");
 }
 
 /**
@@ -672,7 +660,7 @@ void loop()
     {
     case 'z':
     case 'Z':
-      radioPrintln("SAT PONG"); // reply back to GS
+      radioPrintln("pong from satellite"); // reply back to GS
       break;
     case 'u':
     case 'U':
@@ -958,7 +946,12 @@ void captureThermalImageUART()
  */
 bool sendPacketReliable(uint8_t *data, uint8_t len)
 {
-  Serial.println("Sending packet reliably now");
+  if(len == 0 || len > rf23.maxMessageLength()) {
+    Serial.println("Invalid message length: " + len);
+    //TODO should probably send a message to gs or log somewhere the packet was too big to send?
+    return false;
+  }
+  
   const int MAX_RETRIES = 3;
   for (int retry = 0; retry < MAX_RETRIES; retry++)
   {
@@ -976,6 +969,7 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
       if (rf23.waitPacketSent(500))
       {
         digitalWrite(LED_PIN, LOW); // Turn off LED
+        rf23.setModeIdle();
         return true;
       }
     }
@@ -986,6 +980,7 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
       delay(50); // Delay before retry
     }
   }
+  rf23.setModeIdle();
   return false;
 }
 
