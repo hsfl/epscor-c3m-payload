@@ -66,7 +66,8 @@ bool autoMode = false;
 const uint8_t PACKET_DATA_SIZE = 45; // Data payload size per packet
 
 // Serial message radio reception parameters
-const uint8_t SERIAL_MSG_TYPE = 0xAA; // Message type identifier for serial output
+const uint8_t SERIAL_MSG_TYPE = 0xAA;        // Message type identifier for serial output
+const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
 // Global variables
 String inputBuffer = "";
@@ -486,7 +487,9 @@ void handleSerialMessage(uint8_t *buf, uint8_t len)
   if (len < 2)
     return; // Minimum packet size check
 
-  uint8_t msgLen = buf[1]; // Message length from second byte
+  uint8_t header = buf[1];
+  bool hasMore = (header & SERIAL_CONTINUATION_FLAG) != 0;
+  uint8_t msgLen = header & 0x7F; // Lower 7 bits carry the actual length
 
   if (msgLen == 0 || len < msgLen + 2)
     return; // Invalid message length or packet too short
@@ -498,8 +501,23 @@ void handleSerialMessage(uint8_t *buf, uint8_t len)
     message += (char)buf[2 + i];
   }
 
-  // Print the message to serial (this is the satellite's serial output)
-  Serial.println(message);
+  Serial.print(message);
+
+  if (!hasMore)
+  {
+    if (message.length() == 0)
+    {
+      Serial.println();
+    }
+    else
+    {
+      char lastChar = message.charAt(message.length() - 1);
+      if (lastChar != '\n' && lastChar != '\r')
+      {
+        Serial.println();
+      }
+    }
+  }
 }
 
 void runAutoMode()

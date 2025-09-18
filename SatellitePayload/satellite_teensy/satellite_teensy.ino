@@ -77,8 +77,9 @@ const uint8_t PACKET_DATA_SIZE = 45; // Data payload size per packet
 const uint16_t PACKET_DELAY_MS = 20; // Delay between packet transmissions
 
 // Serial message radio transmission parameters
-const uint8_t SERIAL_MSG_TYPE = 0xAA;  // Message type identifier for serial output
-const uint8_t MAX_SERIAL_MSG_LEN = 45; // Maximum serial message length per packet
+const uint8_t SERIAL_MSG_TYPE = 0xAA;        // Message type identifier for serial output
+const uint8_t MAX_SERIAL_MSG_LEN = 45;       // Maximum serial message length per packet
+const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
 // Define the analog input pins for the temperature sensors and their labels (pulled from Artemis Manual AIN# should be 7 pins)
 const int temperatureSensorPins[] = {14, 15, 41, 20, 21, 22, 23};
@@ -156,8 +157,10 @@ void sendSerialBuffer()
   // Split long messages into chunks
   while (serialBuffer.length() > 0)
   {
-    uint8_t chunkSize = min(serialBuffer.length(), (unsigned int)MAX_SERIAL_MSG_LEN);
-    packet[1] = chunkSize;
+    unsigned int remaining = serialBuffer.length();
+    uint8_t chunkSize = (uint8_t)min(remaining, (unsigned int)MAX_SERIAL_MSG_LEN);
+    bool hasMore = remaining > chunkSize;
+    packet[1] = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
 
     // Copy message data
     for (uint8_t i = 0; i < chunkSize; i++)
@@ -192,6 +195,10 @@ void listenForCommands()
 
   while (rf23.available())
   {
+    // Reset expected length before each read; RH_RF22::recv updates `len` in-place
+    // with the payload length, so leaving the prior value would cap the next
+    // receive attempt to the last command's size.
+    len = sizeof(buf);
     if (rf23.recv(buf, &len))
     {
       if (len == 0)
