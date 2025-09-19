@@ -48,13 +48,15 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
+const uint8_t RADIO_PACKET_MAX_SIZE = 45; // RF22 payload limit for reliable recv/tx
+
 // === UART / Framing constants ===
 #define UART_BAUD 115200 // <-- set this to match the Pi; 921600 is fine on Teensy 4.1
 
 const uint8_t UART_MAGIC[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 const uint8_t UART_END[2] = {0xFF, 0xFF};
 
-const uint32_t UART_HEADER_TIMEOUT_MS = 2000;   // 2s to see header
+const uint32_t UART_HEADER_TIMEOUT_MS = 15000;  // 15s to see header (Pi capture + prep time)
 const uint32_t UART_PAYLOAD_TIMEOUT_MS = 30000; // 30s to receive payload
 const uint32_t UART_END_TIMEOUT_MS = 1000;      // 1s to see end markers
 
@@ -69,17 +71,30 @@ const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
 uint8_t imgBuf[MAX_IMG];        // Buffer to store thermal image data
 
 // Serial output redirection
-String serialBuffer = ""; // Buffer to accumulate serial output
-bool radioReady = false;  // Flag to indicate if radio is ready for transmission
+String serialBuffer = "";           // Buffer to accumulate serial output
+bool radioReady = false;             // Flag to indicate if radio is ready for transmission
+bool serialBufferAtLineStart = true; // Tracks when to prepend the SAT> prefix
 
 // Radio transmission parameters
-const uint8_t PACKET_DATA_SIZE = 45; // Data payload size per packet
+const uint8_t PACKET_DATA_SIZE = RADIO_PACKET_MAX_SIZE - 2; // Data payload size per packet (excludes 2-byte header)
 const uint16_t PACKET_DELAY_MS = 20; // Delay between packet transmissions
 
 // Serial message radio transmission parameters
-const uint8_t SERIAL_MSG_TYPE = 0xAA;        // Message type identifier for serial output
-const uint8_t MAX_SERIAL_MSG_LEN = 45;       // Maximum serial message length per packet
+const uint8_t SERIAL_MSG_TYPE = 0xAA;          // Message type identifier for serial output
+const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
+
+// Shared radio buffers to avoid stack allocations inside hot paths
+uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE];
+uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE];
+uint8_t radioSerialTxBuffer[MAX_SERIAL_MSG_LEN + 2];
+
+/**
+ * Dumps a raw snapshot of the RF23 RX FIFO via radio debug output.
+ * This bypasses RH_RF22::available() and reads the hardware FIFO directly.
+ */
+void dumpRf23PendingPackets();
+void dumpRf23PacketHexLines(const uint8_t *data, uint8_t length);
 
 // Define the analog input pins for the temperature sensors and their labels (pulled from Artemis Manual AIN# should be 7 pins)
 const int temperatureSensorPins[] = {14, 15, 41, 20, 21, 22, 23};
@@ -118,11 +133,26 @@ void radioPrint(const String &message)
   if (!radioReady)
     return;
 
-  //Keep if debugging 
-  Serial.println(message);
+  // Keep if debugging
+  Serial.print(message);
 
-  // Add message to buffer
-  serialBuffer = serialBuffer + "SAT> " + message;
+  unsigned int msgLen = message.length();
+  for (unsigned int i = 0; i < msgLen; i++)
+  {
+    char c = message.charAt(i);
+    if (serialBufferAtLineStart)
+    {
+      serialBuffer += "SAT> ";
+      serialBufferAtLineStart = false;
+    }
+
+    serialBuffer += c;
+
+    if (c == '\n')
+    {
+      serialBufferAtLineStart = true;
+    }
+  }
 
   // Send buffer when it gets long enough or contains newlines
   if (serialBuffer.length() >= MAX_SERIAL_MSG_LEN || serialBuffer.indexOf('\n') != -1)
@@ -151,28 +181,36 @@ void sendSerialBuffer()
     return;
 
   // Create packet: [MSG_TYPE][LENGTH][MESSAGE_DATA]
-  uint8_t packet[MAX_SERIAL_MSG_LEN + 2];
-  packet[0] = SERIAL_MSG_TYPE;
+  radioSerialTxBuffer[0] = SERIAL_MSG_TYPE;
 
   // Split long messages into chunks
   while (serialBuffer.length() > 0)
   {
     unsigned int remaining = serialBuffer.length();
     uint8_t chunkSize = (uint8_t)min(remaining, (unsigned int)MAX_SERIAL_MSG_LEN);
-    bool hasMore = remaining > chunkSize;
-    packet[1] = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
-
-    // Copy message data
-    for (uint8_t i = 0; i < chunkSize; i++)
+    int newlineIndex = serialBuffer.indexOf('\n');
+    if (newlineIndex != -1 && newlineIndex + 1 <= chunkSize)
     {
-      packet[2 + i] = serialBuffer.charAt(i);
+      chunkSize = (uint8_t)(newlineIndex + 1);
     }
 
+    if (chunkSize == 0)
+    {
+      break;
+    }
+
+    bool hasMore = remaining > chunkSize;
+    radioSerialTxBuffer[1] = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
+
+    // Copy message data
+    const char *src = serialBuffer.c_str();
+    memcpy(&radioSerialTxBuffer[2], src, chunkSize);
+
     // Send packet
-    if (sendPacketReliable(packet, chunkSize + 2))
+    if (sendPacketReliable(radioSerialTxBuffer, chunkSize + 2))
     {
       // Remove sent chunk from buffer
-      serialBuffer = serialBuffer.substring(chunkSize);
+      serialBuffer.remove(0, chunkSize);
     }
     else
     {
@@ -185,79 +223,191 @@ void sendSerialBuffer()
 }
 
 /**
+ * Read the RF23 RX FIFO directly over SPI and emit a hex/ASCII snapshot.
+ *
+ * This helper is intentionally invasive: it places the radio in idle,
+ * captures diagnostic registers (STATUS: chip state bits, EZMAC: MAC layer
+ * event flags, INT1/INT2: pending interrupt reasons that clear on read),
+ * pulls the entire 64-byte FIFO via `spiBurstRead`, prints the results
+ * through the radio logging channel, then returns the part to RX mode. The
+ * FIFO snapshot is valuable when packets stall mid-flight or when you need
+ * to confirm whether stray bytes are sitting in hardware before the driver
+ * consumes them.
+ */
+void dumpRf23PendingPackets()
+{
+  radioPrintln("=== RF23 RX FIFO RAW SNAPSHOT START ===");
+  // TODO: FIFO recovery checklist
+  if (!radioReady)
+  {
+    radioPrintln("RF23 debug: radio not initialised");
+    return;
+  }
+
+  // Freeze the radio so we can read the FIFO safely
+  rf23.setModeIdle();
+  delay(2);
+
+  // Grab status/interrupt diagnostics straight from the silicon
+  uint8_t status = rf23.statusRead();
+  uint8_t ezmac = rf23.ezmacStatusRead();
+  uint8_t irq1 = rf23.spiRead(RH_RF22_REG_03_INTERRUPT_STATUS1); // read-to-clear
+  uint8_t irq2 = rf23.spiRead(RH_RF22_REG_04_INTERRUPT_STATUS2); // read-to-clear
+
+  // Diagnostic usage guide (cross-reference RH_RF22.h or the Si4432 datasheet):
+  //   - STATUS (reg 0x02) exposes live chip state bits such as `RH_RF22_CHIP_READY`,
+  //     `RH_RF22_FFEM` (FIFO empty), and `RH_RF22_RXAFULL` (RX almost full). Use this to
+  //     confirm whether the part thinks data is queued or if it is still synchronised.
+  //   - EZMAC status (reg 0x31) mirrors MAC-events like packet sent/received and CRC
+  //     outcomes. Flags such as `RH_RF22_PKSENT` or `RH_RF22_PKVALID` help determine if
+  //     the high-level packet engine progressed even when our code did not.
+  //   - Interrupt Status1 (reg 0x03) shows per-event causes (`RH_RF22_IPKVALID`,
+  //     `RH_RF22_ICRCERROR`, `RH_RF22_IPKSENT`, etc.). A set bit means the corresponding
+  //     event fired prior to this dump; the read here also clears it.
+  //   - Interrupt Status2 (reg 0x04) covers secondary events (`RH_RF22_IFFERR`,
+  //     `RH_RF22_ISWDET`, `RH_RF22_IEXT` ...). Inspect these when diagnosing FIFO
+  //     overflows, sync losses, or external interrupts.
+  // Using the four values together lets you decide if bytes stalled in hardware, if a
+  // CRC failure occurred, or if the silicon believes the transaction already finished.
+
+  auto formatHex = [](uint8_t value)
+  {
+    String hex = String(value, HEX);
+    hex.toUpperCase();
+    if (hex.length() < 2)
+      hex = "0" + hex;
+    return hex;
+  };
+
+  radioPrint("STATUS: 0x");
+  radioPrintln(formatHex(status));
+  radioPrint("EZMAC: 0x");
+  radioPrintln(formatHex(ezmac));
+  radioPrint("INT1 : 0x");
+  radioPrintln(formatHex(irq1));
+  radioPrint("INT2 : 0x");
+  radioPrintln(formatHex(irq2));
+
+  // Read the raw FIFO contents directly (always 64 bytes)
+  uint8_t fifoSnapshot[RH_RF22_FIFO_SIZE];
+  memset(fifoSnapshot, 0, sizeof(fifoSnapshot));
+  rf23.spiBurstRead(RH_RF22_REG_7F_FIFO_ACCESS, fifoSnapshot, RH_RF22_FIFO_SIZE);
+
+  radioPrintln("FIFO contents (oldest first):");
+  dumpRf23PacketHexLines(fifoSnapshot, RH_RF22_FIFO_SIZE);
+
+  // Leave the radio ready to receive the next command
+  rf23.setModeRx();
+  radioPrintln("=== RF23 RX FIFO RAW SNAPSHOT END ===");
+}
+
+/**
+ * Helper to print bytes in hex + ASCII columns for readability.
+ *
+ * Output format mirrors classic hexdump style: byte offsets, hex tuples,
+ * and printable ASCII ('.' for non-printable). Intended for short dumps
+ * such as the 64-byte RF23 FIFO snapshot above.
+ */
+void dumpRf23PacketHexLines(const uint8_t *data, uint8_t length)
+{
+  const uint8_t BYTES_PER_LINE = 16;
+  char lineBuf[4 /*offset*/ + 2 /*colon+space*/ + (BYTES_PER_LINE * 3) /*hex+space*/ + 2 /*| */ + BYTES_PER_LINE /*ascii*/ + 1];
+
+  for (uint8_t offset = 0; offset < length; offset += BYTES_PER_LINE)
+  {
+    uint8_t remaining = length - offset;
+    uint8_t lineLen = remaining < BYTES_PER_LINE ? remaining : BYTES_PER_LINE;
+    int pos = snprintf(lineBuf, sizeof(lineBuf), "%03u: ", offset);
+
+    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
+    {
+      pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "%02X ", data[offset + i]);
+    }
+
+    for (uint8_t i = lineLen; i < BYTES_PER_LINE && pos < (int)sizeof(lineBuf); i++)
+    {
+      pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "   ");
+    }
+
+    pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "| ");
+
+    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
+    {
+      char c = static_cast<char>(data[offset + i]);
+      if (c < 32 || c > 126)
+        c = '.';
+      pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "%c", c);
+    }
+
+    radioPrintln(String(lineBuf));
+  }
+}
+
+/**
  * Listens for commands from ground station via radio and handles them
  *
  */
 void listenForCommands()
 {
-  uint8_t buf[50];
-  uint8_t len = sizeof(buf);
+  uint8_t len = sizeof(radioRxBuffer);
 
-  while (rf23.available())
+  if (rf23.recv(radioRxBuffer, &len))
   {
-    // Reset expected length before each read; RH_RF22::recv updates `len` in-place
-    // with the payload length, so leaving the prior value would cap the next
-    // receive attempt to the last command's size.
-    len = sizeof(buf);
-    if (rf23.recv(buf, &len))
+    if (len == 0)
+      return;
+
+    char cmd = (char)radioRxBuffer[0];
+
+    if (cmd == 'u' || cmd == 'U')
     {
-      if (len == 0)
-        continue;
-      char cmd = (char)buf[0];
-
-      if (cmd == 'u' || cmd == 'U')
-      {
-        captureThermalImageUART();
-        continue;
-      }
-      else if (cmd == 'r' || cmd == 'R')
-      {
-        sendViaRadio();
-        continue;
-      }
-
+      captureThermalImageUART();
+    }
+    else if (cmd == 'r' || cmd == 'R')
+    {
+      sendViaRadio();
+    }
+    else if (cmd == 'd' || cmd == 'D')
+    {
+      dumpRf23PendingPackets();
+    }
+    else if (cmd == 'p' || cmd == 'P')
+    {
       // Power control: ['p','1'] on, ['p','0'] off, ['p','s'] status
-      if (cmd == 'p' || cmd == 'P')
+      if (len >= 2)
       {
-        if (len >= 2)
+        char sub = (char)radioRxBuffer[1];
+        if (sub == '1')
         {
-          char sub = (char)buf[1];
-          if (sub == '1')
-          {
-            digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
-            radioPrintln("RPi POWER: ON");
-          }
-          else if (sub == '0')
-          {
-            digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
-            radioPrintln("RPi POWER: OFF");
-          }
-          else if (sub == 's' || sub == 'S')
-          {
-            int state = digitalRead(RPI_ENABLE);
-            radioPrint("RPI POWER STATE: ");
-            radioPrintln(state ? "ON" : "OFF");
-          }
-          else
-          {
-            radioPrintln("RPI POWER: Unknown subcommand");
-          }
+          digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
+          radioPrintln("RPi POWER: ON (Wait 15 seconds before image capture)");
+        }
+        else if (sub == '0')
+        {
+          digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
+          radioPrintln("RPi POWER: OFF");
+        }
+        else if (sub == 's' || sub == 'S')
+        {
+          int state = digitalRead(RPI_ENABLE);
+          radioPrint("RPI POWER STATE: ");
+          radioPrintln(state ? "ON" : "OFF");
         }
         else
         {
-          radioPrintln("RPI POWER: missing arg");
+          radioPrintln("RPI POWER: Unknown subcommand");
         }
-        continue;
       }
-
-      if (cmd == 'g' || cmd == 'G')
+      else
       {
-        radioPrintln("pong from satellite"); // reply back to GS
-        continue;
+        radioPrintln("RPI POWER: missing arg");
       }
-
-      radioPrintln("Unknown command received via radio");
     }
+    else if (cmd == 'g' || cmd == 'G')
+    {
+      radioPrintln("pong from satellite"); // reply back to GS
+    }
+    else
+      radioPrintln("Unknown command received via radio");
   }
 }
 
@@ -269,42 +419,40 @@ void listenForCommands()
  */
 void setup()
 {
-  /* Don't need unless debugging.
-   Serial.begin(115200);
-    while (!Serial && millis() < 5000); */
+  Serial.begin(115200);
+  while (!Serial && millis() < 5000)
+    ;
 
   // Initialize radio first so we can send setup messages
   initRadio();
 
   // Send startup message via radio instead of serial
-  radioPrintln("\n=== Artemis Cubesat Teensy 4.1 Flat Sat Transmitter ===");
+  radioPrintln("=== Artemis Cubesat Teensy 4.1 Satellite Transmitter ===");
 
-  //initTemperatureSensors();
+  initTemperatureSensors();
 
-  //initCurrentSensors();
+  initCurrentSensors();
 
   // TODO: Implement initPDU
 
-  // init the RPI for thermal images
+  // init the RPI for thermal images (default turned off)
   initRPI();
 
-  radioPrintln("\nWaiting 5 seconds for RPi boot...");
-  delay(5000);
-
   // Perform initial temperature sensor check
-  //checkTemperatureSensors();
+  // checkTemperatureSensors();
 
   // Perform initial current sensor check
-  //checkCurrentSensors();
+  // checkCurrentSensors();
 
   // TODO: Implement checkPingPDU to ensure a pong is receivied from PDU
 
-  radioPrintln("\nCommands:");
+  radioPrintln("Commands:");
   radioPrintln(" 'u' - UART thermal capture (fast!)");
   radioPrintln(" 'r' - Send captured image via radio");
   radioPrintln(" 't' - Check temperature sensors");
   radioPrintln(" 'c' - Check current sensors");
-  radioPrintln("\nReady!");
+  radioPrintln(" 'd' - Dump RF23 RX FIFO contents");
+  radioPrintln("Ready!");
 }
 
 void initTemperatureSensors()
@@ -351,7 +499,7 @@ float readTemperatureCelsius(int sensorPin)
  */
 bool checkTemperatureSensors()
 {
-  radioPrintln("\n--- TEMPERATURE SENSOR CHECK ---");
+  radioPrintln("--- TEMPERATURE SENSOR CHECK ---");
 
   bool allValid = true;
   int validSensors = 0;
@@ -488,7 +636,7 @@ void initCurrentSensors()
  */
 bool checkCurrentSensors()
 {
-  radioPrintln("\n--- CURRENT SENSOR CHECK ---");
+  radioPrintln("--- CURRENT SENSOR CHECK ---");
 
   bool allValid = true;
   int validSensors = 0;
@@ -608,7 +756,7 @@ void initRPI()
  */
 void initRadio()
 {
-  //radioPrintln("Initializing radio");
+  // radioPrintln("Initializing radio");
 
   // Configure RX/TX control pins
   pinMode(30, OUTPUT);    // RX_ON pin
@@ -628,7 +776,9 @@ void initRadio()
   // Initialize RF22 radio module
   if (!rf23.init())
   {
-    //radioPrintln("Radio init failed!");
+    Serial.println("Satellite Radio init failed!");
+    // TODO: graceful fail here... wait like 5 seconds then boot through GS and allow user to self initialize via radio init command
+    // radioPrintln("Radio init failed!");
     radioReady = false;
     return; // init failed dont setup the rest.
   }
@@ -640,6 +790,7 @@ void initRadio()
   rf23.setModeIdle();                           // Set radio to idle mode
   delay(100);
   radioReady = true;
+  radioPrintln("Satellite Radio is ready.");
 }
 
 /**
@@ -651,7 +802,10 @@ void initRadio()
 void loop()
 {
   // Handle commands from ground station via radio
-  listenForCommands();
+  while (rf23.available())
+  {
+    listenForCommands();
+  }
 
   // Also allow manual commands via serial for testing/debug
   if (Serial.available())
@@ -660,14 +814,14 @@ void loop()
     while (Serial.available())
       Serial.read(); // Clear input buffer
 
-    radioPrint("\nCommand: ");
+    radioPrint("Command: ");
     radioPrintln(String(cmd));
 
     switch (cmd)
     {
     case 'z':
     case 'Z':
-      radioPrintln("pong from satellite"); // reply back to GS
+      radioPrintln("command Z pong from satellite"); // reply back to GS
       break;
     case 'u':
     case 'U':
@@ -685,8 +839,12 @@ void loop()
     case 'C':
       checkCurrentSensors();
       break;
+    case 'd':
+    case 'D':
+      dumpRf23PendingPackets();
+      break;
     default:
-      radioPrintln("Unknown command. Use 'z' for ping, Use 'u' for capture, 'r' for transmit, 't' for temperature check, 'c' for current check");
+      radioPrintln("Unknown command. Use 'z' ping, 'u' capture, 'r' transmit, 't' temps, 'c' currents, 'd' dump RF23 FIFO");
     }
   }
 }
@@ -811,6 +969,8 @@ bool recvFramedFromPi(HardwareSerial &port,
         delay(1);
       }
     }
+    radioPrintln("ERROR: Discarded oversized payload; request retransmit.");
+    return false;
   }
 
   // 2) Payload
@@ -871,7 +1031,7 @@ void handleStatusPayload(const uint8_t *payload, uint16_t len)
  */
 void captureThermalImageUART()
 {
-  radioPrintln("\n--- UART THERMAL CAPTURE ---");
+  radioPrintln("--- UART THERMAL CAPTURE ---");
   radioPrintln("Triggering RPi capture...");
 
   // Clear any pending UART bytes
@@ -906,7 +1066,7 @@ void captureThermalImageUART()
   // Otherwise it's image data
   capturedImageLength = rxLen;
 
-  radioPrintln("\n--- UART IMAGE RECEPTION COMPLETE ---");
+  radioPrintln("--- UART IMAGE RECEPTION COMPLETE ---");
   radioPrint("Received ");
   radioPrint(String(capturedImageLength));
   radioPrintln(" image bytes");
@@ -953,21 +1113,22 @@ void captureThermalImageUART()
  */
 bool sendPacketReliable(uint8_t *data, uint8_t len)
 {
-  if(len == 0 || len > rf23.maxMessageLength()) {
+  if (len == 0 || len > rf23.maxMessageLength())
+  {
     Serial.println("Invalid message length: " + len);
-    //TODO should probably send a message to gs or log somewhere the packet was too big to send?
+    // TODO should probably send a message to gs or log somewhere the packet was too big to send?
     return false;
   }
-  
+
   const int MAX_RETRIES = 3;
   for (int retry = 0; retry < MAX_RETRIES; retry++)
   {
-    rf23.setModeIdle(); // Set radio to idle mode
+    // rf23.setModeIdle(); // Set radio to idle mode
     delay(5);
 
-    // Clear interrupt flags
-    rf23.spiRead(RH_RF22_REG_03_INTERRUPT_STATUS1);
-    rf23.spiRead(RH_RF22_REG_04_INTERRUPT_STATUS2);
+    // Clear interrupt flags... dont really need for sending?
+    // rf23.spiRead(RH_RF22_REG_03_INTERRUPT_STATUS1);
+    // rf23.spiRead(RH_RF22_REG_04_INTERRUPT_STATUS2);
 
     digitalWrite(LED_PIN, HIGH); // Turn on LED during transmission
 
@@ -976,7 +1137,7 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
       if (rf23.waitPacketSent(500))
       {
         digitalWrite(LED_PIN, LOW); // Turn off LED
-        rf23.setModeIdle();
+        // rf23.setModeIdle();
         return true;
       }
     }
@@ -987,7 +1148,7 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
       delay(50); // Delay before retry
     }
   }
-  rf23.setModeIdle();
+  // rf23.setModeIdle();
   return false;
 }
 
@@ -1006,7 +1167,7 @@ void sendViaRadio()
     return;
   }
 
-  radioPrintln("\n--- SENDING THERMAL IMAGE VIA RADIO ---");
+  radioPrintln("--- SENDING THERMAL IMAGE VIA RADIO ---");
   radioPrint("Image size: ");
   radioPrint(String(capturedImageLength));
   radioPrintln(" bytes");
@@ -1018,23 +1179,23 @@ void sendViaRadio()
 
   // Send header packet with image metadata
   radioPrintln("Sending header...");
-  uint8_t header[10];
-  header[0] = 0xFF; // TODO: tf does this mean
-  header[1] = 0xFF;
-  header[2] = capturedImageLength & 0xFF; // Image length (little-endian)
-  header[3] = (capturedImageLength >> 8) & 0xFF;
-  header[4] = totalPackets & 0xFF; // Total packets (little-endian)
-  header[5] = (totalPackets >> 8) & 0xFF;
-  header[6] = 0xDE; // Magic bytes for validation
-  header[7] = 0xAD;
-  header[8] = 0xBE;
-  header[9] = 0xEF;
+  memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
+  radioTxBuffer[0] = 0xFF; // TODO: tf does this mean
+  radioTxBuffer[1] = 0xFF;
+  radioTxBuffer[2] = capturedImageLength & 0xFF; // Image length (little-endian)
+  radioTxBuffer[3] = (capturedImageLength >> 8) & 0xFF;
+  radioTxBuffer[4] = totalPackets & 0xFF; // Total packets (little-endian)
+  radioTxBuffer[5] = (totalPackets >> 8) & 0xFF;
+  radioTxBuffer[6] = 0xDE; // Magic bytes for validation
+  radioTxBuffer[7] = 0xAD;
+  radioTxBuffer[8] = 0xBE;
+  radioTxBuffer[9] = 0xEF;
 
   // Send header with retry logic
   bool headerSent = false;
   for (int retry = 0; retry < 5 && !headerSent; retry++)
   {
-    if (sendPacketReliable(header, 10))
+    if (sendPacketReliable(radioTxBuffer, 10))
     {
       headerSent = true;
       radioPrintln("✓ Header sent");
@@ -1067,14 +1228,14 @@ void sendViaRadio()
   {
     uint16_t remaining = capturedImageLength - bytesSent;
     uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
-    uint8_t packet[PACKET_DATA_SIZE + 2];
+    memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
 
     // Packet number (little-endian)
-    packet[0] = packetNum & 0xFF;
-    packet[1] = (packetNum >> 8) & 0xFF;
+    radioTxBuffer[0] = packetNum & 0xFF;
+    radioTxBuffer[1] = (packetNum >> 8) & 0xFF;
 
     // Copy image data to packet
-    memcpy(&packet[2], &imgBuf[bytesSent], chunkSize);
+    memcpy(&radioTxBuffer[2], &imgBuf[bytesSent], chunkSize);
 
     // Progress update every 50 packets
     if (packetNum % 50 == 0)
@@ -1086,7 +1247,7 @@ void sendViaRadio()
     }
 
     // Send packet with retry logic
-    if (sendPacketReliable(packet, chunkSize + 2))
+    if (sendPacketReliable(radioTxBuffer, chunkSize + 2))
     {
       successCount++;
     }
@@ -1102,24 +1263,24 @@ void sendViaRadio()
 
   // Send end packet to signal completion
   radioPrintln("Sending end packet...");
-  uint8_t endPkt[6];
-  endPkt[0] = 0xEE; // End packet magic bytes
-  endPkt[1] = 0xEE;
-  endPkt[2] = packetNum & 0xFF; // Final packet count (little-endian)
-  endPkt[3] = (packetNum >> 8) & 0xFF;
-  endPkt[4] = 0xFF; // Padding
-  endPkt[5] = 0xFF;
+  memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
+  radioTxBuffer[0] = 0xEE; // End packet magic bytes
+  radioTxBuffer[1] = 0xEE;
+  radioTxBuffer[2] = packetNum & 0xFF; // Final packet count (little-endian)
+  radioTxBuffer[3] = (packetNum >> 8) & 0xFF;
+  radioTxBuffer[4] = 0xFF; // Padding
+  radioTxBuffer[5] = 0xFF;
 
   // Send end packet multiple times for reliability
   for (int i = 0; i < 3; i++)
   {
-    sendPacketReliable(endPkt, 6);
+    sendPacketReliable(radioTxBuffer, 6);
     delay(200);
   }
 
   // Display transmission summary
   float duration = (millis() - startTime) / 1000.0;
-  radioPrintln("\n=== TRANSMISSION COMPLETE ===");
+  radioPrintln("=== TRANSMISSION COMPLETE ===");
   radioPrint("Packets sent: ");
   radioPrint(String(successCount));
   radioPrint("/");
@@ -1139,14 +1300,14 @@ void sendViaRadio()
   // Quality assessment based on success rate
   if (successCount == totalPackets)
   {
-    radioPrintln("\n✅ Perfect transmission!");
+    radioPrintln("✅ Perfect transmission!");
   }
   else if (successCount > totalPackets * 0.95)
   {
-    radioPrintln("\n✅ Excellent transmission!");
+    radioPrintln("✅ Excellent transmission!");
   }
   else
   {
-    radioPrintln("\n⚠️ Some packets lost");
+    radioPrintln("⚠️ Some packets lost");
   }
 }

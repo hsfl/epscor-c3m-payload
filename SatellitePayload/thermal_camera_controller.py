@@ -38,7 +38,7 @@ import struct
 import serial
 from uvctypes import *
 import cv2
-from queue import Queue
+from queue import Queue, Empty, Full
 import ctypes
 
 # GPIO Pin Configuration
@@ -62,8 +62,39 @@ class ThermalCamera:
         self.devh = POINTER(uvc_device_handle)()
         self.ctrl = uvc_stream_ctrl()
         self.frame_callback = CFUNCTYPE(None, POINTER(uvc_frame), c_void_p)(self._frame_callback)
+        self.frame_shape = None
 
-    # (unchanged) _frame_callback ...
+    def _frame_callback(self, frame_ptr, userptr):
+        frame = frame_ptr.contents
+        if not bool(frame.data) or frame.data_bytes == 0:
+            return
+
+        width = frame.width
+        height = frame.height
+        if width == 0 or height == 0:
+            return
+
+        data_ptr = ctypes.cast(frame.data, POINTER(ctypes.c_uint16))
+        np_frame = np.ctypeslib.as_array(data_ptr, shape=(height * width,))
+        try:
+            thermal = np_frame.reshape((height, width))
+        except ValueError:
+            return
+
+        frame_copy = np.copy(thermal)
+        self.frame_shape = frame_copy.shape
+
+        try:
+            thermal_queue.put_nowait(frame_copy)
+        except Full:
+            try:
+                thermal_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                thermal_queue.put_nowait(frame_copy)
+            except Full:
+                pass
 
     def initialize(self):
         # 1) Context
@@ -131,7 +162,7 @@ class ThermalCamera:
         except Exception:
             pass
 
-def capture_and_average():
+def capture_and_average(timeout_s=8.0):
     """
     Capture and average multiple thermal frames for noise reduction
     
@@ -143,25 +174,37 @@ def capture_and_average():
         bytes: Averaged thermal image data as raw bytes
     """
     frames = []
-    
-    # Clear any existing frames in queue
-    while not thermal_queue.empty():
-        thermal_queue.get()
-    
-    print(f"Capturing {MAX_FRAMES} frames...")
-    while len(frames) < MAX_FRAMES:
+
+    while True:
         try:
-            # Get frame from queue with timeout
-            data = thermal_queue.get(timeout=2.0)
-            frames.append(data)
-            if len(frames) % 20 == 0:
-                print(f"Progress: {len(frames)}/{MAX_FRAMES}")
-        except:
-            continue  # Continue if timeout occurs
-    
+            thermal_queue.get_nowait()
+        except Empty:
+            break
+
+    print(f"Capturing up to {MAX_FRAMES} frames (timeout {timeout_s:.1f}s)...")
+    deadline = time.time() + timeout_s
+
+    while len(frames) < MAX_FRAMES:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            frame = thermal_queue.get(timeout=min(0.5, max(0.05, remaining)))
+            frames.append(frame)
+            print(f"Captured {len(frames)}/{MAX_FRAMES} frames")
+        except Empty:
+            continue
+
+    if not frames:
+        print("No frames captured before timeout.")
+        return None
+
+    if len(frames) < MAX_FRAMES:
+        print(f"Only captured {len(frames)} frame(s); averaging nonetheless.")
+
     print("Averaging frames...")
-    # Convert frames to float64 for averaging, then back to uint16
-    averaged = np.mean(np.array(frames, dtype=np.float64), axis=0).astype(np.uint16)
+    stacked = np.stack(frames, axis=0).astype(np.float64)
+    averaged = np.mean(stacked, axis=0).astype(np.uint16)
     
     # Calculate and display temperature statistics
     min_val = np.min(averaged)

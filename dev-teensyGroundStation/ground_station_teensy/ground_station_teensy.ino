@@ -41,6 +41,12 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
+const uint8_t RADIO_PACKET_MAX_SIZE = 45; // RF22 payload limit for reliable recv/tx
+
+// Shared radio buffers to avoid per-call stack allocations
+uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE];
+uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE];
+
 // Image reception buffer and tracking variables
 const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
 uint8_t imgBuffer[MAX_IMG];     // Buffer to store received thermal image data
@@ -66,7 +72,7 @@ bool autoMode = false;
 const uint8_t PACKET_DATA_SIZE = 45; // Data payload size per packet
 
 // Serial message radio reception parameters
-const uint8_t SERIAL_MSG_TYPE = 0xAA;        // Message type identifier for serial output
+const uint8_t SERIAL_MSG_TYPE = 0xAA;          // Message type identifier for serial output
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
 // Global variables
@@ -97,11 +103,13 @@ void processPacket(uint8_t *buf, uint8_t len);
 void handleHeaderPacket(uint8_t *buf);
 void handleEndPacket(uint8_t *buf);
 void handleDataPacket(uint8_t *buf, uint8_t len);
-void handleSerialMessage(uint8_t *buf, uint8_t len);
+bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut = nullptr);
 void runAutoMode();
 void showReceptionSummary();
 void exportThermalData();
 void forwardToSatellite(char cmd);
+void dumpRf23PendingPacketsToSerial();
+void printRf23HexLines(const uint8_t *data, uint8_t length);
 
 // Command function prototypes
 void cmdHelp(const char *args);
@@ -141,7 +149,7 @@ const Command commands[] = {
     {"clear", "Clear screen", cmdClear},
     {"rpi", "Control Raspberry Pi (rpi <on|off|status>)", cmdRPIControl},
     {"testint", "Test interrupt functionality (testint <seconds>)", cmdTestInterrupt},
-    {"radio", "Radio control (radio <init|status|tx|rx>)", cmdRadio},
+    {"radio", "Radio control (radio <init|status|tx|rx|dump>)", cmdRadio},
     {"auto", "Start auto reception mode", cmdAutoMode},
     {"export", "Export thermal data as CSV", cmdExport},
     {"capture", "Command satellite to capture thermal data", cmdCapture},
@@ -154,7 +162,6 @@ const int numCommands = sizeof(commands) / sizeof(commands[0]);
 bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeout_ms = 500)
 {
   digitalWrite(LED_BUILTIN, HIGH);
-  rf23.setModeTx();
   bool ok = false;
 
   if (!rf23.send((uint8_t *)data, len))
@@ -172,7 +179,7 @@ bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeou
   // small safety gap then go to idle
   delay(5);
   digitalWrite(LED_BUILTIN, LOW);
-  rf23.setModeIdle();
+  // rf23.setModeIdle();
   return ok;
 }
 
@@ -258,23 +265,23 @@ void clearHistory()
   historyIndex = 0;
 }
 
-void checkForInterrupt()
-{
-  // Check for interrupt character (Q) without blocking
-  if (Serial.available())
-  {
-    char c = Serial.peek(); // Look at next character without consuming it
-    if (c == 'Q' || c == 'q')
-    {
-      // Consume the interrupt character
-      Serial.read();
-      interruptRequested = true;
-      Serial.println("\n*** INTERRUPT REQUESTED ***");
-      Serial.println("Returning to command prompt...");
-      printPrompt();
-    }
-  }
-}
+// void checkForInterrupt()
+// {
+//   // Check for interrupt character (Q) without blocking
+//   if (Serial.available())
+//   {
+//     char c = Serial.peek(); // Look at next character without consuming it
+//     if (c == 'Q' || c == 'q')
+//     {
+//       // Consume the interrupt character
+//       Serial.read();
+//       interruptRequested = true;
+//       Serial.println("\n*** INTERRUPT REQUESTED ***");
+//       Serial.println("Returning to command prompt...");
+//       printPrompt();
+//     }
+//   }
+// }
 
 // Function to check for interrupt during command execution
 bool isInterruptRequested()
@@ -322,6 +329,7 @@ void initRadio()
     Serial.println("Radio init failed!");
     while (1)
       ; // Halt if radio initialization fails
+        // TODO: graceful fail here... wait like 5 seconds then boot through GS and allow user to self initialize via radio init command
   }
 
   // Configure radio parameters
@@ -330,7 +338,7 @@ void initRadio()
   rf23.setTxPower(RH_RF22_TXPOW_20DBM);         // Set transmit power to 20dBm
   rf23.setModeIdle();                           // Set radio to idle mode
   delay(100);
-  Serial.println("Radio ready");
+  Serial.println("GS Radio ready");
 }
 
 void clearReception()
@@ -346,17 +354,15 @@ void clearReception()
 
 void handlePacket()
 {
-  uint8_t buf[64]; // Buffer for incoming packet data
-  uint8_t len = sizeof(buf);
-
-  if (rf23.recv(buf, &len))
+  uint8_t len = sizeof(radioRxBuffer);
+  if (rf23.recv(radioRxBuffer, &len))
   {
     digitalWrite(LED_BUILTIN, HIGH); // Turn on LED to indicate packet reception
     lastPacketTime = millis();
     lastRSSI = rf23.lastRssi(); // Store signal strength
     packetsReceived++;
-    processPacket(buf, len);        // Process the received packet
-    digitalWrite(LED_BUILTIN, LOW); // Turn off LED
+    processPacket(radioRxBuffer, len); // Process the received packet
+    digitalWrite(LED_BUILTIN, LOW);    // Turn off LED
   }
 }
 
@@ -481,24 +487,133 @@ void handleDataPacket(uint8_t *buf, uint8_t len)
   }
 }
 
-void handleSerialMessage(uint8_t *buf, uint8_t len)
+/**
+ * Snapshot the RF23 RX FIFO directly over SPI and dump the contents to USB serial.
+ *
+ * Mirrors the satellite-side helper: forces the part idle, captures key status
+ * registers (STATUS: current chip state, EZMAC: MAC event flags, INT1/INT2:
+ * pending interrupt causes that clear on read), reads all 64 FIFO bytes via
+ * `spiBurstRead`, prints a hex+ASCII table, then restores RX mode so normal
+ * reception can resume. The FIFO dump lets you inspect raw bytes lingering in
+ * hardware before the driver drains them, which is invaluable when debugging
+ * wedged receptions or malformed packets.
+ */
+void dumpRf23PendingPacketsToSerial()
+{
+  Serial.println("\n=== RF23 RX FIFO RAW SNAPSHOT START ===");
+
+  rf23.setModeIdle();
+  delay(2);
+
+  uint8_t status = rf23.statusRead();
+  uint8_t ezmac = rf23.ezmacStatusRead();
+  uint8_t irq1 = rf23.spiRead(RH_RF22_REG_03_INTERRUPT_STATUS1);
+  uint8_t irq2 = rf23.spiRead(RH_RF22_REG_04_INTERRUPT_STATUS2);
+
+  // Diagnostic quick reference (see RH_RF22.h / Si4432 datasheet for bit masks):
+  //   STATUS (0x02) -> real-time chip flags (`RH_RF22_CHIP_READY`, `RH_RF22_FFEM`,
+  //     `RH_RF22_RXAFULL`, ...). Handy for confirming FIFO level and lock state.
+  //   EZMAC (0x31) -> MAC engine events like `RH_RF22_PKSENT`, `RH_RF22_PKVALID`, and
+  //     CRC indications that tell you whether the packet engine completed.
+  //   INT1 (0x03) -> primary interrupt causes (`RH_RF22_IPKVALID`, `RH_RF22_IPKSENT`,
+  //     `RH_RF22_ICRCERROR`, etc.). A set bit means the event fired; reading clears it.
+  //   INT2 (0x04) -> secondary causes (`RH_RF22_IFFERR`, `RH_RF22_ISWDET`, `RH_RF22_IEXT`).
+  // Combining these values lets you pinpoint whether hardware saw a packet, rejected it,
+  // or experienced FIFO/sync faults before our firmware reacted.
+
+  auto formatHex = [](uint8_t value)
+  {
+    String hex = String(value, HEX);
+    hex.toUpperCase();
+    if (hex.length() < 2)
+      hex = "0" + hex;
+    return hex;
+  };
+
+  Serial.print("STATUS: 0x");
+  Serial.println(formatHex(status));
+  Serial.print("EZMAC : 0x");
+  Serial.println(formatHex(ezmac));
+  Serial.print("INT1  : 0x");
+  Serial.println(formatHex(irq1));
+  Serial.print("INT2  : 0x");
+  Serial.println(formatHex(irq2));
+
+  uint8_t fifoSnapshot[RH_RF22_FIFO_SIZE];
+  memset(fifoSnapshot, 0, sizeof(fifoSnapshot));
+  rf23.spiBurstRead(RH_RF22_REG_7F_FIFO_ACCESS, fifoSnapshot, RH_RF22_FIFO_SIZE);
+
+  Serial.println("FIFO contents (64 bytes, oldest first):");
+  printRf23HexLines(fifoSnapshot, RH_RF22_FIFO_SIZE);
+
+  rf23.setModeRx();
+  Serial.println("=== RF23 RX FIFO RAW SNAPSHOT END ===\n");
+}
+
+/**
+ * Render raw bytes in a hex+ASCII table (`000: AA BB ... | ..`) to aid analysis.
+ * Designed for short buffers such as the RF23 FIFO snapshot.
+ */
+void printRf23HexLines(const uint8_t *data, uint8_t length)
+{
+  const uint8_t BYTES_PER_LINE = 16;
+  char lineBuf[4 + 2 + (BYTES_PER_LINE * 3) + 2 + BYTES_PER_LINE + 1];
+
+  for (uint8_t offset = 0; offset < length; offset += BYTES_PER_LINE)
+  {
+    uint8_t remaining = length - offset;
+    uint8_t lineLen = remaining < BYTES_PER_LINE ? remaining : BYTES_PER_LINE;
+    int pos = snprintf(lineBuf, sizeof(lineBuf), "%03u: ", offset);
+
+    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
+    {
+      pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "%02X ", data[offset + i]);
+    }
+
+    for (uint8_t i = lineLen; i < BYTES_PER_LINE && pos < (int)sizeof(lineBuf); i++)
+    {
+      pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "   ");
+    }
+
+    pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "| ");
+
+    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
+    {
+      char c = static_cast<char>(data[offset + i]);
+      if (c < 32 || c > 126)
+        c = '.';
+      pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "%c", c);
+    }
+
+    Serial.println(lineBuf);
+  }
+}
+
+bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
 {
   // Serial.println("Inside satellite serial message");
+  // newline to go pass the >GS prompt
   if (len < 2)
-    return; // Minimum packet size check
+    return false; // Minimum packet size check
 
   uint8_t header = buf[1];
   bool hasMore = (header & SERIAL_CONTINUATION_FLAG) != 0;
   uint8_t msgLen = header & 0x7F; // Lower 7 bits carry the actual length
 
   if (msgLen == 0 || len < msgLen + 2)
-    return; // Invalid message length or packet too short
+    return false; // Invalid message length or packet too short
 
   // Extract message data and print to serial
   String message = "";
+  message.reserve(msgLen);
   for (uint8_t i = 0; i < msgLen; i++)
   {
     message += (char)buf[2 + i];
+  }
+
+  if (messageOut != nullptr)
+  {
+    *messageOut = message;
   }
 
   Serial.print(message);
@@ -518,6 +633,8 @@ void handleSerialMessage(uint8_t *buf, uint8_t len)
       }
     }
   }
+
+  return true;
 }
 
 void runAutoMode()
@@ -672,9 +789,6 @@ void forwardToSatellite(char cmd)
   Serial.println("Forwarding command to satellite...");
   digitalWrite(LED_BUILTIN, HIGH); // Turn on LED during transmission
 
-  // Ensure radio is in transmit mode
-  rf23.setModeTx();
-
   // Send the command
   if (!rf23.send((uint8_t *)&cmd, 1))
   { // a command should be a single byte
@@ -755,7 +869,6 @@ void cmdPing(const char *args)
 {
   Serial.println("\nPinging satellite...");
 
-  // --- Send single-byte ping ('g') ---
   uint8_t ping = 'g';
   if (!sendBytesToSatellite(&ping, 1, 500))
   {
@@ -763,51 +876,10 @@ void cmdPing(const char *args)
     return;
   }
 
-  // --- Wait for "SAT PONG" reply (ignore other messages like boot banners) ---
-  const unsigned long WAIT_MS = 3000;
+  // Return to RX so the main loop can process the response via handleCommand.
   rf23.setModeRx();
-  delay(10); // settle into RX
 
-  Serial.println("Waiting for reply...");
-
-  bool gotPong = false;
-  unsigned long start = millis();
-
-  while (!gotPong && (millis() - start) < WAIT_MS)
-  {
-    // wait in small slices so we can ignore unrelated packets and keep listening
-    if (rf23.waitAvailableTimeout(50))
-    {
-      Serial.println("Radio received something....");
-      uint8_t buf[64];
-      uint8_t len = sizeof(buf);
-      if (rf23.recv(buf, &len))
-      {
-        // Case A: serial-message packet [MSG_TYPE][LENGTH][DATA...]
-
-        handleSerialMessage(buf, len);
-
-        // Extract message data and print to serial
-        String message = "";
-        for (uint8_t i = 0; i < len; i++)
-        {
-          message += (char)buf[2 + i];
-        }
-
-        if(message.indexOf("pong") != -1) {
-          gotPong = true;
-          Serial.println("pong acquired from satellite ✅");
-        }
-      }
-    }
-  }
-
-  rf23.setModeIdle();
-
-  if (!gotPong)
-  {
-    Serial.println("❌ No reply from satellite (timeout or non-matching payload)");
-  }
+  Serial.println("Ping sent. Waiting for satellite response...");
 }
 
 void cmdEcho(const char *args)
@@ -1011,19 +1083,19 @@ void cmdRPIControl(const char *args)
 
   if (argStr == "on" || argStr == "off" || argStr == "status")
   {
-    uint8_t packet[2];
-    packet[0] = 'p';
+    memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
+    radioTxBuffer[0] = 'p';
     if (argStr == "on")
-      packet[1] = '1';
+      radioTxBuffer[1] = '1';
     else if (argStr == "off")
-      packet[1] = '0';
+      radioTxBuffer[1] = '0';
     else // status
-      packet[1] = 's';
+      radioTxBuffer[1] = 's';
 
     Serial.print("Forwarding RPI command to satellite: rpi ");
     Serial.println(argStr);
 
-    if (sendBytesToSatellite(packet, 2))
+    if (sendBytesToSatellite(radioTxBuffer, 2))
       Serial.println("Command forwarded");
     else
       Serial.println("Failed to forward command");
@@ -1129,9 +1201,13 @@ void cmdRadio(const char *args)
     rf23.setModeRx();
     Serial.println("Radio set to receive mode");
   }
+  else if (argStr == "dump" || argStr == "debug")
+  {
+    dumpRf23PendingPacketsToSerial();
+  }
   else
   {
-    Serial.println("Usage: radio [init|status|tx|rx]");
+    Serial.println("Usage: radio [init|status|tx|rx|dump]");
   }
 }
 
@@ -1226,21 +1302,17 @@ void loop()
     Serial.println("\nSerial connection restored.");
     printPrompt();
   }
-  // Handle serial disconnection
-  else if (serialConnected && !currentlyConnected)
-  {
-    // Serial disconnected - no action needed
-  }
 
   serialConnected = currentlyConnected;
 
   // Check for interrupt character (Q) at any time
-  checkForInterrupt();
+  // checkForInterrupt();
 
   // Check for incoming radio packets (always listen for serial messages)
   if (rf23.available())
   {
     handlePacket();
+    printPrompt();
   }
 
   // Read entire line when available
@@ -1252,9 +1324,9 @@ void loop()
     if (input.length() > 0)
     {
       // Reset interrupt flag before processing new command
-      resetInterrupt();
+      // resetInterrupt();
       parseCommand(input);
-      addToHistory(input);
+      // addToHistory(input);
       printPrompt();
     }
   }
