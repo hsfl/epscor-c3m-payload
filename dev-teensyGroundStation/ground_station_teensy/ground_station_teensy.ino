@@ -762,13 +762,13 @@ void exportThermalData()
   }
 
   Serial.println("=== END CSV ===");
-  Serial.println("\nVisualize with Python:");
-  Serial.println(" import numpy as np");
-  Serial.println(" import matplotlib.pyplot as plt");
-  Serial.println(" data = np.loadtxt('thermal_image.csv', delimiter=',')");
-  Serial.println(" plt.imshow(data, cmap='hot')");
-  Serial.println(" plt.colorbar(label='Temperature (°C)')");
-  Serial.println(" plt.show()");
+  // Serial.println("\nVisualize with Python:");
+  // Serial.println(" import numpy as np");
+  // Serial.println(" import matplotlib.pyplot as plt");
+  // Serial.println(" data = np.loadtxt('thermal_image.csv', delimiter=',')");
+  // Serial.println(" plt.imshow(data, cmap='hot')");
+  // Serial.println(" plt.colorbar(label='Temperature (°C)')");
+  // Serial.println(" plt.show()");
 }
 
 void forwardToSatellite(char cmd)

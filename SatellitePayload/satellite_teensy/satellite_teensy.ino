@@ -6,7 +6,7 @@
  * to the ground station via radio communication.
  *
  * Key Features:
- * - Receives thermal image data from RPi via UART at 115200 baud
+ * - Receives thermal image data from RPI via UART at 115200 baud
  * - Transmits image data via RF22 radio module in packetized format
  * - Handles reliable packet transmission with retry logic
  * - Provides transmission statistics and quality assessment
@@ -16,7 +16,7 @@
  * - Teensy microcontroller
  * - RF22 radio module (433MHz)
  * - Raspberry Pi with thermal camera
- * - UART connection between Teensy and RPi
+ * - UART connection between Teensy and RPI
  *
  * Communication Protocol:
  * - UART: Receives thermal data with header/end markers
@@ -38,7 +38,7 @@
 
 // Pin definitions for hardware control
 const uint8_t RPI_ENABLE = 36; // Power control pin for Raspberry Pi
-const uint8_t TRIGGER_PIN = 2; // Trigger pin to signal RPi for capture
+const uint8_t TRIGGER_PIN = 2; // Trigger pin to signal RPI for capture
 const uint8_t LED_PIN = 13;
 
 // UART pins: Serial2 uses pins 7 (RX) and 8 (TX) automatically
@@ -63,12 +63,18 @@ const uint32_t UART_END_TIMEOUT_MS = 1000;      // 1s to see end markers
 // Simple max for STATUS messages
 const uint16_t MAX_STATUS_LEN = 256;
 
+uint8_t piStatusBuf[MAX_STATUS_LEN];
+bool piCaptureInProgress = false;
+
 // Image data storage and tracking
 uint16_t capturedImageLength = 0; // Length of captured thermal image
 
 // Buffer for thermal image storage
 const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
 uint8_t imgBuf[MAX_IMG];        // Buffer to store thermal image data
+
+uint32_t rpiPowerOnTimestamp = 0;
+bool rpiBootNotificationSent = false;
 
 // Serial output redirection
 String serialBuffer = "";           // Buffer to accumulate serial output
@@ -364,7 +370,7 @@ void listenForCommands()
     }
     else if (cmd == 'r' || cmd == 'R')
     {
-      sendViaRadio();
+      sendThermalDataViaRadio();
     }
     else if (cmd == 'd' || cmd == 'D')
     {
@@ -379,12 +385,16 @@ void listenForCommands()
         if (sub == '1')
         {
           digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
-          radioPrintln("RPi POWER: ON (Wait 15 seconds before image capture)");
+          rpiPowerOnTimestamp = millis();
+          rpiBootNotificationSent = false;
+          radioPrintln("RPI POWER: ON (Wait 80 seconds before image capture)");
         }
         else if (sub == '0')
         {
           digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
-          radioPrintln("RPi POWER: OFF");
+          rpiPowerOnTimestamp = 0;
+          rpiBootNotificationSent = false;
+          radioPrintln("RPI POWER: OFF");
         }
         else if (sub == 's' || sub == 'S')
         {
@@ -738,6 +748,8 @@ void initRPI()
   // Initialize Raspberry Pi control pin and make sure its off.
   pinMode(RPI_ENABLE, OUTPUT);
   digitalWrite(RPI_ENABLE, LOW);
+  rpiPowerOnTimestamp = 0;
+  rpiBootNotificationSent = false;
 
   // Configure trigger pin for RPI communication and leave HIGH (if LOW it will trigger thermal data capture script)
   pinMode(TRIGGER_PIN, OUTPUT);
@@ -801,10 +813,25 @@ void initRadio()
  */
 void loop()
 {
+  pollPiUartStatus();
+
   // Handle commands from ground station via radio
   while (rf23.available())
   {
     listenForCommands();
+  }
+
+  if (rpiPowerOnTimestamp != 0 && !rpiBootNotificationSent)
+  {
+    if (millis() - rpiPowerOnTimestamp >= 80000UL)
+    {
+      if (radioReady)
+      {
+        radioPrintln("RPI POWER: Boot complete");
+        rpiBootNotificationSent = true;
+        rpiPowerOnTimestamp = 0;
+      }
+    }
   }
 
   // Also allow manual commands via serial for testing/debug
@@ -829,7 +856,7 @@ void loop()
       break;
     case 'r':
     case 'R':
-      sendViaRadio();
+      sendThermalDataViaRadio();
       break;
     case 't':
     case 'T':
@@ -844,7 +871,7 @@ void loop()
       dumpRf23PendingPackets();
       break;
     default:
-      radioPrintln("Unknown command. Use 'z' ping, 'u' capture, 'r' transmit, 't' temps, 'c' currents, 'd' dump RF23 FIFO");
+      radioPrintln("Unknown command. Use 'z' pong, 'u' capture thermal, 'r' transmit thermal, 't' temps sensors, 'c' currents sensors, 'd' dump RF23 FIFO");
     }
   }
 }
@@ -1019,20 +1046,51 @@ void handleStatusPayload(const uint8_t *payload, uint16_t len)
   }
   if (msg.length() == 0)
     msg = "(empty)";
-  radioPrint("RPi STATUS: ");
+  radioPrint("RPI STATUS: ");
   radioPrintln(msg);
+}
+
+// Drain any unsolicited framed UART messages (typically STATUS packets) while idle
+void pollPiUartStatus()
+{
+  if (piCaptureInProgress)
+    return;
+
+  while (Serial2.available() >= 6)
+  {
+    uint16_t rxLen = 0;
+    bool isStatus = false;
+
+    if (!recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus))
+    {
+      return; // recvFramedFromPi already reported the error
+    }
+
+    if (isStatus)
+    {
+      handleStatusPayload(piStatusBuf, rxLen);
+    }
+    else
+    {
+      radioPrint("RPI payload received while idle (" );
+      radioPrint(String(rxLen));
+      radioPrintln(" bytes)");
+    }
+  }
 }
 /**
  * Captures thermal image data from Raspberry Pi via UART
  *
- * Triggers the RPi to capture thermal data, receives the data via UART,
+ * Triggers the RPI to capture thermal data, receives the data via UART,
  * validates the transmission, and stores the image in the buffer.
  * Provides real-time progress updates and data quality assessment.
  */
 void captureThermalImageUART()
 {
   radioPrintln("--- UART THERMAL CAPTURE ---");
-  radioPrintln("Triggering RPi capture...");
+  radioPrintln("Triggering RPI capture...");
+
+  piCaptureInProgress = true;
 
   // Clear any pending UART bytes
   while (Serial2.available())
@@ -1043,28 +1101,33 @@ void captureThermalImageUART()
   delay(10);
   digitalWrite(TRIGGER_PIN, HIGH);
 
-  radioPrintln("Waiting for framed message from RPi...");
+  radioPrintln("Waiting for framed message from RPI...");
 
-  // Receive one framed message (either STATUS or IMAGE)
-  uint16_t rxLen = 0;
-  bool isStatus = false;
+  bool imageReceived = false;
 
-  if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
+  while (!imageReceived)
   {
-    radioPrintln("ERROR: Failed to receive framed message");
-    return;
+    uint16_t rxLen = 0;
+    bool isStatus = false;
+
+    if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
+    {
+      radioPrintln("ERROR: Failed to receive framed message");
+      piCaptureInProgress = false;
+      return;
+    }
+
+    if (isStatus)
+    {
+      handleStatusPayload(imgBuf, rxLen);
+      continue;
+    }
+
+    capturedImageLength = rxLen;
+    imageReceived = true;
   }
 
-  if (isStatus)
-  {
-    // Interpret imgBuf[0..rxLen-1] as ASCII "STATUS:...."
-    handleStatusPayload(imgBuf, rxLen);
-    // Nothing else to do; not an image
-    return;
-  }
-
-  // Otherwise it's image data
-  capturedImageLength = rxLen;
+  piCaptureInProgress = false;
 
   radioPrintln("--- UART IMAGE RECEPTION COMPLETE ---");
   radioPrint("Received ");
@@ -1098,6 +1161,9 @@ void captureThermalImageUART()
   {
     radioPrintln("⚠️ Received size smaller than expected for thermal image");
   }
+
+  // Drain any post-capture status messages immediately
+  pollPiUartStatus();
 }
 
 /**
@@ -1159,7 +1225,7 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
  * data packets, and end packet. Provides transmission statistics
  * and quality assessment. Requires captured image data to be present.
  */
-void sendViaRadio()
+void sendThermalDataViaRadio()
 {
   if (capturedImageLength == 0)
   {

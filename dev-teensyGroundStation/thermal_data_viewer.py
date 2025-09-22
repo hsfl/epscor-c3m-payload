@@ -16,7 +16,7 @@ def main():
         filename = sys.argv[1]
         print("Using filename: " + filename) 
     else:
-        filename = 'thermal_image1.txt'
+        filename = 'thermal_data_001.csv'
         print("Using default filename: " + filename) 
     
     # Check if file exists
