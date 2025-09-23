@@ -11,7 +11,7 @@
  * - Version management
  *
  * Version: 1.0.0
- * Build Date: 2024-01-15
+ * Build Date: 2025-09-10
  * Author: Artemis CubeSat Team
  */
 
@@ -69,7 +69,7 @@ int lastRSSI = 0;                  // Signal strength of last received packet
 bool autoMode = false;
 
 // Packet size configuration
-const uint8_t PACKET_DATA_SIZE = 45; // Data payload size per packet
+const uint8_t PACKET_DATA_SIZE = RADIO_PACKET_MAX_SIZE - 2; // Data payload size per packet (excludes 2-byte header)
 
 // Serial message radio reception parameters
 const uint8_t SERIAL_MSG_TYPE = 0xAA;          // Message type identifier for serial output
