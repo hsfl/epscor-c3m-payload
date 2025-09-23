@@ -48,7 +48,7 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
-const uint8_t RADIO_PACKET_MAX_SIZE = 45; // RF22 payload limit for reliable recv/tx
+const uint8_t RADIO_PACKET_MAX_SIZE = 47; // RF22 payload limit for reliable recv/tx
 
 // === UART / Framing constants ===
 #define UART_BAUD 115200 // <-- set this to match the Pi; 921600 is fine on Teensy 4.1
@@ -91,8 +91,8 @@ const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial 
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
 // Shared radio buffers to avoid stack allocations inside hot paths
-uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE];
-uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE];
+uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + 2];
+uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + 2];
 uint8_t radioSerialTxBuffer[MAX_SERIAL_MSG_LEN + 2];
 
 /**
@@ -1089,6 +1089,8 @@ void captureThermalImageUART()
 {
   radioPrintln("--- UART THERMAL CAPTURE ---");
   radioPrintln("Triggering RPI capture...");
+
+  //TODO clear the imgBuffer for the new photo
 
   piCaptureInProgress = true;
 

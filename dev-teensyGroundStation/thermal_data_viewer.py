@@ -2,7 +2,7 @@
 Thermal Data Viewer
 Displays thermal image data from CSV files captured by the ground station
 Usage: python thermal_data_viewer.py [filename]
-If no filename is provided, defaults to thermal_image1.txt
+If no filename is provided, defaults to thermal_data_001.csv
 """
 
 import numpy as np

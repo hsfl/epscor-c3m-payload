@@ -41,11 +41,11 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
-const uint8_t RADIO_PACKET_MAX_SIZE = 45; // RF22 payload limit for reliable recv/tx
+const uint8_t RADIO_PACKET_MAX_SIZE = 47; // RF22 payload limit of 50 for reliable recv/tx, 47 for reliability.
 
 // Shared radio buffers to avoid per-call stack allocations
-uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE];
-uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE];
+uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + 2];
+uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + 2];
 
 // Image reception buffer and tracking variables
 const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
