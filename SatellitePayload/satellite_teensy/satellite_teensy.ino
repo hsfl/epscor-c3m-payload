@@ -813,7 +813,7 @@ void initRadio()
  */
 void loop()
 {
-  pollPiUartStatus();
+  pollPIUartStatus();
 
   // Handle commands from ground station via radio
   while (rf23.available())
@@ -1051,7 +1051,7 @@ void handleStatusPayload(const uint8_t *payload, uint16_t len)
 }
 
 // Drain any unsolicited framed UART messages (typically STATUS packets) while idle
-void pollPiUartStatus()
+void pollPIUartStatus()
 {
   if (piCaptureInProgress)
     return;
@@ -1165,7 +1165,7 @@ void captureThermalImageUART()
   }
 
   // Drain any post-capture status messages immediately
-  pollPiUartStatus();
+  pollPIUartStatus();
 }
 
 /**
