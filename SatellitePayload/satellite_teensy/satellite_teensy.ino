@@ -48,8 +48,6 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
-const uint8_t RADIO_PACKET_MAX_SIZE = 47; // RF22 payload limit for reliable recv/tx
-
 // === UART / Framing constants ===
 #define UART_BAUD 115200 // <-- set this to match the Pi; 921600 is fine on Teensy 4.1
 
@@ -77,23 +75,26 @@ uint32_t rpiPowerOnTimestamp = 0;
 bool rpiBootNotificationSent = false;
 
 // Serial output redirection
-String serialBuffer = "";           // Buffer to accumulate serial output
+String serialBuffer = "";            // Buffer to accumulate serial output
 bool radioReady = false;             // Flag to indicate if radio is ready for transmission
 bool serialBufferAtLineStart = true; // Tracks when to prepend the SAT> prefix
 
 // Radio transmission parameters
-const uint8_t PACKET_DATA_SIZE = RADIO_PACKET_MAX_SIZE - 2; // Data payload size per packet (excludes 2-byte header)
-const uint16_t PACKET_DELAY_MS = 20; // Delay between packet transmissions
+const uint8_t RADIO_PACKET_MAX_SIZE = 49; // RF22 payload limit for reliable recv/tx
+
+const uint8_t THERMAL_PACKET_OVERHEAD = 2 /*packet index*/ + 2 /*CRC16*/;
+const uint8_t PACKET_DATA_SIZE = RADIO_PACKET_MAX_SIZE - THERMAL_PACKET_OVERHEAD; // Max bytes of image data per radio packet
+const uint16_t PACKET_DELAY_MS = 50;                                              // Delay between packet transmissions
 
 // Serial message radio transmission parameters
-const uint8_t SERIAL_MSG_TYPE = 0xAA;          // Message type identifier for serial output
+const uint8_t SERIAL_MSG_TYPE = 0xAA;                         // Message type identifier for serial output
 const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
-const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
+const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indicates additional chunks follow
 
 // Shared radio buffers to avoid stack allocations inside hot paths
-uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + 2];
-uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + 2];
-uint8_t radioSerialTxBuffer[MAX_SERIAL_MSG_LEN + 2];
+uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
+uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
+uint8_t radioSerialTxBuffer[MAX_SERIAL_MSG_LEN + RADIO_PACKET_MAX_SIZE];
 
 /**
  * Dumps a raw snapshot of the RF23 RX FIFO via radio debug output.
@@ -923,6 +924,28 @@ bool endOK(const uint8_t *e)
   return e[0] == UART_END[0] && e[1] == UART_END[1];
 }
 
+// Standard CRC-16/CCITT-FALSE for cross-checking packet integrity
+uint16_t crc16_ccitt(const uint8_t *data, size_t len)
+{
+  uint16_t crc = 0xFFFF;
+  while (len--)
+  {
+    crc ^= (uint16_t)(*data++) << 8;
+    for (uint8_t i = 0; i < 8; ++i)
+    {
+      if (crc & 0x8000)
+      {
+        crc = (crc << 1) ^ 0x1021;
+      }
+      else
+      {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
+}
+
 // Identify STATUS vs IMAGE by looking for ASCII "STATUS:" prefix
 bool payloadIsStatus(const uint8_t *payload, uint16_t len)
 {
@@ -1072,7 +1095,7 @@ void pollPIUartStatus()
     }
     else
     {
-      radioPrint("RPI payload received while idle (" );
+      radioPrint("RPI payload received while idle (");
       radioPrint(String(rxLen));
       radioPrintln(" bytes)");
     }
@@ -1090,7 +1113,8 @@ void captureThermalImageUART()
   radioPrintln("--- UART THERMAL CAPTURE ---");
   radioPrintln("Triggering RPI capture...");
 
-  //TODO clear the imgBuffer for the new photo
+  memset(imgBuf, 0, MAX_IMG); // Clear previous frame residue
+  capturedImageLength = 0;
 
   piCaptureInProgress = true;
 
@@ -1235,43 +1259,53 @@ void sendThermalDataViaRadio()
     return;
   }
 
+  const uint16_t totalPackets = (capturedImageLength + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;
+  if (totalPackets == 0)
+  {
+    radioPrintln("No packets to transmit");
+    return;
+  }
+
+  const uint16_t imageCrc = crc16_ccitt(imgBuf, capturedImageLength);
+
   radioPrintln("--- SENDING THERMAL IMAGE VIA RADIO ---");
   radioPrint("Image size: ");
   radioPrint(String(capturedImageLength));
   radioPrintln(" bytes");
-
-  // Calculate total packets needed
-  uint16_t totalPackets = (capturedImageLength + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;
   radioPrint("Total packets: ");
   radioPrintln(String(totalPackets));
 
-  // Send header packet with image metadata
-  radioPrintln("Sending header...");
+  Serial.println(F("=== Radio thermal downlink ==="));
+  Serial.print(F("Bytes: "));
+  Serial.println(capturedImageLength);
+  Serial.print(F("Packets: "));
+  Serial.println(totalPackets);
+  Serial.print(F("Image CRC16: 0x"));
+  Serial.println(imageCrc, HEX);
+
   memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
-  radioTxBuffer[0] = 0xFF; // TODO: tf does this mean
+  radioTxBuffer[0] = 0xFF;
   radioTxBuffer[1] = 0xFF;
-  radioTxBuffer[2] = capturedImageLength & 0xFF; // Image length (little-endian)
+  radioTxBuffer[2] = capturedImageLength & 0xFF;
   radioTxBuffer[3] = (capturedImageLength >> 8) & 0xFF;
-  radioTxBuffer[4] = totalPackets & 0xFF; // Total packets (little-endian)
+  radioTxBuffer[4] = totalPackets & 0xFF;
   radioTxBuffer[5] = (totalPackets >> 8) & 0xFF;
-  radioTxBuffer[6] = 0xDE; // Magic bytes for validation
+  radioTxBuffer[6] = 0xDE;
   radioTxBuffer[7] = 0xAD;
   radioTxBuffer[8] = 0xBE;
   radioTxBuffer[9] = 0xEF;
 
-  // Send header with retry logic
   bool headerSent = false;
   for (int retry = 0; retry < 5 && !headerSent; retry++)
   {
     if (sendPacketReliable(radioTxBuffer, 10))
     {
       headerSent = true;
-      radioPrintln("✓ Header sent");
     }
     else
     {
-      radioPrint("Header retry ");
-      radioPrintln(String(retry + 1));
+      Serial.print(F("Header retry "));
+      Serial.println(retry + 1);
       delay(200);
     }
   }
@@ -1282,10 +1316,8 @@ void sendThermalDataViaRadio()
     return;
   }
 
-  delay(1000); // Wait for receiver to prepare
+  delay(500); // Allow ground station to prime RX path
 
-  // Send data packets
-  radioPrintln("Sending data packets...");
   uint16_t bytesSent = 0;
   uint16_t packetNum = 0;
   uint16_t successCount = 0;
@@ -1296,26 +1328,17 @@ void sendThermalDataViaRadio()
   {
     uint16_t remaining = capturedImageLength - bytesSent;
     uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
-    memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
 
-    // Packet number (little-endian)
     radioTxBuffer[0] = packetNum & 0xFF;
     radioTxBuffer[1] = (packetNum >> 8) & 0xFF;
-
-    // Copy image data to packet
     memcpy(&radioTxBuffer[2], &imgBuf[bytesSent], chunkSize);
 
-    // Progress update every 50 packets
-    if (packetNum % 50 == 0)
-    {
-      float progress = (float)bytesSent / capturedImageLength * 100;
-      radioPrint("Progress: ");
-      radioPrint(String(progress, 1));
-      radioPrintln("%");
-    }
+    uint16_t packetCrc = crc16_ccitt(&radioTxBuffer[2], chunkSize);
+    radioTxBuffer[2 + chunkSize] = packetCrc & 0xFF;
+    radioTxBuffer[3 + chunkSize] = (packetCrc >> 8) & 0xFF;
 
-    // Send packet with retry logic
-    if (sendPacketReliable(radioTxBuffer, chunkSize + 2))
+    uint8_t frameLen = chunkSize + THERMAL_PACKET_OVERHEAD;
+    if (sendPacketReliable(radioTxBuffer, frameLen))
     {
       successCount++;
     }
@@ -1326,46 +1349,65 @@ void sendThermalDataViaRadio()
 
     bytesSent += chunkSize;
     packetNum++;
-    delay(PACKET_DELAY_MS); // Delay between packets
+
+    if (((packetNum & 0x3F) == 0) || bytesSent >= capturedImageLength)
+    {
+      Serial.print(F("TX bytes: "));
+      Serial.print(bytesSent);
+      Serial.print(F("/"));
+      Serial.println(capturedImageLength);
+    }
+
+    delay(PACKET_DELAY_MS);
   }
 
-  // Send end packet to signal completion
-  radioPrintln("Sending end packet...");
   memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
-  radioTxBuffer[0] = 0xEE; // End packet magic bytes
+  radioTxBuffer[0] = 0xEE;
   radioTxBuffer[1] = 0xEE;
-  radioTxBuffer[2] = packetNum & 0xFF; // Final packet count (little-endian)
+  radioTxBuffer[2] = packetNum & 0xFF;
   radioTxBuffer[3] = (packetNum >> 8) & 0xFF;
-  radioTxBuffer[4] = 0xFF; // Padding
-  radioTxBuffer[5] = 0xFF;
+  radioTxBuffer[4] = imageCrc & 0xFF;
+  radioTxBuffer[5] = (imageCrc >> 8) & 0xFF;
 
-  // Send end packet multiple times for reliability
-  for (int i = 0; i < 3; i++)
+  if (!sendPacketReliable(radioTxBuffer, 6))
   {
-    sendPacketReliable(radioTxBuffer, 6);
-    delay(200);
+    radioPrintln("❌ Failed to send end data packet!");
+    return;
   }
 
-  // Display transmission summary
-  float duration = (millis() - startTime) / 1000.0;
+  unsigned long elapsed = millis() - startTime;
+  float duration = elapsed / 1000.0f;
+  float successPct = totalPackets ? (float)successCount * 100.0f / totalPackets : 0.0f;
+  float dataRate = duration > 0.001f ? capturedImageLength / duration : 0.0f;
+
+  Serial.print(F("Packets ok: "));
+  Serial.print(successCount);
+  Serial.print(F("/"));
+  Serial.println(totalPackets);
+  if (failCount > 0)
+  {
+    Serial.print(F("Failed sends: "));
+    Serial.println(failCount);
+  }
+  Serial.print(F("Elapsed (s): "));
+  Serial.println(duration, 2);
+  Serial.print(F("Data rate (B/s): "));
+  Serial.println(dataRate, 1);
+
   radioPrintln("=== TRANSMISSION COMPLETE ===");
-  radioPrint("Packets sent: ");
+  radioPrint("Packets ok: ");
   radioPrint(String(successCount));
   radioPrint("/");
   radioPrint(String(totalPackets));
   radioPrint(" (");
-  radioPrint(String((float)successCount / totalPackets * 100, 1));
-  radioPrintln("% success rate)");
-
-  radioPrint("Duration: ");
-  radioPrint(String(duration, 1));
-  radioPrintln(" seconds");
-
+  radioPrint(String(successPct, 1));
+  radioPrintln("%)");
   radioPrint("Data rate: ");
-  radioPrint(String(capturedImageLength / duration, 0));
+  radioPrint(String(dataRate, 0));
   radioPrintln(" bytes/sec");
+  radioPrint("Image CRC16: 0x");
+  radioPrintln(String(imageCrc, HEX));
 
-  // Quality assessment based on success rate
   if (successCount == totalPackets)
   {
     radioPrintln("✅ Perfect transmission!");

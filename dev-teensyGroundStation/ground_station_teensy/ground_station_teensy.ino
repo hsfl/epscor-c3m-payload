@@ -41,20 +41,20 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
-const uint8_t RADIO_PACKET_MAX_SIZE = 47; // RF22 payload limit of 50 for reliable recv/tx, 47 for reliability.
-
-// Shared radio buffers to avoid per-call stack allocations
-uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + 2];
-uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + 2];
+const uint8_t LED_PIN = 13;
 
 // Image reception buffer and tracking variables
-const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
-uint8_t imgBuffer[MAX_IMG];     // Buffer to store received thermal image data
-uint16_t expectedLength = 0;    // Expected total image size from header
-uint16_t expectedPackets = 0;   // Total number of packets expected
-uint16_t receivedPackets = 0;   // Number of packets successfully received
-bool headerReceived = false;    // Flag indicating header packet was received
-bool imageComplete = false;     // Flag indicating all data was received
+const uint32_t MAX_IMG = 40000;    // Maximum image buffer size (40KB)
+uint8_t imgBuffer[MAX_IMG];        // Buffer to store received thermal image data
+uint16_t expectedLength = 0;       // Expected total image size from header
+uint16_t expectedPackets = 0;      // Total number of packets expected
+uint16_t receivedPackets = 0;      // Number of packets successfully received
+bool headerReceived = false;       // Flag indicating header packet was received
+bool imageComplete = false;        // Flag indicating all data was received
+uint16_t expectedImageCrc = 0;     // CRC expected from satellite end packet
+uint16_t lastComputedImageCrc = 0; // CRC calculated locally after reception
+uint32_t crcErrorCount = 0;        // Count of packets dropped due to CRC mismatch
+bool crcVerified = false;          // True when computed CRC matches expected CRC
 
 // Packet tracking for duplicate detection and missing packet identification
 bool packetReceived[1200]; // Array to track which packets have been received
@@ -69,7 +69,12 @@ int lastRSSI = 0;                  // Signal strength of last received packet
 bool autoMode = false;
 
 // Packet size configuration
-const uint8_t PACKET_DATA_SIZE = RADIO_PACKET_MAX_SIZE - 2; // Data payload size per packet (excludes 2-byte header)
+const uint8_t RADIO_PACKET_MAX_SIZE = 49; // RF22 payload limit of 50 for reliable recv/tx, 47 for reliability.
+const uint8_t THERMAL_PACKET_OVERHEAD = 2 /*packet index*/ + 2 /*CRC16*/;
+const uint8_t PACKET_DATA_SIZE = RADIO_PACKET_MAX_SIZE - THERMAL_PACKET_OVERHEAD; // Data payload size per packet (excludes index+CRC)
+// Shared radio buffers to avoid per-call stack allocations
+uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
+uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + THERMAL_PACKET_OVERHEAD];
 
 // Serial message radio reception parameters
 const uint8_t SERIAL_MSG_TYPE = 0xAA;          // Message type identifier for serial output
@@ -161,7 +166,7 @@ const int numCommands = sizeof(commands) / sizeof(commands[0]);
 // Helper: send 2-byte packet to satellite ('p', <sub>) and wait for send
 bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeout_ms = 500)
 {
-  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(LED_PIN, HIGH);
   bool ok = false;
 
   if (!rf23.send((uint8_t *)data, len))
@@ -178,7 +183,7 @@ bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeou
 
   // small safety gap then go to idle
   delay(5);
-  digitalWrite(LED_BUILTIN, LOW);
+  digitalWrite(LED_PIN, LOW);
   // rf23.setModeIdle();
   return ok;
 }
@@ -349,6 +354,11 @@ void clearReception()
   expectedPackets = 0;
   receivedPackets = 0;
   maxPacketNum = 0;
+  expectedImageCrc = 0;
+  lastComputedImageCrc = 0;
+  crcErrorCount = 0;
+  crcVerified = false;
+  memset(imgBuffer, 0, MAX_IMG);
   memset(packetReceived, false, sizeof(packetReceived)); // Clear packet tracking array
 }
 
@@ -357,12 +367,12 @@ void handlePacket()
   uint8_t len = sizeof(radioRxBuffer);
   if (rf23.recv(radioRxBuffer, &len))
   {
-    digitalWrite(LED_BUILTIN, HIGH); // Turn on LED to indicate packet reception
+    digitalWrite(LED_PIN, HIGH); // Turn on LED to indicate packet reception
     lastPacketTime = millis();
     lastRSSI = rf23.lastRssi(); // Store signal strength
     packetsReceived++;
     processPacket(radioRxBuffer, len); // Process the received packet
-    digitalWrite(LED_BUILTIN, LOW);    // Turn off LED
+    digitalWrite(LED_PIN, LOW);        // Turn off LED
   }
 }
 
@@ -397,6 +407,9 @@ void processPacket(uint8_t *buf, uint8_t len)
     handleDataPacket(buf, len);
     return;
   }
+
+  Serial.println("Unknown packet?!");
+  dumpRf23PendingPacketsToSerial();
 }
 
 void handleHeaderPacket(uint8_t *buf)
@@ -413,15 +426,28 @@ void handleHeaderPacket(uint8_t *buf)
   Serial.print("Expected packets: ");
   Serial.println(expectedPackets);
 
+  if (expectedLength > MAX_IMG)
+  {
+    Serial.println("✗ Header length exceeds local buffer; aborting reception");
+    clearReception();
+    return;
+  }
+
   // Validate magic bytes (0xDE 0xAD 0xBE 0xEF)
   if (buf[6] == 0xDE && buf[7] == 0xAD && buf[8] == 0xBE && buf[9] == 0xEF)
   {
     Serial.println("✓ Header valid - receiving thermal data...");
     headerReceived = true;
     imageComplete = false;
+    autoMode = true;
     receivedPackets = 0;
     maxPacketNum = 0;
+    expectedImageCrc = 0;
+    lastComputedImageCrc = 0;
+    crcErrorCount = 0;
+    crcVerified = false;
     memset(packetReceived, false, sizeof(packetReceived)); // Reset packet tracking
+    memset(imgBuffer, 0, expectedLength);
   }
   else
   {
@@ -433,10 +459,30 @@ void handleEndPacket(uint8_t *buf)
 {
   // Serial.println("Inside satellite end packet");
   uint16_t finalCount = buf[2] | (buf[3] << 8); // Extract final packet count
+  expectedImageCrc = buf[4] | (buf[5] << 8);
   Serial.println("\n🏁 END PACKET RECEIVED!");
   Serial.print("Transmitter sent ");
   Serial.print(finalCount);
   Serial.println(" packets");
+
+  if (expectedLength > 0)
+  {
+    lastComputedImageCrc = crc16_ccitt(imgBuffer, expectedLength);
+    crcVerified = (expectedImageCrc == lastComputedImageCrc);
+    Serial.print("Image CRC16 expected 0x");
+    Serial.print(expectedImageCrc, HEX);
+    Serial.print(", computed 0x");
+    Serial.print(lastComputedImageCrc, HEX);
+    Serial.println(crcVerified ? " (match)" : " (MISMATCH)");
+  }
+
+  if (finalCount != expectedPackets)
+  {
+    Serial.print("⚠️ End packet reports ");
+    Serial.print(finalCount);
+    Serial.print(" packets but header expected ");
+    Serial.println(expectedPackets);
+  }
 
   imageComplete = true;
   autoMode = false; // Exit auto mode
@@ -446,12 +492,38 @@ void handleEndPacket(uint8_t *buf)
 void handleDataPacket(uint8_t *buf, uint8_t len)
 {
   // Serial.println("Inside satellite data packet");
-  if (len < 3)
+  if (len <= THERMAL_PACKET_OVERHEAD)
+  {
+    Serial.println("ERROR: data packet len less than thermal packet overhead?!");
     return; // Minimum packet size check
+  }
 
   // Extract packet number and data length
-  uint16_t packetNum = buf[0] | (buf[1] << 8); // Little-endian packet number
-  uint8_t dataLen = len - 2;                   // Data length excludes packet number bytes
+  uint16_t packetNum = buf[0] | (buf[1] << 8);     // Little-endian packet number
+  uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD; // Data length excludes packet number and CRC
+  uint16_t packetCrc = buf[2 + dataLen] | (buf[3 + dataLen] << 8);
+  uint16_t computedCrc = crc16_ccitt(&buf[2], dataLen);
+
+  if (computedCrc != packetCrc)
+  {
+    Serial.println("crc error increment up...");
+    crcErrorCount++;
+    if (crcErrorCount <= 10)
+    {
+      Serial.print("CRC mismatch on packet ");
+      Serial.print(packetNum);
+      Serial.print(" (expected 0x");
+      Serial.print(packetCrc, HEX);
+      Serial.print(", computed 0x");
+      Serial.print(computedCrc, HEX);
+      Serial.println(")");
+      if (crcErrorCount == 10)
+      {
+        Serial.println("Further CRC mismatch logs suppressed");
+      }
+    }
+    return; // Discard corrupt packet
+  }
 
   if (packetNum >= 1200)
     return; // Bounds check for packet number
@@ -460,8 +532,10 @@ void handleDataPacket(uint8_t *buf, uint8_t len)
   if (!packetReceived[packetNum])
   {
     uint32_t bufferPos = (uint32_t)packetNum * PACKET_DATA_SIZE; // Calculate buffer position
-    if (bufferPos + dataLen <= MAX_IMG)
-    {                                                  // Buffer overflow protection
+    uint32_t bound = expectedLength > 0 ? expectedLength : MAX_IMG;
+    // Buffer overflow protection
+    if (bufferPos + dataLen <= bound)
+    {
       memcpy(&imgBuffer[bufferPos], &buf[2], dataLen); // Copy data to buffer
       packetReceived[packetNum] = true;                // Mark packet as received
       receivedPackets++;
@@ -471,19 +545,24 @@ void handleDataPacket(uint8_t *buf, uint8_t len)
         maxPacketNum = packetNum; // Track highest packet number
       }
 
-      // Progress indication in auto mode
-      if (autoMode && receivedPackets % 10 == 0)
-      {
-        Serial.print(".");
-        if (receivedPackets % 100 == 0)
-        {
-          float progress = (float)receivedPackets / expectedPackets * 100;
-          Serial.print(" ");
-          Serial.print(progress, 0);
-          Serial.println("%");
-        }
-      }
+      // // Progress indication in auto mode
+      // if (autoMode && receivedPackets % 10 == 0)
+      // {
+      //   Serial.print(".");
+      //   if (receivedPackets % 100 == 0)
+      //   {
+      //     float progress = (float)receivedPackets / expectedPackets * 100;
+      //     Serial.print(" ");
+      //     Serial.print(progress, 0);
+      //     Serial.println("%");
+      //   }
+      // }
     }
+    else
+      return;
+  }
+  else {
+    return; //debugging REMOVE THIS LATER
   }
 }
 
@@ -637,6 +716,28 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
   return true;
 }
 
+// Standard CRC-16/CCITT-FALSE helper used for thermal payload validation
+uint16_t crc16_ccitt(const uint8_t *data, size_t len)
+{
+  uint16_t crc = 0xFFFF;
+  while (len--)
+  {
+    crc ^= (uint16_t)(*data++) << 8;
+    for (uint8_t i = 0; i < 8; ++i)
+    {
+      if (crc & 0x8000)
+      {
+        crc = (crc << 1) ^ 0x1021;
+      }
+      else
+      {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
+}
+
 void runAutoMode()
 {
   Serial.println("\n=== AUTO MODE - THERMAL IMAGE RECEPTION ===");
@@ -691,8 +792,36 @@ void showReceptionSummary()
   Serial.print(" of ");
   Serial.print(expectedPackets);
   Serial.print(" packets (");
-  Serial.print((float)receivedPackets / expectedPackets * 100, 1);
+  float pct = (expectedPackets > 0) ? ((float)receivedPackets / expectedPackets * 100.0f) : 0.0f;
+  Serial.print(pct, 1);
   Serial.println("%)");
+
+  if (crcErrorCount > 0)
+  {
+    Serial.print("Packets discarded (CRC): ");
+    Serial.println(crcErrorCount);
+  }
+
+  if (expectedImageCrc != 0 || lastComputedImageCrc != 0)
+  {
+    Serial.print("Image CRC16 expected 0x");
+    Serial.print(expectedImageCrc, HEX);
+    Serial.print(", computed 0x");
+    Serial.print(lastComputedImageCrc, HEX);
+    Serial.println(crcVerified ? " (match)" : " (MISMATCH)");
+  }
+
+  if (expectedPackets > 0 && receivedPackets < expectedPackets)
+  {
+    Serial.print("Missing packets: ");
+    Serial.println(expectedPackets - receivedPackets);
+    
+    for(int index = 0; index < expectedPackets; index++) {
+      if(!packetReceived[index]) {
+        Serial.println(index);
+      }
+    }
+  }
 
   // Quality assessment based on reception rate
   if (receivedPackets == expectedPackets)
@@ -727,8 +856,13 @@ void exportThermalData()
     return;
   }
 
+  if (!crcVerified)
+  {
+    Serial.println("⚠️ Warning: image CRC mismatch – export may contain corrupt data");
+  }
+
   Serial.println("\n--- EXPORTING THERMAL DATA ---");
-  Serial.println("Copy data below to 'thermal_image.csv'");
+  Serial.println("Copying data below to a 'thermal_image.csv'");
   Serial.println("=== START CSV ===");
 
   // Export thermal data as CSV (120x160 pixel grid)
@@ -787,7 +921,7 @@ void forwardToSatellite(char cmd)
   }
 
   Serial.println("Forwarding command to satellite...");
-  digitalWrite(LED_BUILTIN, HIGH); // Turn on LED during transmission
+  digitalWrite(LED_PIN, HIGH); // Turn on LED during transmission
 
   // Send the command
   if (!rf23.send((uint8_t *)&cmd, 1))
@@ -809,7 +943,7 @@ void forwardToSatellite(char cmd)
     }
   }
 
-  digitalWrite(LED_BUILTIN, LOW); // Turn off LED
+  digitalWrite(LED_PIN, LOW); // Turn off LED
   // rf23.setModeIdle();             // Return to idle mode
   return;
 }
@@ -859,7 +993,7 @@ void cmdStatus(const char *args)
   cmdTime(args);
 
   Serial.print("GS LED Status: ");
-  Serial.println(digitalRead(LED_BUILTIN) ? "ON" : "OFF");
+  Serial.println(digitalRead(LED_PIN) ? "ON" : "OFF");
 
   Serial.print("Commands in history: ");
   Serial.println(historyIndex);
@@ -902,19 +1036,19 @@ void cmdLed(const char *args)
 
   if (argStr == "on")
   {
-    digitalWrite(LED_BUILTIN, HIGH);
+    digitalWrite(LED_PIN, HIGH);
     Serial.println("LED turned ON");
   }
   else if (argStr == "off")
   {
-    digitalWrite(LED_BUILTIN, LOW);
+    digitalWrite(LED_PIN, LOW);
     Serial.println("LED turned OFF");
   }
   else if (argStr == "toggle")
   {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     Serial.print("LED toggled to ");
-    Serial.println(digitalRead(LED_BUILTIN) ? "ON" : "OFF");
+    Serial.println(digitalRead(LED_PIN) ? "ON" : "OFF");
   }
   else
   {
@@ -1253,8 +1387,8 @@ void setup()
   inputBuffer = "";
 
   // Initialize built-in LED to off.
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   // Configure the Raspberry Pi control pin
   pinMode(RASPBERRY_PI_GPIO_PIN, OUTPUT);
@@ -1312,7 +1446,12 @@ void loop()
   if (rf23.available())
   {
     handlePacket();
-    printPrompt();
+
+    if (!autoMode)
+    {
+      // dont spam the serial line when reading data packets.
+      printPrompt();
+    }
   }
 
   // Read entire line when available
