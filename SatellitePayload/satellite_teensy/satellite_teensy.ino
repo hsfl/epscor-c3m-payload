@@ -397,7 +397,7 @@ void listenForCommands()
           digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
           rpiPowerOnTimestamp = millis();
           rpiBootNotificationSent = false;
-          radioPrintln("RPI POWER: ON (Wait 80 seconds before image capture)");
+          radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
         }
         else if (sub == '0')
         {

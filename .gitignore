@@ -1,3 +1,5 @@
 dev-teensyGroundStation/.DS_Store
+.vscode/
 .vscode/extensions.json
-dev-teensyGroundStation/.DS_Store
+
+thermal_data_*.csv

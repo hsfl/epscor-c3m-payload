@@ -44,17 +44,18 @@ RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 const uint8_t LED_PIN = 13;
 
 // Image reception buffer and tracking variables
-const uint32_t MAX_IMG = 40000;    // Maximum image buffer size (40KB)
-uint8_t imgBuffer[MAX_IMG];        // Buffer to store received thermal image data
-uint16_t expectedLength = 0;       // Expected total image size from header
-uint16_t expectedPackets = 0;      // Total number of packets expected
-uint16_t receivedPackets = 0;      // Number of packets successfully received
-bool headerReceived = false;       // Flag indicating header packet was received
-bool imageComplete = false;        // Flag indicating all data was received
-uint16_t expectedImageCrc = 0;     // CRC expected from satellite end packet
-uint16_t lastComputedImageCrc = 0; // CRC calculated locally after reception
-uint32_t crcErrorCount = 0;        // Count of packets dropped due to CRC mismatch
-bool crcVerified = false;          // True when computed CRC matches expected CRC
+const uint32_t MAX_IMG = 40000;      // Maximum image buffer size (40KB)
+uint8_t imgBuffer[MAX_IMG];          // Buffer to store received thermal image data
+uint16_t expectedLength = 0;         // Expected total image size from header
+uint16_t expectedPackets = 0;        // Total number of packets expected
+uint16_t receivedPackets = 0;        // Number of packets successfully received
+bool headerReceived = false;         // Flag indicating header packet was received
+bool downloadingThermalData = false; // Flag indicating active thermal data packet transfer
+bool imageComplete = false;          // Flag indicating all data was received
+uint16_t expectedImageCrc = 0;       // CRC expected from satellite end packet
+uint16_t lastComputedImageCrc = 0;   // CRC calculated locally after reception
+uint32_t crcErrorCount = 0;          // Count of packets dropped due to CRC mismatch
+bool crcVerified = false;            // True when computed CRC matches expected CRC
 
 // Packet tracking for duplicate detection and missing packet identification
 bool packetReceived[1200]; // Array to track which packets have been received
@@ -106,9 +107,9 @@ void initRadio();
 void clearReception();
 void handlePacket();
 void processPacket(uint8_t *buf, uint8_t len);
-void handleHeaderPacket(uint8_t *buf);
-void handleEndPacket(uint8_t *buf);
-void handleDataPacket(uint8_t *buf, uint8_t len);
+void handleThermalHeaderPacket(uint8_t *buf);
+void handleThermalEndPacket(uint8_t *buf);
+void handleThermalDataPacket(uint8_t *buf, uint8_t len);
 bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut = nullptr);
 void runAutoMode();
 void showReceptionSummary();
@@ -333,9 +334,9 @@ void initRadio()
   if (!rf23.init())
   {
     Serial.println("Radio init failed!");
-    while (1)
-      ; // Halt if radio initialization fails
-        // TODO: graceful fail here... wait like 5 seconds then boot through GS and allow user to self initialize via radio init command
+    Serial.println("Delaying init for 5 seconds, continuing without radio. try 'radio init' again.");
+    delay(5000);
+    return; // Allow GS to continue so user can retry manually
   }
 
   // Configure radio parameters
@@ -379,43 +380,35 @@ void handlePacket()
 
 void processPacket(uint8_t *buf, uint8_t len)
 {
-  // Serial.println("Inside processPacket");
   //  Check for serial message packet (MSG_TYPE + LENGTH + MESSAGE_DATA)
-  if (len >= 2 && buf[0] == SERIAL_MSG_TYPE)
-  //  Check for serial message packet (MSG_TYPE_LOW + MSG_TYPE_HIGH + LENGTH + MESSAGE_DATA)
-  // if (len >= 3 && buf[0] == (SERIAL_MSG_TYPE & 0xFF) && buf[1] == ((SERIAL_MSG_TYPE >> 8) & 0xFF))
+  if (buf[0] == SERIAL_MSG_TYPE && !downloadingThermalData && len >= 2)
   {
     handleSerialMessage(buf, len);
-    // Serial.println("leaving processPacket");
-    return;
   }
-
   // Check for header packet (10 bytes with magic bytes)
-  if (len == 10 && buf[0] == 0xFF && buf[1] == 0xFF)
+  else if (len == 10 && buf[0] == 0xFF && buf[1] == 0xFF)
   {
-    handleHeaderPacket(buf);
-    return;
+    handleThermalHeaderPacket(buf);
   }
-
   // Check for end packet (6 bytes with magic bytes)
-  if (len == 6 && buf[0] == 0xEE && buf[1] == 0xEE)
+  else if (len == 6 && buf[0] == 0xEE && buf[1] == 0xEE)
   {
-    handleEndPacket(buf);
-    return;
+    handleThermalEndPacket(buf);
   }
-
   // Check for data packet (requires valid header and incomplete image)
-  if (len >= 3 && headerReceived && !imageComplete)
+  else if (headerReceived && !imageComplete && len >= 3)
   {
-    handleDataPacket(buf, len);
-    return;
+    handleThermalDataPacket(buf, len);
   }
-
-  Serial.println("Unknown packet?!");
-  dumpRf23PendingPacketsToSerial();
+  else
+  {
+    // should never hit this but leave for debugging radio packets.
+    Serial.println("Unknown radio packet?! Dumping radio packets.");
+    dumpRf23PendingPacketsToSerial();
+  }
 }
 
-void handleHeaderPacket(uint8_t *buf)
+void handleThermalHeaderPacket(uint8_t *buf)
 {
   // Serial.println("Inside satellite header packet");
   //  Extract image size and packet count (little-endian format)
@@ -442,6 +435,7 @@ void handleHeaderPacket(uint8_t *buf)
     Serial.println("✓ Header valid - receiving thermal data...");
     headerReceived = true;
     imageComplete = false;
+    downloadingThermalData = false;
     autoMode = true;
     receivedPackets = 0;
     maxPacketNum = 0;
@@ -458,9 +452,9 @@ void handleHeaderPacket(uint8_t *buf)
   }
 }
 
-void handleEndPacket(uint8_t *buf)
+void handleThermalEndPacket(uint8_t *buf)
 {
-  // Serial.println("Inside satellite end packet");
+  downloadingThermalData = false;
   uint16_t finalCount = buf[2] | (buf[3] << 8); // Extract final packet count
   expectedImageCrc = buf[4] | (buf[5] << 8);
   Serial.println("\n🏁 END PACKET RECEIVED!");
@@ -492,7 +486,7 @@ void handleEndPacket(uint8_t *buf)
   showReceptionSummary();
 }
 
-void handleDataPacket(uint8_t *buf, uint8_t len)
+void handleThermalDataPacket(uint8_t *buf, uint8_t len)
 {
   // Serial.println("Inside satellite data packet");
   if (len <= THERMAL_PACKET_OVERHEAD)
@@ -531,6 +525,7 @@ void handleDataPacket(uint8_t *buf, uint8_t len)
   if (packetNum >= 1200)
     return; // Bounds check for packet number
 
+  downloadingThermalData = true;
   // Process packet only if not already received (duplicate detection)
   if (!packetReceived[packetNum])
   {
@@ -563,9 +558,6 @@ void handleDataPacket(uint8_t *buf, uint8_t len)
     }
     else
       return;
-  }
-  else {
-    return; //debugging REMOVE THIS LATER
   }
 }
 
@@ -827,9 +819,11 @@ void showReceptionSummary()
   {
     Serial.print("Missing packets: ");
     Serial.println(expectedPackets - receivedPackets);
-    
-    for(int index = 0; index < expectedPackets; index++) {
-      if(!packetReceived[index]) {
+
+    for (int index = 0; index < expectedPackets; index++)
+    {
+      if (!packetReceived[index])
+      {
         Serial.println(index);
       }
     }
@@ -1351,6 +1345,12 @@ void cmdRadio(const char *args)
   {
     dumpRf23PendingPacketsToSerial();
   }
+  // else if (argStr == "reset")
+  // {
+  // Never run rf23.reset on the artemis kit - it seems to break the drivers? functional testing breaks when u call this, leaving this in for future devs.
+  //   rf23.reset();
+  //   Serial.println("Radio softeware reset. Try to run 'radio init' after 3 seconds to re-initialize.");
+  // }
   else
   {
     Serial.println("Usage: radio [init|status|tx|rx|dump]");
