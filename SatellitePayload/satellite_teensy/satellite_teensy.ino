@@ -89,6 +89,8 @@ const uint16_t PACKET_DELAY_MS = 50;                                            
 // Serial message radio transmission parameters
 const uint8_t SERIAL_MSG_TYPE = 0xAA;                         // Message type identifier for serial output
 const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
+// const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
+// const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 3; // Maximum serial message length per packet payload
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indicates additional chunks follow
 
 // Shared radio buffers to avoid stack allocations inside hot paths
@@ -190,6 +192,10 @@ void sendSerialBuffer()
   // Create packet: [MSG_TYPE][LENGTH][MESSAGE_DATA]
   radioSerialTxBuffer[0] = SERIAL_MSG_TYPE;
 
+  // Create packet: [MSG_TYPE_LOW][MSG_TYPE_HIGH][LENGTH][MESSAGE_DATA]
+  // radioSerialTxBuffer[0] = SERIAL_MSG_TYPE & 0xFF;         // Low byte
+  // radioSerialTxBuffer[1] = (SERIAL_MSG_TYPE >> 8) & 0xFF;  // High byte
+
   // Split long messages into chunks
   while (serialBuffer.length() > 0)
   {
@@ -208,13 +214,16 @@ void sendSerialBuffer()
 
     bool hasMore = remaining > chunkSize;
     radioSerialTxBuffer[1] = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
+    // radioSerialTxBuffer[2] = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
 
     // Copy message data
     const char *src = serialBuffer.c_str();
     memcpy(&radioSerialTxBuffer[2], src, chunkSize);
+    // memcpy(&radioSerialTxBuffer[3], src, chunkSize);
 
     // Send packet
     if (sendPacketReliable(radioSerialTxBuffer, chunkSize + 2))
+    // if (sendPacketReliable(radioSerialTxBuffer, chunkSize + 3))
     {
       // Remove sent chunk from buffer
       serialBuffer.remove(0, chunkSize);

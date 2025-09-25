@@ -78,6 +78,7 @@ uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + THERMAL_PACKET_OVERHEAD];
 
 // Serial message radio reception parameters
 const uint8_t SERIAL_MSG_TYPE = 0xAA;          // Message type identifier for serial output
+// const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
 // Global variables
@@ -381,6 +382,8 @@ void processPacket(uint8_t *buf, uint8_t len)
   // Serial.println("Inside processPacket");
   //  Check for serial message packet (MSG_TYPE + LENGTH + MESSAGE_DATA)
   if (len >= 2 && buf[0] == SERIAL_MSG_TYPE)
+  //  Check for serial message packet (MSG_TYPE_LOW + MSG_TYPE_HIGH + LENGTH + MESSAGE_DATA)
+  // if (len >= 3 && buf[0] == (SERIAL_MSG_TYPE & 0xFF) && buf[1] == ((SERIAL_MSG_TYPE >> 8) & 0xFF))
   {
     handleSerialMessage(buf, len);
     // Serial.println("leaving processPacket");
@@ -675,12 +678,20 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
   if (len < 2)
     return false; // Minimum packet size check
 
+
+  // if (len < 3)
+  //   return false; // Minimum packet size check (2-byte type + 1-byte header)
+
   uint8_t header = buf[1];
+  // uint8_t header = buf[2];  // Header is now at index 2 after 2-byte message type
+
   bool hasMore = (header & SERIAL_CONTINUATION_FLAG) != 0;
   uint8_t msgLen = header & 0x7F; // Lower 7 bits carry the actual length
 
   if (msgLen == 0 || len < msgLen + 2)
     return false; // Invalid message length or packet too short
+
+  // if (msgLen == 0 || len < msgLen + 3)    return false; // Invalid message length or packet too short (3-byte overhead)
 
   // Extract message data and print to serial
   String message = "";
@@ -688,6 +699,7 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
   for (uint8_t i = 0; i < msgLen; i++)
   {
     message += (char)buf[2 + i];
+    // message += (char) buf[3 + i];  // Message data starts at index 3
   }
 
   if (messageOut != nullptr)
