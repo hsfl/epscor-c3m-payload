@@ -65,6 +65,7 @@ uint16_t maxPacketNum = 0; // Highest packet number received
 unsigned long packetsReceived = 0; // Total packets received (including duplicates)
 unsigned long lastPacketTime = 0;  // Timestamp of last packet reception
 int lastRSSI = 0;                  // Signal strength of last received packet
+unsigned long thermalDataDownloadDuration = 0;  // Track how long it took to download thermal data
 
 // Auto mode flag for continuous reception
 bool autoMode = false;
@@ -101,6 +102,7 @@ void clearHistory();
 void checkForInterrupt();
 void resetInterrupt();
 bool isInterruptRequested();
+void helperTime(unsigned long durationMillis);
 
 // Radio function declarations
 void initRadio();
@@ -362,6 +364,7 @@ void clearReception()
   crcVerified = false;
   memset(imgBuffer, 0, MAX_IMG);
   memset(packetReceived, false, sizeof(packetReceived)); // Clear packet tracking array
+  lastPacketTime = 0;
 }
 
 void handlePacket()
@@ -481,6 +484,10 @@ void handleThermalEndPacket(uint8_t *buf)
     Serial.println(expectedPackets);
   }
 
+  thermalDataDownloadDuration = millis() - thermalDataDownloadDuration;
+  
+  helperTime(thermalDataDownloadDuration);
+
   imageComplete = true;
   autoMode = false; // Exit auto mode
   showReceptionSummary();
@@ -543,18 +550,18 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
         maxPacketNum = packetNum; // Track highest packet number
       }
 
-      // // Progress indication in auto mode
-      // if (autoMode && receivedPackets % 10 == 0)
-      // {
-      //   Serial.print(".");
-      //   if (receivedPackets % 100 == 0)
-      //   {
-      //     float progress = (float)receivedPackets / expectedPackets * 100;
-      //     Serial.print(" ");
-      //     Serial.print(progress, 0);
-      //     Serial.println("%");
-      //   }
-      // }
+      // Progress indication in auto mode
+      if (autoMode && receivedPackets % 10 == 0)
+      {
+        Serial.print(".");
+        if (receivedPackets % 100 == 0)
+        {
+          float progress = (float)receivedPackets / expectedPackets * 100;
+          Serial.print(" ");
+          Serial.print(progress, 0);
+          Serial.println("%");
+        }
+      }
     }
     else
       return;
@@ -916,6 +923,7 @@ void forwardToSatellite(char cmd)
   if (cmd == 'u')
   {
     Serial.println("\n--- UART THERMAL CAPTURE ---");
+    thermalDataDownloadDuration = millis();
   }
   else if (cmd == 'r')
   {
@@ -1132,17 +1140,15 @@ void cmdDigital(const char *args)
   }
 }
 
-void cmdTime(const char *args)
+void helperTime(unsigned long durationMillis)
 {
-  unsigned long uptime = millis();
-  unsigned long seconds = uptime / 1000;
+  unsigned long seconds = durationMillis / 1000;
   unsigned long minutes = seconds / 60;
   unsigned long hours = minutes / 60;
 
   seconds = seconds % 60;
   minutes = minutes % 60;
 
-  Serial.print("GS Uptime: ");
   if (hours > 0)
   {
     Serial.print(hours);
@@ -1153,8 +1159,15 @@ void cmdTime(const char *args)
     Serial.print(minutes);
     Serial.print("m ");
   }
+
   Serial.print(seconds);
   Serial.println("s");
+}
+
+void cmdTime(const char *args)
+{
+  Serial.print("GS Uptime: ");
+  helperTime(millis());
 }
 
 void cmdReset(const char *args)
@@ -1458,7 +1471,6 @@ void loop()
   if (rf23.available())
   {
     handlePacket();
-
     if (!autoMode)
     {
       // dont spam the serial line when reading data packets.
