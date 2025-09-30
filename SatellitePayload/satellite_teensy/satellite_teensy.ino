@@ -137,8 +137,7 @@ const int numCurrentSensors = 5;
  *
  * @param message The message string to send
  */
-void radioPrint(const String &message)
-{
+void radioPrint(const String &message) {
   if (!radioReady)
     return;
 
@@ -146,26 +145,22 @@ void radioPrint(const String &message)
   Serial.print(message);
 
   unsigned int msgLen = message.length();
-  for (unsigned int i = 0; i < msgLen; i++)
-  {
+  for (unsigned int i = 0; i < msgLen; i++) {
     char c = message.charAt(i);
-    if (serialBufferAtLineStart)
-    {
+    if (serialBufferAtLineStart) {
       serialBuffer += "SAT> ";
       serialBufferAtLineStart = false;
     }
 
     serialBuffer += c;
 
-    if (c == '\n')
-    {
+    if (c == '\n') {
       serialBufferAtLineStart = true;
     }
   }
 
   // Send buffer when it gets long enough or contains newlines
-  if (serialBuffer.length() >= MAX_SERIAL_MSG_LEN || serialBuffer.indexOf('\n') != -1)
-  {
+  if (serialBuffer.length() >= MAX_SERIAL_MSG_LEN || serialBuffer.indexOf('\n') != -1) {
     sendSerialBuffer();
   }
 }
@@ -175,8 +170,7 @@ void radioPrint(const String &message)
  *
  * @param message The message string to send (optional)
  */
-void radioPrintln(const String &message = "")
-{
+void radioPrintln(const String &message = "") {
   radioPrint(message + "\n");
   sendSerialBuffer(); // Force send after newline
 }
@@ -184,8 +178,7 @@ void radioPrintln(const String &message = "")
 /**
  * Sends accumulated serial buffer via radio
  */
-void sendSerialBuffer()
-{
+void sendSerialBuffer() {
   if (!radioReady || serialBuffer.length() == 0)
     return;
 
@@ -197,18 +190,15 @@ void sendSerialBuffer()
   // radioSerialTxBuffer[1] = (SERIAL_MSG_TYPE >> 8) & 0xFF;  // High byte
 
   // Split long messages into chunks
-  while (serialBuffer.length() > 0)
-  {
+  while (serialBuffer.length() > 0) {
     unsigned int remaining = serialBuffer.length();
-    uint8_t chunkSize = (uint8_t)min(remaining, (unsigned int)MAX_SERIAL_MSG_LEN);
+    uint8_t chunkSize = (uint8_t) min(remaining, (unsigned int) MAX_SERIAL_MSG_LEN);
     int newlineIndex = serialBuffer.indexOf('\n');
-    if (newlineIndex != -1 && newlineIndex + 1 <= chunkSize)
-    {
-      chunkSize = (uint8_t)(newlineIndex + 1);
+    if (newlineIndex != -1 && newlineIndex + 1 <= chunkSize) {
+      chunkSize = (uint8_t) (newlineIndex + 1);
     }
 
-    if (chunkSize == 0)
-    {
+    if (chunkSize == 0) {
       break;
     }
 
@@ -228,8 +218,7 @@ void sendSerialBuffer()
       // Remove sent chunk from buffer
       serialBuffer.remove(0, chunkSize);
     }
-    else
-    {
+    else {
       // Failed to send, keep buffer for retry
       break;
     }
@@ -250,12 +239,10 @@ void sendSerialBuffer()
  * to confirm whether stray bytes are sitting in hardware before the driver
  * consumes them.
  */
-void dumpRf23PendingPackets()
-{
+void dumpRf23PendingPackets() {
   radioPrintln("=== RF23 RX FIFO RAW SNAPSHOT START ===");
   // TODO: FIFO recovery checklist
-  if (!radioReady)
-  {
+  if (!radioReady) {
     radioPrintln("RF23 debug: radio not initialised");
     return;
   }
@@ -286,14 +273,13 @@ void dumpRf23PendingPackets()
   // Using the four values together lets you decide if bytes stalled in hardware, if a
   // CRC failure occurred, or if the silicon believes the transaction already finished.
 
-  auto formatHex = [](uint8_t value)
-  {
+  auto formatHex = [](uint8_t value) {
     String hex = String(value, HEX);
     hex.toUpperCase();
     if (hex.length() < 2)
       hex = "0" + hex;
     return hex;
-  };
+    };
 
   radioPrint("STATUS: 0x");
   radioPrintln(formatHex(status));
@@ -324,31 +310,26 @@ void dumpRf23PendingPackets()
  * and printable ASCII ('.' for non-printable). Intended for short dumps
  * such as the 64-byte RF23 FIFO snapshot above.
  */
-void dumpRf23PacketHexLines(const uint8_t *data, uint8_t length)
-{
+void dumpRf23PacketHexLines(const uint8_t *data, uint8_t length) {
   const uint8_t BYTES_PER_LINE = 16;
   char lineBuf[4 /*offset*/ + 2 /*colon+space*/ + (BYTES_PER_LINE * 3) /*hex+space*/ + 2 /*| */ + BYTES_PER_LINE /*ascii*/ + 1];
 
-  for (uint8_t offset = 0; offset < length; offset += BYTES_PER_LINE)
-  {
+  for (uint8_t offset = 0; offset < length; offset += BYTES_PER_LINE) {
     uint8_t remaining = length - offset;
     uint8_t lineLen = remaining < BYTES_PER_LINE ? remaining : BYTES_PER_LINE;
     int pos = snprintf(lineBuf, sizeof(lineBuf), "%03u: ", offset);
 
-    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
-    {
+    for (uint8_t i = 0; i < lineLen && pos < (int) sizeof(lineBuf); i++) {
       pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "%02X ", data[offset + i]);
     }
 
-    for (uint8_t i = lineLen; i < BYTES_PER_LINE && pos < (int)sizeof(lineBuf); i++)
-    {
+    for (uint8_t i = lineLen; i < BYTES_PER_LINE && pos < (int) sizeof(lineBuf); i++) {
       pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "   ");
     }
 
     pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "| ");
 
-    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
-    {
+    for (uint8_t i = 0; i < lineLen && pos < (int) sizeof(lineBuf); i++) {
       char c = static_cast<char>(data[offset + i]);
       if (c < 32 || c > 126)
         c = '.';
@@ -363,67 +344,54 @@ void dumpRf23PacketHexLines(const uint8_t *data, uint8_t length)
  * Listens for commands from ground station via radio and handles them
  *
  */
-void listenForCommands()
-{
+void listenForCommands() {
   uint8_t len = sizeof(radioRxBuffer);
 
-  if (rf23.recv(radioRxBuffer, &len))
-  {
+  if (rf23.recv(radioRxBuffer, &len)) {
     if (len == 0)
       return;
 
-    char cmd = (char)radioRxBuffer[0];
+    char cmd = (char) radioRxBuffer[0];
 
-    if (cmd == 'u' || cmd == 'U')
-    {
+    if (cmd == 'u' || cmd == 'U') {
       captureThermalImageUART();
     }
-    else if (cmd == 'r' || cmd == 'R')
-    {
+    else if (cmd == 'r' || cmd == 'R') {
       sendThermalDataViaRadio();
     }
-    else if (cmd == 'd' || cmd == 'D')
-    {
+    else if (cmd == 'd' || cmd == 'D') {
       dumpRf23PendingPackets();
     }
-    else if (cmd == 'p' || cmd == 'P')
-    {
+    else if (cmd == 'p' || cmd == 'P') {
       // Power control: ['p','1'] on, ['p','0'] off, ['p','s'] status
-      if (len >= 2)
-      {
-        char sub = (char)radioRxBuffer[1];
-        if (sub == '1')
-        {
+      if (len >= 2) {
+        char sub = (char) radioRxBuffer[1];
+        if (sub == '1') {
           digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
           rpiPowerOnTimestamp = millis();
           rpiBootNotificationSent = false;
           radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
         }
-        else if (sub == '0')
-        {
+        else if (sub == '0') {
           digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
           rpiPowerOnTimestamp = 0;
           rpiBootNotificationSent = false;
           radioPrintln("RPI POWER: OFF");
         }
-        else if (sub == 's' || sub == 'S')
-        {
+        else if (sub == 's' || sub == 'S') {
           int state = digitalRead(RPI_ENABLE);
           radioPrint("RPI POWER STATE: ");
           radioPrintln(state ? "ON" : "OFF");
         }
-        else
-        {
+        else {
           radioPrintln("RPI POWER: Unknown subcommand");
         }
       }
-      else
-      {
+      else {
         radioPrintln("RPI POWER: missing arg");
       }
     }
-    else if (cmd == 'g' || cmd == 'G')
-    {
+    else if (cmd == 'g' || cmd == 'G') {
       radioPrintln("pong from satellite"); // reply back to GS
     }
     else
@@ -437,8 +405,7 @@ void listenForCommands()
  * Configures serial communication, GPIO pins, radio module, and UART
  * interface. Powers up the Raspberry Pi and displays available commands.
  */
-void setup()
-{
+void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 5000)
     ;
@@ -475,13 +442,11 @@ void setup()
   radioPrintln("Ready!");
 }
 
-void initTemperatureSensors()
-{
+void initTemperatureSensors() {
   radioPrintln("Initializing temperature sensors...");
 
   // Initialize all temperature sensor pins as INPUT
-  for (int i = 0; i < numTemperatureSensors; i++)
-  {
+  for (int i = 0; i < numTemperatureSensors; i++) {
     pinMode(temperatureSensorPins[i], INPUT);
     radioPrint("  Pin ");
     radioPrint(String(temperatureSensorPins[i]));
@@ -498,8 +463,7 @@ void initTemperatureSensors()
  * @param sensorPin The analog pin connected to the TMP36 sensor
  * @return Temperature in Celsius
  */
-float readTemperatureCelsius(int sensorPin)
-{
+float readTemperatureCelsius(int sensorPin) {
   int adcValue = analogRead(sensorPin);
   float voltage = adcValue * MV_PER_ADC_UNIT;
 
@@ -517,15 +481,13 @@ float readTemperatureCelsius(int sensorPin)
  *
  * @return true if all sensors are reading valid temperatures, false otherwise
  */
-bool checkTemperatureSensors()
-{
+bool checkTemperatureSensors() {
   radioPrintln("--- TEMPERATURE SENSOR CHECK ---");
 
   bool allValid = true;
   int validSensors = 0;
 
-  for (int i = 0; i < numTemperatureSensors; i++)
-  {
+  for (int i = 0; i < numTemperatureSensors; i++) {
     float temperatureC = readTemperatureCelsius(temperatureSensorPins[i]);
 
     // Check if temperature is within reasonable range (-40°C to +125°C for TMP36)
@@ -538,13 +500,11 @@ bool checkTemperatureSensors()
     radioPrint(String(temperatureC, 2));
     radioPrint("°C ");
 
-    if (isValid)
-    {
+    if (isValid) {
       radioPrintln("Y");
       validSensors++;
     }
-    else
-    {
+    else {
       radioPrintln("N");
       allValid = false;
     }
@@ -555,12 +515,10 @@ bool checkTemperatureSensors()
   radioPrint("/");
   radioPrintln(String(numTemperatureSensors));
 
-  if (allValid)
-  {
+  if (allValid) {
     radioPrintln("✓ All temperature sensors operational");
   }
-  else
-  {
+  else {
     radioPrintln("⚠️ Some temperature sensors showing invalid readings");
   }
 
@@ -573,18 +531,15 @@ bool checkTemperatureSensors()
  * @param temperatures Array to store temperature readings (must be at least numTemperatureSensors)
  * @return Number of valid temperature readings
  */
-int getValidTemperatureData(float temperatures[])
-{
+int getValidTemperatureData(float temperatures[]) {
   int validCount = 0;
 
-  for (int i = 0; i < numTemperatureSensors; i++)
-  {
+  for (int i = 0; i < numTemperatureSensors; i++) {
     float tempC = readTemperatureCelsius(temperatureSensorPins[i]);
     temperatures[i] = tempC;
 
     // Count valid readings
-    if (tempC >= -40.0 && tempC <= 125.0)
-    {
+    if (tempC >= -40.0 && tempC <= 125.0) {
       validCount++;
     }
   }
@@ -598,8 +553,7 @@ int getValidTemperatureData(float temperatures[])
  * Configures I2C communication and calibrates each sensor for 16V/400mA range.
  * Reports which sensors are connected and operational.
  */
-void initCurrentSensors()
-{
+void initCurrentSensors() {
   radioPrintln("Initializing current sensors...");
 
   // Initialize I2C communication
@@ -608,12 +562,10 @@ void initCurrentSensors()
   int connectedSensors = 0;
 
   // Initialize and configure each INA219 sensor
-  for (int i = 0; i < numCurrentSensors; i++)
-  {
+  for (int i = 0; i < numCurrentSensors; i++) {
     bool sensorConnected = currentSensors[i].begin(&Wire2);
 
-    if (sensorConnected)
-    {
+    if (sensorConnected) {
       radioPrint("  ");
       radioPrint(currentSensorsLabels[i]);
       radioPrintln(" - Connected");
@@ -622,8 +574,7 @@ void initCurrentSensors()
       // Set calibration for 16V and 400mA range
       currentSensors[i].setCalibration_16V_400mA();
     }
-    else
-    {
+    else {
       radioPrint("  ");
       radioPrint(currentSensorsLabels[i]);
       radioPrintln(" - Not detected");
@@ -635,16 +586,13 @@ void initCurrentSensors()
   radioPrint("/");
   radioPrintln(String(numCurrentSensors));
 
-  if (connectedSensors == numCurrentSensors)
-  {
+  if (connectedSensors == numCurrentSensors) {
     radioPrintln("✓ All current sensors operational");
   }
-  else if (connectedSensors > 0)
-  {
+  else if (connectedSensors > 0) {
     radioPrintln("⚠️ Some current sensors not detected");
   }
-  else
-  {
+  else {
     radioPrintln("❌ No current sensors detected");
   }
 }
@@ -654,15 +602,13 @@ void initCurrentSensors()
  *
  * @return true if all sensors are reading valid current/voltage, false otherwise
  */
-bool checkCurrentSensors()
-{
+bool checkCurrentSensors() {
   radioPrintln("--- CURRENT SENSOR CHECK ---");
 
   bool allValid = true;
   int validSensors = 0;
 
-  for (int i = 0; i < numCurrentSensors; i++)
-  {
+  for (int i = 0; i < numCurrentSensors; i++) {
     // Read current and voltage from each sensor
     float current_mA = currentSensors[i].getCurrent_mA();
     float bus_voltage_V = currentSensors[i].getBusVoltage_V();
@@ -681,23 +627,19 @@ bool checkCurrentSensors()
     radioPrint(String(bus_voltage_V, 2));
     radioPrint(" V ");
 
-    if (isValid)
-    {
+    if (isValid) {
       radioPrintln("Y");
       validSensors++;
     }
-    else
-    {
+    else {
       radioPrintln("N");
       allValid = false;
 
-      if (!currentValid)
-      {
+      if (!currentValid) {
         radioPrint("  Current out of range: ");
         radioPrintln(String(current_mA, 2));
       }
-      if (!voltageValid)
-      {
+      if (!voltageValid) {
         radioPrint("  Voltage out of range: ");
         radioPrintln(String(bus_voltage_V, 2));
       }
@@ -709,12 +651,10 @@ bool checkCurrentSensors()
   radioPrint("/");
   radioPrintln(String(numCurrentSensors));
 
-  if (allValid)
-  {
+  if (allValid) {
     radioPrintln("✓ All current sensors operational");
   }
-  else
-  {
+  else {
     radioPrintln("⚠️ Some current sensors showing invalid readings");
   }
 
@@ -728,12 +668,10 @@ bool checkCurrentSensors()
  * @param voltages Array to store voltage readings (must be at least numCurrentSensors)
  * @return Number of valid sensor readings
  */
-int getValidCurrentData(float currents[], float voltages[])
-{
+int getValidCurrentData(float currents[], float voltages[]) {
   int validCount = 0;
 
-  for (int i = 0; i < numCurrentSensors; i++)
-  {
+  for (int i = 0; i < numCurrentSensors; i++) {
     float current_mA = currentSensors[i].getCurrent_mA();
     float bus_voltage_V = currentSensors[i].getBusVoltage_V();
 
@@ -744,8 +682,7 @@ int getValidCurrentData(float currents[], float voltages[])
     bool currentValid = (current_mA >= -400.0 && current_mA <= 400.0);
     bool voltageValid = (bus_voltage_V >= 0.0 && bus_voltage_V <= 16.0);
 
-    if (currentValid && voltageValid)
-    {
+    if (currentValid && voltageValid) {
       validCount++;
     }
   }
@@ -753,8 +690,7 @@ int getValidCurrentData(float currents[], float voltages[])
   return validCount;
 }
 
-void initRPI()
-{
+void initRPI() {
   // Initialize Raspberry Pi control pin and make sure its off.
   pinMode(RPI_ENABLE, OUTPUT);
   digitalWrite(RPI_ENABLE, LOW);
@@ -776,8 +712,7 @@ void initRPI()
  * modem settings for GFSK modulation, and sets the radio to idle mode
  * ready for transmission. Also configures RX/TX control pins.
  */
-void initRadio()
-{
+void initRadio() {
   // radioPrintln("Initializing radio");
 
   // Configure RX/TX control pins
@@ -796,8 +731,7 @@ void initRadio()
   pinMode(LED_PIN, OUTPUT);
 
   // Initialize RF22 radio module
-  if (!rf23.init())
-  {
+  if (!rf23.init()) {
     Serial.println("Satellite Radio init failed!");
     // TODO: graceful fail here... wait like 5 seconds then boot through GS and allow user to self initialize via radio init command
     // radioPrintln("Radio init failed!");
@@ -821,22 +755,17 @@ void initRadio()
  * Continuously monitors serial interface for user commands and executes
  * the corresponding operations (capture or transmit).
  */
-void loop()
-{
+void loop() {
   pollPIUartStatus();
 
   // Handle commands from ground station via radio
-  while (rf23.available())
-  {
+  while (rf23.available()) {
     listenForCommands();
   }
 
-  if (rpiPowerOnTimestamp != 0 && !rpiBootNotificationSent)
-  {
-    if (millis() - rpiPowerOnTimestamp >= 80000UL)
-    {
-      if (radioReady)
-      {
+  if (rpiPowerOnTimestamp != 0 && !rpiBootNotificationSent) {
+    if (millis() - rpiPowerOnTimestamp >= 80000UL) {
+      if (radioReady) {
         radioPrintln("RPI POWER: Boot complete");
         rpiBootNotificationSent = true;
         rpiPowerOnTimestamp = 0;
@@ -845,8 +774,7 @@ void loop()
   }
 
   // Also allow manual commands via serial for testing/debug
-  if (Serial.available())
-  {
+  if (Serial.available()) {
     char cmd = Serial.read();
     while (Serial.available())
       Serial.read(); // Clear input buffer
@@ -854,8 +782,7 @@ void loop()
     radioPrint("Command: ");
     radioPrintln(String(cmd));
 
-    switch (cmd)
-    {
+    switch (cmd) {
     case 'z':
     case 'Z':
       radioPrintln("command Z pong from satellite"); // reply back to GS
@@ -887,34 +814,28 @@ void loop()
 }
 
 // Read exactly 'len' bytes from 'port' with a deadline
-bool readExact(HardwareSerial &port, uint8_t *buf, size_t len, uint32_t timeout_ms)
-{
+bool readExact(HardwareSerial &port, uint8_t *buf, size_t len, uint32_t timeout_ms) {
   uint32_t start = millis();
   size_t got = 0;
-  while (got < len)
-  {
+  while (got < len) {
     if (millis() - start > timeout_ms)
       return false;
     int avail = port.available();
-    if (avail > 0)
-    {
-      size_t toRead = (size_t)avail;
+    if (avail > 0) {
+      size_t toRead = (size_t) avail;
       size_t needed = len - got;
       if (toRead > needed)
         toRead = needed;
 
       size_t r = port.readBytes(buf + got, toRead);
-      if (r > 0)
-      {
+      if (r > 0) {
         got += r;
       }
-      else
-      {
+      else {
         delay(1);
       }
     }
-    else
-    {
+    else {
       delay(1);
     }
   }
@@ -922,32 +843,25 @@ bool readExact(HardwareSerial &port, uint8_t *buf, size_t len, uint32_t timeout_
 }
 
 // Validate magic
-bool magicOK(const uint8_t *h)
-{
+bool magicOK(const uint8_t *h) {
   return h[0] == UART_MAGIC[0] && h[1] == UART_MAGIC[1] && h[2] == UART_MAGIC[2] && h[3] == UART_MAGIC[3];
 }
 
 // Validate end markers
-bool endOK(const uint8_t *e)
-{
+bool endOK(const uint8_t *e) {
   return e[0] == UART_END[0] && e[1] == UART_END[1];
 }
 
 // Standard CRC-16/CCITT-FALSE for cross-checking packet integrity
-uint16_t crc16_ccitt(const uint8_t *data, size_t len)
-{
+uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;
-  while (len--)
-  {
-    crc ^= (uint16_t)(*data++) << 8;
-    for (uint8_t i = 0; i < 8; ++i)
-    {
-      if (crc & 0x8000)
-      {
+  while (len--) {
+    crc ^= (uint16_t) (*data++) << 8;
+    for (uint8_t i = 0; i < 8; ++i) {
+      if (crc & 0x8000) {
         crc = (crc << 1) ^ 0x1021;
       }
-      else
-      {
+      else {
         crc <<= 1;
       }
     }
@@ -956,15 +870,13 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 }
 
 // Identify STATUS vs IMAGE by looking for ASCII "STATUS:" prefix
-bool payloadIsStatus(const uint8_t *payload, uint16_t len)
-{
+bool payloadIsStatus(const uint8_t *payload, uint16_t len) {
   const char *prefix = "STATUS:";
   const size_t L = 7; // includes colon
   if (len < L)
     return false;
-  for (size_t i = 0; i < L; ++i)
-  {
-    if ((char)payload[i] != prefix[i])
+  for (size_t i = 0; i < L; ++i) {
+    if ((char) payload[i] != prefix[i])
       return false;
   }
   return true;
@@ -973,24 +885,20 @@ bool payloadIsStatus(const uint8_t *payload, uint16_t len)
 // Receive ONE framed message from the Pi into 'dest' (up to destMax)
 // Returns: true on success; writes outLen and sets isStatus accordingly.
 bool recvFramedFromPi(HardwareSerial &port,
-                      uint8_t *dest, uint16_t destMax,
-                      uint16_t &outLen, bool &isStatus)
-{
+  uint8_t *dest, uint16_t destMax,
+  uint16_t &outLen, bool &isStatus) {
   outLen = 0;
   isStatus = false;
 
   // 1) Header: 4 magic + 2 length
   uint8_t header[6];
-  if (!readExact(port, header, 6, UART_HEADER_TIMEOUT_MS))
-  {
+  if (!readExact(port, header, 6, UART_HEADER_TIMEOUT_MS)) {
     radioPrintln("ERROR: UART header timeout");
     return false;
   }
-  if (!magicOK(header))
-  {
+  if (!magicOK(header)) {
     radioPrint("ERROR: Bad magic: ");
-    for (int i = 0; i < 4; i++)
-    {
+    for (int i = 0; i < 4; i++) {
       radioPrint("0x");
       radioPrint(String(header[i], HEX));
       radioPrint(" ");
@@ -999,32 +907,27 @@ bool recvFramedFromPi(HardwareSerial &port,
     return false;
   }
 
-  uint16_t len = (uint16_t)header[4] | ((uint16_t)header[5] << 8);
-  if (len == 0)
-  {
+  uint16_t len = (uint16_t) header[4] | ((uint16_t) header[5] << 8);
+  if (len == 0) {
     radioPrintln("ERROR: Zero-length payload");
     return false;
   }
 
-  if (len > destMax)
-  {
+  if (len > destMax) {
     radioPrint("ERROR: Payload too large (");
     radioPrint(String(len));
     radioPrintln(" bytes) for buffer");
     // Drain and discard payload + end markers to resync
     uint8_t dump[64];
-    uint32_t remaining = (uint32_t)len + 2;
+    uint32_t remaining = (uint32_t) len + 2;
     uint32_t start = millis();
-    while (remaining > 0 && (millis() - start) < UART_PAYLOAD_TIMEOUT_MS)
-    {
-      size_t toRead = (remaining < sizeof(dump)) ? (size_t)remaining : sizeof(dump);
+    while (remaining > 0 && (millis() - start) < UART_PAYLOAD_TIMEOUT_MS) {
+      size_t toRead = (remaining < sizeof(dump)) ? (size_t) remaining : sizeof(dump);
       size_t r = port.readBytes(dump, toRead);
-      if (r > 0)
-      {
-        remaining -= (uint32_t)r;
+      if (r > 0) {
+        remaining -= (uint32_t) r;
       }
-      else
-      {
+      else {
         delay(1);
       }
     }
@@ -1033,21 +936,18 @@ bool recvFramedFromPi(HardwareSerial &port,
   }
 
   // 2) Payload
-  if (!readExact(port, dest, len, UART_PAYLOAD_TIMEOUT_MS))
-  {
+  if (!readExact(port, dest, len, UART_PAYLOAD_TIMEOUT_MS)) {
     radioPrintln("ERROR: UART payload timeout");
     return false;
   }
 
   // 3) End markers
   uint8_t ender[2];
-  if (!readExact(port, ender, 2, UART_END_TIMEOUT_MS))
-  {
+  if (!readExact(port, ender, 2, UART_END_TIMEOUT_MS)) {
     radioPrintln("ERROR: UART end-marker timeout");
     return false;
   }
-  if (!endOK(ender))
-  {
+  if (!endOK(ender)) {
     radioPrint("ERROR: Bad end markers: 0x");
     radioPrint(String(ender[0], HEX));
     radioPrint(" 0x");
@@ -1061,16 +961,13 @@ bool recvFramedFromPi(HardwareSerial &port,
 }
 
 // Pretty-print a STATUS payload (strip "STATUS:")
-void handleStatusPayload(const uint8_t *payload, uint16_t len)
-{
+void handleStatusPayload(const uint8_t *payload, uint16_t len) {
   const size_t L = 7;
   String msg;
-  if (len > L)
-  {
+  if (len > L) {
     // copy ASCII into a String safely
-    for (uint16_t i = L; i < len; ++i)
-    {
-      char c = (char)payload[i];
+    for (uint16_t i = L; i < len; ++i) {
+      char c = (char) payload[i];
       if (c == '\r' || c == '\n')
         continue;
       msg += c;
@@ -1083,27 +980,22 @@ void handleStatusPayload(const uint8_t *payload, uint16_t len)
 }
 
 // Drain any unsolicited framed UART messages (typically STATUS packets) while idle
-void pollPIUartStatus()
-{
+void pollPIUartStatus() {
   if (piCaptureInProgress)
     return;
 
-  while (Serial2.available() >= 6)
-  {
+  while (Serial2.available() >= 6) {
     uint16_t rxLen = 0;
     bool isStatus = false;
 
-    if (!recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus))
-    {
+    if (!recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus)) {
       return; // recvFramedFromPi already reported the error
     }
 
-    if (isStatus)
-    {
+    if (isStatus) {
       handleStatusPayload(piStatusBuf, rxLen);
     }
-    else
-    {
+    else {
       radioPrint("RPI payload received while idle (");
       radioPrint(String(rxLen));
       radioPrintln(" bytes)");
@@ -1117,8 +1009,7 @@ void pollPIUartStatus()
  * validates the transmission, and stores the image in the buffer.
  * Provides real-time progress updates and data quality assessment.
  */
-void captureThermalImageUART()
-{
+void captureThermalImageUART() {
   radioPrintln("--- UART THERMAL CAPTURE ---");
   radioPrintln("Triggering RPI capture...");
 
@@ -1140,20 +1031,17 @@ void captureThermalImageUART()
 
   bool imageReceived = false;
 
-  while (!imageReceived)
-  {
+  while (!imageReceived) {
     uint16_t rxLen = 0;
     bool isStatus = false;
 
-    if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
-    {
+    if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus)) {
       radioPrintln("ERROR: Failed to receive framed message");
       piCaptureInProgress = false;
       return;
     }
 
-    if (isStatus)
-    {
+    if (isStatus) {
       handleStatusPayload(imgBuf, rxLen);
       continue;
     }
@@ -1170,17 +1058,15 @@ void captureThermalImageUART()
   radioPrintln(" image bytes");
 
   // Quick quality check (same logic you already had)
-  if (capturedImageLength >= 38400)
-  {
+  if (capturedImageLength >= 38400) {
     int validPixels = 0;
-    for (uint32_t i = 0; i + 1 < capturedImageLength; i += 2)
-    {
+    for (uint32_t i = 0; i + 1 < capturedImageLength; i += 2) {
       uint16_t pixel = imgBuf[i] | (uint16_t(imgBuf[i + 1]) << 8);
       float tempC = (pixel - 27315) / 100.0f;
       if (tempC >= 0 && tempC <= 60)
         validPixels++;
     }
-    float validPct = (float)validPixels * 100.0f / (capturedImageLength / 2);
+    float validPct = (float) validPixels * 100.0f / (capturedImageLength / 2);
     radioPrint("Data quality: ");
     radioPrint(String(validPct, 1));
     radioPrintln("% valid temperature pixels");
@@ -1192,8 +1078,7 @@ void captureThermalImageUART()
     else
       radioPrintln("❌ Poor data quality detected");
   }
-  else
-  {
+  else {
     radioPrintln("⚠️ Received size smaller than expected for thermal image");
   }
 
@@ -1212,18 +1097,15 @@ void captureThermalImageUART()
  * @param len Length of packet data
  * @return true if packet was sent successfully, false otherwise
  */
-bool sendPacketReliable(uint8_t *data, uint8_t len)
-{
-  if (len == 0 || len > rf23.maxMessageLength())
-  {
+bool sendPacketReliable(uint8_t *data, uint8_t len) {
+  if (len == 0 || len > rf23.maxMessageLength()) {
     Serial.println("Invalid message length: " + len);
     // TODO should probably send a message to gs or log somewhere the packet was too big to send?
     return false;
   }
 
   const int MAX_RETRIES = 3;
-  for (int retry = 0; retry < MAX_RETRIES; retry++)
-  {
+  for (int retry = 0; retry < MAX_RETRIES; retry++) {
     // rf23.setModeIdle(); // Set radio to idle mode
     delay(5);
 
@@ -1233,10 +1115,8 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
 
     digitalWrite(LED_PIN, HIGH); // Turn on LED during transmission
 
-    if (rf23.send(data, len))
-    {
-      if (rf23.waitPacketSent(500))
-      {
+    if (rf23.send(data, len)) {
+      if (rf23.waitPacketSent(500)) {
         digitalWrite(LED_PIN, LOW); // Turn off LED
         // rf23.setModeIdle();
         return true;
@@ -1244,8 +1124,7 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
     }
 
     digitalWrite(LED_PIN, LOW); // Turn off LED
-    if (retry < MAX_RETRIES - 1)
-    {
+    if (retry < MAX_RETRIES - 1) {
       delay(50); // Delay before retry
     }
   }
@@ -1260,17 +1139,14 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
  * data packets, and end packet. Provides transmission statistics
  * and quality assessment. Requires captured image data to be present.
  */
-void sendThermalDataViaRadio()
-{
-  if (capturedImageLength == 0)
-  {
+void sendThermalDataViaRadio() {
+  if (capturedImageLength == 0) {
     radioPrintln("No image captured yet!");
     return;
   }
 
   const uint16_t totalPackets = (capturedImageLength + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;
-  if (totalPackets == 0)
-  {
+  if (totalPackets == 0) {
     radioPrintln("No packets to transmit");
     return;
   }
@@ -1305,22 +1181,18 @@ void sendThermalDataViaRadio()
   radioTxBuffer[9] = 0xEF;
 
   bool headerSent = false;
-  for (int retry = 0; retry < 5 && !headerSent; retry++)
-  {
-    if (sendPacketReliable(radioTxBuffer, 10))
-    {
+  for (int retry = 0; retry < 5 && !headerSent; retry++) {
+    if (sendPacketReliable(radioTxBuffer, 10)) {
       headerSent = true;
     }
-    else
-    {
+    else {
       Serial.print(F("Header retry "));
       Serial.println(retry + 1);
       delay(200);
     }
   }
 
-  if (!headerSent)
-  {
+  if (!headerSent) {
     radioPrintln("❌ Failed to send header!");
     return;
   }
@@ -1333,10 +1205,9 @@ void sendThermalDataViaRadio()
   uint16_t failCount = 0;
   unsigned long startTime = millis();
 
-  while (bytesSent < capturedImageLength)
-  {
+  while (bytesSent < capturedImageLength) {
     uint16_t remaining = capturedImageLength - bytesSent;
-    uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
+    uint16_t chunkSize = (remaining < (uint16_t) PACKET_DATA_SIZE) ? remaining : (uint16_t) PACKET_DATA_SIZE;
 
     radioTxBuffer[0] = packetNum & 0xFF;
     radioTxBuffer[1] = (packetNum >> 8) & 0xFF;
@@ -1347,20 +1218,17 @@ void sendThermalDataViaRadio()
     radioTxBuffer[3 + chunkSize] = (packetCrc >> 8) & 0xFF;
 
     uint8_t frameLen = chunkSize + THERMAL_PACKET_OVERHEAD;
-    if (sendPacketReliable(radioTxBuffer, frameLen))
-    {
+    if (sendPacketReliable(radioTxBuffer, frameLen)) {
       successCount++;
     }
-    else
-    {
+    else {
       failCount++;
     }
 
     bytesSent += chunkSize;
     packetNum++;
 
-    if (((packetNum & 0x3F) == 0) || bytesSent >= capturedImageLength)
-    {
+    if (((packetNum & 0x3F) == 0) || bytesSent >= capturedImageLength) {
       Serial.print(F("TX bytes: "));
       Serial.print(bytesSent);
       Serial.print(F("/"));
@@ -1378,23 +1246,21 @@ void sendThermalDataViaRadio()
   radioTxBuffer[4] = imageCrc & 0xFF;
   radioTxBuffer[5] = (imageCrc >> 8) & 0xFF;
 
-  if (!sendPacketReliable(radioTxBuffer, 6))
-  {
+  if (!sendPacketReliable(radioTxBuffer, 6)) {
     radioPrintln("❌ Failed to send end data packet!");
     return;
   }
 
   unsigned long elapsed = millis() - startTime;
   float duration = elapsed / 1000.0f;
-  float successPct = totalPackets ? (float)successCount * 100.0f / totalPackets : 0.0f;
+  float successPct = totalPackets ? (float) successCount * 100.0f / totalPackets : 0.0f;
   float dataRate = duration > 0.001f ? capturedImageLength / duration : 0.0f;
 
   Serial.print(F("Packets ok: "));
   Serial.print(successCount);
   Serial.print(F("/"));
   Serial.println(totalPackets);
-  if (failCount > 0)
-  {
+  if (failCount > 0) {
     Serial.print(F("Failed sends: "));
     Serial.println(failCount);
   }
@@ -1417,16 +1283,13 @@ void sendThermalDataViaRadio()
   radioPrint("Image CRC16: 0x");
   radioPrintln(String(imageCrc, HEX));
 
-  if (successCount == totalPackets)
-  {
+  if (successCount == totalPackets) {
     radioPrintln("✅ Perfect transmission!");
   }
-  else if (successCount > totalPackets * 0.95)
-  {
+  else if (successCount > totalPackets * 0.95) {
     radioPrintln("✅ Excellent transmission!");
   }
-  else
-  {
+  else {
     radioPrintln("⚠️ Some packets lost");
   }
 }

@@ -19,6 +19,7 @@
 #include <SPI.h>
 #include <RH_RF22.h>
 #include <RHHardwareSPI1.h>
+#include <microlzw.h>
 
 // Version information
 #define VERSION_MAJOR 1
@@ -29,8 +30,7 @@
 #define BUILD_INFO "Arduino Teensy 4.1 Ground Station Command Interpreter"
 
 // Command structure definition
-struct Command
-{
+struct Command {
   const char *name;
   const char *description;
   void (*function)(const char *args);
@@ -168,17 +168,14 @@ const Command commands[] = {
 const int numCommands = sizeof(commands) / sizeof(commands[0]);
 
 // Helper: send 2-byte packet to satellite ('p', <sub>) and wait for send
-bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeout_ms = 500)
-{
+bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeout_ms = 500) {
   digitalWrite(LED_PIN, HIGH);
   bool ok = false;
 
-  if (!rf23.send((uint8_t *)data, len))
-  {
+  if (!rf23.send((uint8_t *) data, len)) {
     Serial.println("Failed to queue radio packet");
   }
-  else
-  {
+  else {
     if (rf23.waitPacketSent(timeout_ms))
       ok = true;
     else
@@ -192,14 +189,12 @@ bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeou
   return ok;
 }
 
-void parseCommand(const String &input)
-{
+void parseCommand(const String &input) {
   // Trim whitespace
   String trimmed = input;
   trimmed.trim();
 
-  if (trimmed.length() == 0)
-  {
+  if (trimmed.length() == 0) {
     return;
   }
 
@@ -208,13 +203,11 @@ void parseCommand(const String &input)
   String command;
   String args;
 
-  if (spaceIndex == -1)
-  {
+  if (spaceIndex == -1) {
     command = trimmed;
     args = "";
   }
-  else
-  {
+  else {
     command = trimmed.substring(0, spaceIndex);
     args = trimmed.substring(spaceIndex + 1);
   }
@@ -226,13 +219,10 @@ void parseCommand(const String &input)
   executeCommand(command.c_str(), args.c_str());
 }
 
-void executeCommand(const char *cmd, const char *args)
-{
+void executeCommand(const char *cmd, const char *args) {
   // Search for command in command table
-  for (int i = 0; i < numCommands; i++)
-  {
-    if (strcmp(cmd, commands[i].name) == 0)
-    {
+  for (int i = 0; i < numCommands; i++) {
+    if (strcmp(cmd, commands[i].name) == 0) {
       commands[i].function(args);
       return;
     }
@@ -245,30 +235,24 @@ void executeCommand(const char *cmd, const char *args)
   Serial.println("Type 'help' for available commands");
 }
 
-void printPrompt()
-{
+void printPrompt() {
   Serial.print("GS> ");
 }
 
-void addToHistory(const String &command)
-{
+void addToHistory(const String &command) {
   // Shift history array
-  for (int i = 9; i > 0; i--)
-  {
+  for (int i = 9; i > 0; i--) {
     commandHistory[i] = commandHistory[i - 1];
   }
   commandHistory[0] = command;
 
-  if (historyIndex < 10)
-  {
+  if (historyIndex < 10) {
     historyIndex++;
   }
 }
 
-void clearHistory()
-{
-  for (int i = 0; i < 10; i++)
-  {
+void clearHistory() {
+  for (int i = 0; i < 10; i++) {
     commandHistory[i] = "";
   }
   historyIndex = 0;
@@ -293,14 +277,11 @@ void clearHistory()
 // }
 
 // Function to check for interrupt during command execution
-bool isInterruptRequested()
-{
+bool isInterruptRequested() {
   // Check for Q key during command execution
-  if (Serial.available())
-  {
+  if (Serial.available()) {
     char c = Serial.peek();
-    if (c == 'Q' || c == 'q')
-    {
+    if (c == 'Q' || c == 'q') {
       Serial.read(); // Consume the Q
       interruptRequested = true;
       Serial.println("\n*** INTERRUPT REQUESTED ***");
@@ -310,14 +291,12 @@ bool isInterruptRequested()
   return interruptRequested;
 }
 
-void resetInterrupt()
-{
+void resetInterrupt() {
   interruptRequested = false;
 }
 
 // Radio function implementations
-void initRadio()
-{
+void initRadio() {
   Serial.println("Initializing radio...");
 
   // Configure RX/TX control pins
@@ -333,8 +312,7 @@ void initRadio()
   SPI1.setSCK(27);  // Serial Clock
 
   // Initialize RF22 radio module
-  if (!rf23.init())
-  {
+  if (!rf23.init()) {
     Serial.println("Radio init failed!");
     Serial.println("Delaying init for 5 seconds, continuing without radio. try 'radio init' again.");
     delay(5000);
@@ -350,8 +328,7 @@ void initRadio()
   Serial.println("GS Radio ready");
 }
 
-void clearReception()
-{
+void clearReception() {
   headerReceived = false;
   imageComplete = false;
   expectedLength = 0;
@@ -367,11 +344,9 @@ void clearReception()
   lastPacketTime = 0;
 }
 
-void handlePacket()
-{
+void handlePacket() {
   uint8_t len = sizeof(radioRxBuffer);
-  if (rf23.recv(radioRxBuffer, &len))
-  {
+  if (rf23.recv(radioRxBuffer, &len)) {
     digitalWrite(LED_PIN, HIGH); // Turn on LED to indicate packet reception
     lastPacketTime = millis();
     lastRSSI = rf23.lastRssi(); // Store signal strength
@@ -381,38 +356,31 @@ void handlePacket()
   }
 }
 
-void processPacket(uint8_t *buf, uint8_t len)
-{
+void processPacket(uint8_t *buf, uint8_t len) {
   //  Check for serial message packet (MSG_TYPE + LENGTH + MESSAGE_DATA)
-  if (buf[0] == SERIAL_MSG_TYPE && !downloadingThermalData && len >= 2)
-  {
+  if (buf[0] == SERIAL_MSG_TYPE && !downloadingThermalData && len >= 2) {
     handleSerialMessage(buf, len);
   }
   // Check for header packet (10 bytes with magic bytes)
-  else if (len == 10 && buf[0] == 0xFF && buf[1] == 0xFF)
-  {
+  else if (len == 10 && buf[0] == 0xFF && buf[1] == 0xFF) {
     handleThermalHeaderPacket(buf);
   }
   // Check for end packet (6 bytes with magic bytes)
-  else if (len == 6 && buf[0] == 0xEE && buf[1] == 0xEE)
-  {
+  else if (len == 6 && buf[0] == 0xEE && buf[1] == 0xEE) {
     handleThermalEndPacket(buf);
   }
   // Check for data packet (requires valid header and incomplete image)
-  else if (headerReceived && !imageComplete && len >= 3)
-  {
+  else if (headerReceived && !imageComplete && len >= 3) {
     handleThermalDataPacket(buf, len);
   }
-  else
-  {
+  else {
     // should never hit this but leave for debugging radio packets.
     Serial.println("Unknown radio packet?! Dumping radio packets.");
     dumpRf23PendingPacketsToSerial();
   }
 }
 
-void handleThermalHeaderPacket(uint8_t *buf)
-{
+void handleThermalHeaderPacket(uint8_t *buf) {
   // Serial.println("Inside satellite header packet");
   //  Extract image size and packet count (little-endian format)
   expectedLength = buf[2] | (buf[3] << 8);
@@ -425,16 +393,14 @@ void handleThermalHeaderPacket(uint8_t *buf)
   Serial.print("Expected packets: ");
   Serial.println(expectedPackets);
 
-  if (expectedLength > MAX_IMG)
-  {
+  if (expectedLength > MAX_IMG) {
     Serial.println("✗ Header length exceeds local buffer; aborting reception");
     clearReception();
     return;
   }
 
   // Validate magic bytes (0xDE 0xAD 0xBE 0xEF)
-  if (buf[6] == 0xDE && buf[7] == 0xAD && buf[8] == 0xBE && buf[9] == 0xEF)
-  {
+  if (buf[6] == 0xDE && buf[7] == 0xAD && buf[8] == 0xBE && buf[9] == 0xEF) {
     Serial.println("✓ Header valid - receiving thermal data...");
     headerReceived = true;
     imageComplete = false;
@@ -449,14 +415,12 @@ void handleThermalHeaderPacket(uint8_t *buf)
     memset(packetReceived, false, sizeof(packetReceived)); // Reset packet tracking
     memset(imgBuffer, 0, expectedLength);
   }
-  else
-  {
+  else {
     Serial.println("✗ Invalid header!");
   }
 }
 
-void handleThermalEndPacket(uint8_t *buf)
-{
+void handleThermalEndPacket(uint8_t *buf) {
   downloadingThermalData = false;
   uint16_t finalCount = buf[2] | (buf[3] << 8); // Extract final packet count
   expectedImageCrc = buf[4] | (buf[5] << 8);
@@ -465,8 +429,7 @@ void handleThermalEndPacket(uint8_t *buf)
   Serial.print(finalCount);
   Serial.println(" packets");
 
-  if (expectedLength > 0)
-  {
+  if (expectedLength > 0) {
     lastComputedImageCrc = crc16_ccitt(imgBuffer, expectedLength);
     crcVerified = (expectedImageCrc == lastComputedImageCrc);
     Serial.print("Image CRC16 expected 0x");
@@ -476,8 +439,7 @@ void handleThermalEndPacket(uint8_t *buf)
     Serial.println(crcVerified ? " (match)" : " (MISMATCH)");
   }
 
-  if (finalCount != expectedPackets)
-  {
+  if (finalCount != expectedPackets) {
     Serial.print("⚠️ End packet reports ");
     Serial.print(finalCount);
     Serial.print(" packets but header expected ");
@@ -485,7 +447,7 @@ void handleThermalEndPacket(uint8_t *buf)
   }
 
   thermalDataDownloadDuration = millis() - thermalDataDownloadDuration;
-  
+
   helperTime(thermalDataDownloadDuration);
 
   imageComplete = true;
@@ -493,11 +455,9 @@ void handleThermalEndPacket(uint8_t *buf)
   showReceptionSummary();
 }
 
-void handleThermalDataPacket(uint8_t *buf, uint8_t len)
-{
+void handleThermalDataPacket(uint8_t *buf, uint8_t len) {
   // Serial.println("Inside satellite data packet");
-  if (len <= THERMAL_PACKET_OVERHEAD)
-  {
+  if (len <= THERMAL_PACKET_OVERHEAD) {
     Serial.println("ERROR: data packet len less than thermal packet overhead?!");
     return; // Minimum packet size check
   }
@@ -508,12 +468,10 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
   uint16_t packetCrc = buf[2 + dataLen] | (buf[3 + dataLen] << 8);
   uint16_t computedCrc = crc16_ccitt(&buf[2], dataLen);
 
-  if (computedCrc != packetCrc)
-  {
+  if (computedCrc != packetCrc) {
     Serial.println("crc error increment up...");
     crcErrorCount++;
-    if (crcErrorCount <= 10)
-    {
+    if (crcErrorCount <= 10) {
       Serial.print("CRC mismatch on packet ");
       Serial.print(packetNum);
       Serial.print(" (expected 0x");
@@ -521,8 +479,7 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
       Serial.print(", computed 0x");
       Serial.print(computedCrc, HEX);
       Serial.println(")");
-      if (crcErrorCount == 10)
-      {
+      if (crcErrorCount == 10) {
         Serial.println("Further CRC mismatch logs suppressed");
       }
     }
@@ -534,29 +491,24 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
 
   downloadingThermalData = true;
   // Process packet only if not already received (duplicate detection)
-  if (!packetReceived[packetNum])
-  {
-    uint32_t bufferPos = (uint32_t)packetNum * PACKET_DATA_SIZE; // Calculate buffer position
+  if (!packetReceived[packetNum]) {
+    uint32_t bufferPos = (uint32_t) packetNum * PACKET_DATA_SIZE; // Calculate buffer position
     uint32_t bound = expectedLength > 0 ? expectedLength : MAX_IMG;
     // Buffer overflow protection
-    if (bufferPos + dataLen <= bound)
-    {
+    if (bufferPos + dataLen <= bound) {
       memcpy(&imgBuffer[bufferPos], &buf[2], dataLen); // Copy data to buffer
       packetReceived[packetNum] = true;                // Mark packet as received
       receivedPackets++;
 
-      if (packetNum > maxPacketNum)
-      {
+      if (packetNum > maxPacketNum) {
         maxPacketNum = packetNum; // Track highest packet number
       }
 
       // Progress indication in auto mode
-      if (autoMode && receivedPackets % 10 == 0)
-      {
+      if (autoMode && receivedPackets % 10 == 0) {
         Serial.print(".");
-        if (receivedPackets % 100 == 0)
-        {
-          float progress = (float)receivedPackets / expectedPackets * 100;
+        if (receivedPackets % 100 == 0) {
+          float progress = (float) receivedPackets / expectedPackets * 100;
           Serial.print(" ");
           Serial.print(progress, 0);
           Serial.println("%");
@@ -579,8 +531,7 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
  * hardware before the driver drains them, which is invaluable when debugging
  * wedged receptions or malformed packets.
  */
-void dumpRf23PendingPacketsToSerial()
-{
+void dumpRf23PendingPacketsToSerial() {
   Serial.println("\n=== RF23 RX FIFO RAW SNAPSHOT START ===");
 
   rf23.setModeIdle();
@@ -602,14 +553,13 @@ void dumpRf23PendingPacketsToSerial()
   // Combining these values lets you pinpoint whether hardware saw a packet, rejected it,
   // or experienced FIFO/sync faults before our firmware reacted.
 
-  auto formatHex = [](uint8_t value)
-  {
+  auto formatHex = [](uint8_t value) {
     String hex = String(value, HEX);
     hex.toUpperCase();
     if (hex.length() < 2)
       hex = "0" + hex;
     return hex;
-  };
+    };
 
   Serial.print("STATUS: 0x");
   Serial.println(formatHex(status));
@@ -635,31 +585,26 @@ void dumpRf23PendingPacketsToSerial()
  * Render raw bytes in a hex+ASCII table (`000: AA BB ... | ..`) to aid analysis.
  * Designed for short buffers such as the RF23 FIFO snapshot.
  */
-void printRf23HexLines(const uint8_t *data, uint8_t length)
-{
+void printRf23HexLines(const uint8_t *data, uint8_t length) {
   const uint8_t BYTES_PER_LINE = 16;
   char lineBuf[4 + 2 + (BYTES_PER_LINE * 3) + 2 + BYTES_PER_LINE + 1];
 
-  for (uint8_t offset = 0; offset < length; offset += BYTES_PER_LINE)
-  {
+  for (uint8_t offset = 0; offset < length; offset += BYTES_PER_LINE) {
     uint8_t remaining = length - offset;
     uint8_t lineLen = remaining < BYTES_PER_LINE ? remaining : BYTES_PER_LINE;
     int pos = snprintf(lineBuf, sizeof(lineBuf), "%03u: ", offset);
 
-    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
-    {
+    for (uint8_t i = 0; i < lineLen && pos < (int) sizeof(lineBuf); i++) {
       pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "%02X ", data[offset + i]);
     }
 
-    for (uint8_t i = lineLen; i < BYTES_PER_LINE && pos < (int)sizeof(lineBuf); i++)
-    {
+    for (uint8_t i = lineLen; i < BYTES_PER_LINE && pos < (int) sizeof(lineBuf); i++) {
       pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "   ");
     }
 
     pos += snprintf(lineBuf + pos, sizeof(lineBuf) - pos, "| ");
 
-    for (uint8_t i = 0; i < lineLen && pos < (int)sizeof(lineBuf); i++)
-    {
+    for (uint8_t i = 0; i < lineLen && pos < (int) sizeof(lineBuf); i++) {
       char c = static_cast<char>(data[offset + i]);
       if (c < 32 || c > 126)
         c = '.';
@@ -670,8 +615,7 @@ void printRf23HexLines(const uint8_t *data, uint8_t length)
   }
 }
 
-bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
-{
+bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut) {
   // Serial.println("Inside satellite serial message");
   // newline to go pass the >GS prompt
   if (len < 2)
@@ -695,30 +639,24 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
   // Extract message data and print to serial
   String message = "";
   message.reserve(msgLen);
-  for (uint8_t i = 0; i < msgLen; i++)
-  {
-    message += (char)buf[2 + i];
+  for (uint8_t i = 0; i < msgLen; i++) {
+    message += (char) buf[2 + i];
     // message += (char) buf[3 + i];  // Message data starts at index 3
   }
 
-  if (messageOut != nullptr)
-  {
+  if (messageOut != nullptr) {
     *messageOut = message;
   }
 
   Serial.print(message);
 
-  if (!hasMore)
-  {
-    if (message.length() == 0)
-    {
+  if (!hasMore) {
+    if (message.length() == 0) {
       Serial.println();
     }
-    else
-    {
+    else {
       char lastChar = message.charAt(message.length() - 1);
-      if (lastChar != '\n' && lastChar != '\r')
-      {
+      if (lastChar != '\n' && lastChar != '\r') {
         Serial.println();
       }
     }
@@ -728,20 +666,15 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
 }
 
 // Standard CRC-16/CCITT-FALSE helper used for thermal payload validation
-uint16_t crc16_ccitt(const uint8_t *data, size_t len)
-{
+uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;
-  while (len--)
-  {
-    crc ^= (uint16_t)(*data++) << 8;
-    for (uint8_t i = 0; i < 8; ++i)
-    {
-      if (crc & 0x8000)
-      {
+  while (len--) {
+    crc ^= (uint16_t) (*data++) << 8;
+    for (uint8_t i = 0; i < 8; ++i) {
+      if (crc & 0x8000) {
         crc = (crc << 1) ^ 0x1021;
       }
-      else
-      {
+      else {
         crc <<= 1;
       }
     }
@@ -749,8 +682,7 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t len)
   return crc;
 }
 
-void runAutoMode()
-{
+void runAutoMode() {
   Serial.println("\n=== AUTO MODE - THERMAL IMAGE RECEPTION ===");
   Serial.println("Clearing buffer and waiting for transmission...");
   Serial.println("Start transmission from flat sat now!");
@@ -761,17 +693,14 @@ void runAutoMode()
   rf23.setModeRx(); // Ensure radio is in receive mode
 
   unsigned long lastActivity = millis();
-  while (!Serial.available() && !imageComplete)
-  {
-    if (rf23.available())
-    {
+  while (!Serial.available() && !imageComplete) {
+    if (rf23.available()) {
       handlePacket();
       lastActivity = millis(); // Update activity timestamp
     }
 
     // Timeout if no activity for 30 seconds after header received
-    if (headerReceived && (millis() - lastActivity > 30000))
-    {
+    if (headerReceived && (millis() - lastActivity > 30000)) {
       Serial.println("\n\nTimeout - no packets for 30 seconds");
       break;
     }
@@ -784,37 +713,32 @@ void runAutoMode()
   autoMode = false; // Exit auto mode if end packet not received
 
   // Handle different completion scenarios
-  if (!imageComplete && !headerReceived)
-  {
+  if (!imageComplete && !headerReceived) {
     Serial.println("\nNo transmission detected");
   }
-  else if (!imageComplete)
-  {
+  else if (!imageComplete) {
     Serial.println("\nTransmission interrupted");
     showReceptionSummary();
   }
 }
 
-void showReceptionSummary()
-{
+void showReceptionSummary() {
   Serial.println("\n=== RECEPTION SUMMARY ===");
   Serial.print("Received ");
   Serial.print(receivedPackets);
   Serial.print(" of ");
   Serial.print(expectedPackets);
   Serial.print(" packets (");
-  float pct = (expectedPackets > 0) ? ((float)receivedPackets / expectedPackets * 100.0f) : 0.0f;
+  float pct = (expectedPackets > 0) ? ((float) receivedPackets / expectedPackets * 100.0f) : 0.0f;
   Serial.print(pct, 1);
   Serial.println("%)");
 
-  if (crcErrorCount > 0)
-  {
+  if (crcErrorCount > 0) {
     Serial.print("Packets discarded (CRC): ");
     Serial.println(crcErrorCount);
   }
 
-  if (expectedImageCrc != 0 || lastComputedImageCrc != 0)
-  {
+  if (expectedImageCrc != 0 || lastComputedImageCrc != 0) {
     Serial.print("Image CRC16 expected 0x");
     Serial.print(expectedImageCrc, HEX);
     Serial.print(", computed 0x");
@@ -822,55 +746,44 @@ void showReceptionSummary()
     Serial.println(crcVerified ? " (match)" : " (MISMATCH)");
   }
 
-  if (expectedPackets > 0 && receivedPackets < expectedPackets)
-  {
+  if (expectedPackets > 0 && receivedPackets < expectedPackets) {
     Serial.print("Missing packets: ");
     Serial.println(expectedPackets - receivedPackets);
 
-    for (int index = 0; index < expectedPackets; index++)
-    {
-      if (!packetReceived[index])
-      {
+    for (int index = 0; index < expectedPackets; index++) {
+      if (!packetReceived[index]) {
         Serial.println(index);
       }
     }
   }
 
   // Quality assessment based on reception rate
-  if (receivedPackets == expectedPackets)
-  {
+  if (receivedPackets == expectedPackets) {
     Serial.println("\n✅ PERFECT RECEPTION!");
   }
-  else if (receivedPackets > expectedPackets * 0.95)
-  {
+  else if (receivedPackets > expectedPackets * 0.95) {
     Serial.println("\n✅ Excellent reception!");
   }
-  else if (receivedPackets > expectedPackets * 0.80)
-  {
+  else if (receivedPackets > expectedPackets * 0.80) {
     Serial.println("\n⚠️ Good reception");
   }
-  else
-  {
+  else {
     Serial.println("\n❌ Poor reception");
   }
 
   // Indicate if thermal image is ready for export
-  if (expectedLength == 38400)
-  {
+  if (expectedLength == 38400) {
     Serial.println("\nThermal image ready! Type 'export' to export as CSV");
   }
 }
 
-void exportThermalData()
-{
-  if (!headerReceived || expectedLength != 38400)
-  {
+void exportThermalData() {
+  if (!headerReceived || expectedLength != 38400) {
     Serial.println("No complete thermal image to export");
     return;
   }
 
-  if (!crcVerified)
-  {
+  if (!crcVerified) {
     Serial.println("⚠️ Warning: image CRC mismatch – export may contain corrupt data");
   }
 
@@ -879,27 +792,21 @@ void exportThermalData()
   Serial.println("=== START CSV ===");
 
   // Export thermal data as CSV (120x160 pixel grid)
-  for (int row = 0; row < 120; row++)
-  {
-    for (int col = 0; col < 160; col++)
-    {
+  for (int row = 0; row < 120; row++) {
+    for (int col = 0; col < 160; col++) {
       uint32_t idx = (row * 160 + col) * 2; // 2 bytes per pixel
-      if (idx < MAX_IMG - 1)
-      {
+      if (idx < MAX_IMG - 1) {
         // Convert raw 16-bit value to temperature in Celsius
         uint16_t pixel = imgBuffer[idx] | (imgBuffer[idx + 1] << 8);
-        if (pixel >= 27315 && pixel <= 37315)
-        {                                        // Valid temperature range (0-100°C)
+        if (pixel >= 27315 && pixel <= 37315) {                                        // Valid temperature range (0-100°C)
           float tempC = (pixel - 27315) / 100.0; // Convert from Kelvin*100 to Celsius
           Serial.print(tempC, 2);
         }
-        else
-        {
+        else {
           Serial.print("NaN"); // Invalid temperature value
         }
       }
-      else
-      {
+      else {
         Serial.print("NaN"); // Buffer overflow protection
       }
       if (col < 159)
@@ -918,19 +825,15 @@ void exportThermalData()
   // Serial.println(" plt.show()");
 }
 
-void forwardToSatellite(char cmd)
-{
-  if (cmd == 'u')
-  {
+void forwardToSatellite(char cmd) {
+  if (cmd == 'u') {
     Serial.println("\n--- UART THERMAL CAPTURE ---");
     thermalDataDownloadDuration = millis();
   }
-  else if (cmd == 'r')
-  {
+  else if (cmd == 'r') {
     Serial.println("\n--- REQUESTING THERMAL DATA DOWNLINK ---");
   }
-  else
-  {
+  else {
     return; // Ignore unknown commands
   }
 
@@ -938,20 +841,16 @@ void forwardToSatellite(char cmd)
   digitalWrite(LED_PIN, HIGH); // Turn on LED during transmission
 
   // Send the command
-  if (!rf23.send((uint8_t *)&cmd, 1))
-  { // a command should be a single byte
+  if (!rf23.send((uint8_t *) &cmd, 1)) { // a command should be a single byte
     Serial.print("Failed to queue command for transmission: ");
     Serial.println(cmd);
   }
-  else
-  {
-    if (!rf23.waitPacketSent(500))
-    {
+  else {
+    if (!rf23.waitPacketSent(500)) {
       Serial.print("Failed to send command: ");
       Serial.println(cmd);
     }
-    else
-    {
+    else {
       Serial.print("Command sent successfully: ");
       Serial.println(cmd);
     }
@@ -963,13 +862,11 @@ void forwardToSatellite(char cmd)
 }
 
 // Command implementations
-void cmdHelp(const char *args)
-{
+void cmdHelp(const char *args) {
   Serial.println("\nAvailable Commands:");
   Serial.println("==================");
 
-  for (int i = 0; i < numCommands; i++)
-  {
+  for (int i = 0; i < numCommands; i++) {
     Serial.print("  ");
     Serial.print(commands[i].name);
     Serial.print(" - ");
@@ -981,8 +878,7 @@ void cmdHelp(const char *args)
   Serial.println("\nInterrupt: Press 'Q' during command execution to interrupt and return to prompt");
 }
 
-void cmdVersion(const char *args)
-{
+void cmdVersion(const char *args) {
   Serial.println("\n=== GS Version Information ===");
   Serial.print("Software: ");
   Serial.println(BUILD_INFO);
@@ -1001,8 +897,7 @@ void cmdVersion(const char *args)
   Serial.println("========================");
 }
 
-void cmdStatus(const char *args)
-{
+void cmdStatus(const char *args) {
   Serial.println("\n=== GS System Status ===");
   cmdTime(args);
 
@@ -1013,13 +908,11 @@ void cmdStatus(const char *args)
   Serial.println(historyIndex);
 }
 
-void cmdPing(const char *args)
-{
+void cmdPing(const char *args) {
   Serial.println("\nPinging satellite...");
 
   uint8_t ping = 'g';
-  if (!sendBytesToSatellite(&ping, 1, 500))
-  {
+  if (!sendBytesToSatellite(&ping, 1, 500)) {
     Serial.println("Failed to send ping to satellite");
     return;
   }
@@ -1030,57 +923,46 @@ void cmdPing(const char *args)
   Serial.println("Ping sent. Waiting for satellite response...");
 }
 
-void cmdEcho(const char *args)
-{
-  if (strlen(args) > 0)
-  {
+void cmdEcho(const char *args) {
+  if (strlen(args) > 0) {
     Serial.print("Echo: ");
     Serial.println(args);
   }
-  else
-  {
+  else {
     Serial.println("Usage: echo <message>");
   }
 }
 
-void cmdLed(const char *args)
-{
+void cmdLed(const char *args) {
   String argStr = String(args);
   argStr.toLowerCase();
 
-  if (argStr == "on")
-  {
+  if (argStr == "on") {
     digitalWrite(LED_PIN, HIGH);
     Serial.println("LED turned ON");
   }
-  else if (argStr == "off")
-  {
+  else if (argStr == "off") {
     digitalWrite(LED_PIN, LOW);
     Serial.println("LED turned OFF");
   }
-  else if (argStr == "toggle")
-  {
+  else if (argStr == "toggle") {
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     Serial.print("LED toggled to ");
     Serial.println(digitalRead(LED_PIN) ? "ON" : "OFF");
   }
-  else
-  {
+  else {
     Serial.println("Usage: led [on|off|toggle]");
   }
 }
 
-void cmdAnalog(const char *args)
-{
-  if (strlen(args) == 0)
-  {
+void cmdAnalog(const char *args) {
+  if (strlen(args) == 0) {
     Serial.println("Usage: analog <pin>");
     return;
   }
 
   int pin = atoi(args);
-  if (pin < 0 || pin > 15)
-  { // Adjust based on your board
+  if (pin < 0 || pin > 15) { // Adjust based on your board
     Serial.println("Error: Invalid pin number (0-15)");
     return;
   }
@@ -1097,13 +979,11 @@ void cmdAnalog(const char *args)
   Serial.println("V)");
 }
 
-void cmdDigital(const char *args)
-{
+void cmdDigital(const char *args) {
   String argStr = String(args);
   int spaceIndex = argStr.indexOf(' ');
 
-  if (spaceIndex == -1)
-  {
+  if (spaceIndex == -1) {
     Serial.println("Usage: digital <pin> [value]");
     return;
   }
@@ -1111,14 +991,12 @@ void cmdDigital(const char *args)
   int pin = argStr.substring(0, spaceIndex).toInt();
   String valueStr = argStr.substring(spaceIndex + 1);
 
-  if (pin < 0 || pin > 13)
-  { // Adjust based on your board
+  if (pin < 0 || pin > 13) { // Adjust based on your board
     Serial.println("Error: Invalid pin number (0-13)");
     return;
   }
 
-  if (valueStr.length() == 0)
-  {
+  if (valueStr.length() == 0) {
     // Read mode
     pinMode(pin, INPUT);
     int value = digitalRead(pin);
@@ -1127,8 +1005,7 @@ void cmdDigital(const char *args)
     Serial.print(": ");
     Serial.println(value ? "HIGH" : "LOW");
   }
-  else
-  {
+  else {
     // Write mode
     pinMode(pin, OUTPUT);
     int value = valueStr.toInt();
@@ -1140,8 +1017,7 @@ void cmdDigital(const char *args)
   }
 }
 
-void helperTime(unsigned long durationMillis)
-{
+void helperTime(unsigned long durationMillis) {
   unsigned long seconds = durationMillis / 1000;
   unsigned long minutes = seconds / 60;
   unsigned long hours = minutes / 60;
@@ -1149,13 +1025,11 @@ void helperTime(unsigned long durationMillis)
   seconds = seconds % 60;
   minutes = minutes % 60;
 
-  if (hours > 0)
-  {
+  if (hours > 0) {
     Serial.print(hours);
     Serial.print("h ");
   }
-  if (minutes > 0)
-  {
+  if (minutes > 0) {
     Serial.print(minutes);
     Serial.print("m ");
   }
@@ -1164,23 +1038,19 @@ void helperTime(unsigned long durationMillis)
   Serial.println("s");
 }
 
-void cmdTime(const char *args)
-{
+void cmdTime(const char *args) {
   Serial.print("GS Uptime: ");
   helperTime(millis());
 }
 
-void cmdReset(const char *args)
-{
+void cmdReset(const char *args) {
   Serial.println("Resetting GS system... manually reconnect to serial after 20 seconds.");
   Serial.println("Press 'Q' to cancel reset within 1 second...");
 
   // Check for interrupt during the 1-second delay
   unsigned long startTime = millis();
-  while (millis() - startTime < 1000)
-  {
-    if (isInterruptRequested())
-    {
+  while (millis() - startTime < 1000) {
+    if (isInterruptRequested()) {
       Serial.println("\nReset cancelled by user!");
       return;
     }
@@ -1191,29 +1061,24 @@ void cmdReset(const char *args)
   SCB_AIRCR = 0x05FA0004;
 }
 
-void cmdHistory(const char *args)
-{
+void cmdHistory(const char *args) {
   Serial.println("\nGS Command History:");
   Serial.println("================");
 
-  for (int i = 0; i < historyIndex && i < 10; i++)
-  {
+  for (int i = 0; i < historyIndex && i < 10; i++) {
     Serial.print(i + 1);
     Serial.print(": ");
     Serial.println(commandHistory[i]);
   }
 
-  if (historyIndex == 0)
-  {
+  if (historyIndex == 0) {
     Serial.println("No commands in history");
   }
 }
 
-void cmdClear(const char *args)
-{
+void cmdClear(const char *args) {
   // Clear screen by printing newlines
-  for (int i = 0; i < 50; i++)
-  {
+  for (int i = 0; i < 50; i++) {
     Serial.println();
   }
 
@@ -1228,14 +1093,12 @@ void cmdClear(const char *args)
   Serial.println("================================================\n");
 }
 
-void cmdRPIControl(const char *args)
-{
+void cmdRPIControl(const char *args) {
   String argStr = String(args);
   argStr.trim();
   argStr.toLowerCase();
 
-  if (argStr == "on" || argStr == "off" || argStr == "status")
-  {
+  if (argStr == "on" || argStr == "off" || argStr == "status") {
     memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
     radioTxBuffer[0] = 'p';
     if (argStr == "on")
@@ -1259,18 +1122,15 @@ void cmdRPIControl(const char *args)
   Serial.println("Usage: rpi [on|off|status]");
 }
 
-void cmdTestInterrupt(const char *args)
-{
-  if (strlen(args) == 0)
-  {
+void cmdTestInterrupt(const char *args) {
+  if (strlen(args) == 0) {
     Serial.println("Usage: testint <seconds>");
     Serial.println("Example: testint 10 (runs for 10 seconds, press Q to interrupt)");
     return;
   }
 
   int duration = atoi(args);
-  if (duration <= 0 || duration > 60)
-  {
+  if (duration <= 0 || duration > 60) {
     Serial.println("Error: Duration must be between 1 and 60 seconds");
     return;
   }
@@ -1283,11 +1143,9 @@ void cmdTestInterrupt(const char *args)
   unsigned long startTime = millis();
   unsigned long endTime = startTime + (duration * 1000);
 
-  while (millis() < endTime)
-  {
+  while (millis() < endTime) {
     // Check for interrupt every 100ms
-    if (isInterruptRequested())
-    {
+    if (isInterruptRequested()) {
       Serial.println("\nTest interrupted by user!");
       return;
     }
@@ -1295,8 +1153,7 @@ void cmdTestInterrupt(const char *args)
     // Show progress every second
     unsigned long elapsed = (millis() - startTime) / 1000;
     static unsigned long lastPrint = 0;
-    if (elapsed != lastPrint)
-    {
+    if (elapsed != lastPrint) {
       Serial.print("Test running... ");
       Serial.print(elapsed);
       Serial.print("/");
@@ -1312,17 +1169,14 @@ void cmdTestInterrupt(const char *args)
 }
 
 // Radio command implementations
-void cmdRadio(const char *args)
-{
+void cmdRadio(const char *args) {
   String argStr = String(args);
   argStr.toLowerCase();
 
-  if (argStr == "init")
-  {
+  if (argStr == "init") {
     initRadio();
   }
-  else if (argStr == "status")
-  {
+  else if (argStr == "status") {
     Serial.println("\n=== RADIO STATUS ===");
     Serial.print("Frequency: 433.0 MHz");
     Serial.println();
@@ -1336,26 +1190,22 @@ void cmdRadio(const char *args)
     Serial.println(headerReceived ? "YES" : "NO");
     Serial.print("Image complete: ");
     Serial.println(imageComplete ? "YES" : "NO");
-    if (headerReceived)
-    {
+    if (headerReceived) {
       Serial.print("Expected packets: ");
       Serial.println(expectedPackets);
       Serial.print("Received packets: ");
       Serial.println(receivedPackets);
     }
   }
-  else if (argStr == "tx")
-  {
+  else if (argStr == "tx") {
     rf23.setModeTx();
     Serial.println("Radio set to transmit mode");
   }
-  else if (argStr == "rx")
-  {
+  else if (argStr == "rx") {
     rf23.setModeRx();
     Serial.println("Radio set to receive mode");
   }
-  else if (argStr == "dump" || argStr == "debug")
-  {
+  else if (argStr == "dump" || argStr == "debug") {
     dumpRf23PendingPacketsToSerial();
   }
   // else if (argStr == "reset")
@@ -1364,46 +1214,38 @@ void cmdRadio(const char *args)
   //   rf23.reset();
   //   Serial.println("Radio softeware reset. Try to run 'radio init' after 3 seconds to re-initialize.");
   // }
-  else
-  {
+  else {
     Serial.println("Usage: radio [init|status|tx|rx|dump]");
   }
 }
 
-void cmdAutoMode(const char *args)
-{
+void cmdAutoMode(const char *args) {
   runAutoMode();
 }
 
-void cmdExport(const char *args)
-{
+void cmdExport(const char *args) {
   exportThermalData();
 }
 
-void cmdCapture(const char *args)
-{
+void cmdCapture(const char *args) {
   forwardToSatellite('u');
 }
 
-void cmdRequest(const char *args)
-{
+void cmdRequest(const char *args) {
   forwardToSatellite('r');
 }
 
-void cmdRadioStatus(const char *args)
-{
+void cmdRadioStatus(const char *args) {
   showReceptionSummary();
 }
 
-void setup()
-{
+void setup() {
 
   // Initialize serial communication
   Serial.begin(115200);
 
   // Wait for serial port to connect (optional for some boards)
-  while (!Serial)
-  {
+  while (!Serial) {
     delay(10);
   }
 
@@ -1450,14 +1292,12 @@ void setup()
   printPrompt();
 }
 
-void loop()
-{
+void loop() {
   // Check for serial connection state changes
   bool currentlyConnected = Serial;
 
   // Handle serial reconnection
-  if (!serialConnected && currentlyConnected)
-  {
+  if (!serialConnected && currentlyConnected) {
     Serial.println("\nSerial connection restored.");
     printPrompt();
   }
@@ -1468,24 +1308,20 @@ void loop()
   // checkForInterrupt();
 
   // Check for incoming radio packets (always listen for serial messages)
-  if (rf23.available())
-  {
+  if (rf23.available()) {
     handlePacket();
-    if (!autoMode)
-    {
+    if (!autoMode) {
       // dont spam the serial line when reading data packets.
       printPrompt();
     }
   }
 
   // Read entire line when available
-  if (Serial.available())
-  {
+  if (Serial.available()) {
     String input = Serial.readStringUntil('\n');
     input.trim(); // Remove whitespace and newlines
 
-    if (input.length() > 0)
-    {
+    if (input.length() > 0) {
       // Reset interrupt flag before processing new command
       // resetInterrupt();
       parseCommand(input);
