@@ -7,14 +7,14 @@
  *
  * Key Features:
  * - Receives thermal image data from RPI via UART at 115200 baud
- * - Transmits image data via RF22 radio module in packetized format
+ * - Transmits image data via RFM23BP radio module in packetized format
  * - Handles reliable packet transmission with retry logic
  * - Provides transmission statistics and quality assessment
  * - Supports both capture and transmission operations
  *
  * Hardware Requirements:
  * - Teensy microcontroller
- * - RF22 radio module (433MHz)
+ * - RF23BP radio module (433MHz)
  * - Raspberry Pi with thermal camera
  * - UART connection between Teensy and RPI
  *
@@ -31,6 +31,14 @@
 // UART TRANSMITTER CODE - satellite teensy (8/25/2025)
 #include <Arduino.h>
 #include <SPI.h>
+/**
+ * https://www.airspayce.com/mikem/arduino/RadioHead/
+ * RH_RF22 Works with Hope-RF RF22B and RF23B based transceivers, and compatible chips and modules,
+ * including the RFM22B transceiver module such as hthis bare module: https://www.sparkfun.com/products/10153 and
+ * this shield: https://www.sparkfun.com/products/11018 and this board: https://www.anarduino.com/miniwireless and RF23BP modules
+ * such as: https://www.anarduino.com/details.jsp?pid=130 Supports GFSK, FSK and OOK. Access to other chip features such as
+ * on-chip temperature measurement, analog-digital converter, transmitter power control etc is also provided.
+ */
 #include <RH_RF22.h>
 #include <RHHardwareSPI1.h>
 #include <Wire.h>
@@ -71,9 +79,6 @@ uint16_t capturedImageLength = 0; // Length of captured thermal image
 const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
 uint8_t imgBuf[MAX_IMG];        // Buffer to store thermal image data
 
-uint32_t rpiPowerOnTimestamp = 0;
-bool rpiBootNotificationSent = false;
-
 // Serial output redirection
 String serialBuffer = "";            // Buffer to accumulate serial output
 bool radioReady = false;             // Flag to indicate if radio is ready for transmission
@@ -91,7 +96,7 @@ const uint8_t SERIAL_MSG_TYPE = 0xAA;                         // Message type id
 const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
 // const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
 // const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 3; // Maximum serial message length per packet payload
-const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indicates additional chunks follow
+const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
 // Shared radio buffers to avoid stack allocations inside hot paths
 uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
@@ -395,15 +400,11 @@ void listenForCommands()
         if (sub == '1')
         {
           digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
-          rpiPowerOnTimestamp = millis();
-          rpiBootNotificationSent = false;
           radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
         }
         else if (sub == '0')
         {
           digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
-          rpiPowerOnTimestamp = 0;
-          rpiBootNotificationSent = false;
           radioPrintln("RPI POWER: OFF");
         }
         else if (sub == 's' || sub == 'S')
@@ -758,8 +759,6 @@ void initRPI()
   // Initialize Raspberry Pi control pin and make sure its off.
   pinMode(RPI_ENABLE, OUTPUT);
   digitalWrite(RPI_ENABLE, LOW);
-  rpiPowerOnTimestamp = 0;
-  rpiBootNotificationSent = false;
 
   // Configure trigger pin for RPI communication and leave HIGH (if LOW it will trigger thermal data capture script)
   pinMode(TRIGGER_PIN, OUTPUT);
@@ -768,6 +767,9 @@ void initRPI()
   // Initialize UART for RPi communication
   Serial2.begin(UART_BAUD); // High-speed UART for data transfer
   radioPrintln("RPI UART initialized at 115200 baud");
+
+  digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
+  radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
 }
 /**
  * Initializes the RF22 radio module for transmit mode
@@ -806,10 +808,24 @@ void initRadio()
   }
 
   // Configure radio parameters
-  rf23.setFrequency(433.0);                     // Set frequency to 433MHz
-  rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // GFSK modulation, 9.6kbps
-  rf23.setTxPower(RH_RF22_TXPOW_20DBM);         // Set transmit power to 20dBm
-  rf23.setModeIdle();                           // Set radio to idle mode
+  rf23.setFrequency(433.0); // 433MHz (good for drone use)
+
+  // GFSK Modem Configurations - Ordered from fastest to slowest
+  // Uncomment ONE line to select your desired configuration
+
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
+  rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
+
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
+
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb4_8Fd45);     // 4.8 kbps, 45 kHz deviation
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb2_4Fd36);     // 2.4 kbps, 36 kHz deviation
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
+
+  rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
+  rf23.setModeIdle();                          // Set radio to idle mode
   delay(100);
   radioReady = true;
   radioPrintln("Satellite Radio is ready.");
@@ -829,19 +845,6 @@ void loop()
   while (rf23.available())
   {
     listenForCommands();
-  }
-
-  if (rpiPowerOnTimestamp != 0 && !rpiBootNotificationSent)
-  {
-    if (millis() - rpiPowerOnTimestamp >= 80000UL)
-    {
-      if (radioReady)
-      {
-        radioPrintln("RPI POWER: Boot complete");
-        rpiBootNotificationSent = true;
-        rpiPowerOnTimestamp = 0;
-      }
-    }
   }
 
   // Also allow manual commands via serial for testing/debug
@@ -1403,8 +1406,8 @@ void sendThermalDataViaRadio()
   Serial.print(F("Data rate (B/s): "));
   Serial.println(dataRate, 1);
 
-  radioPrintln("=== TRANSMISSION COMPLETE ===");
-  radioPrint("Packets ok: ");
+  radioPrintln("=== SAT TRANSMISSION COMPLETE ===");
+  radioPrint("SAT Packets sent ok: ");
   radioPrint(String(successCount));
   radioPrint("/");
   radioPrint(String(totalPackets));
@@ -1419,14 +1422,14 @@ void sendThermalDataViaRadio()
 
   if (successCount == totalPackets)
   {
-    radioPrintln("✅ Perfect transmission!");
+    radioPrintln("✅ SAT Perfect transmission!");
   }
   else if (successCount > totalPackets * 0.95)
   {
-    radioPrintln("✅ Excellent transmission!");
+    radioPrintln("✅ SAT Excellent transmission!");
   }
   else
   {
-    radioPrintln("⚠️ Some packets lost");
+    radioPrintln("⚠️ SAT Some packets lost");
   }
 }

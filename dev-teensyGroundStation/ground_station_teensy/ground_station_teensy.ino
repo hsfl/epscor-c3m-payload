@@ -17,6 +17,14 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+/**
+ * https://www.airspayce.com/mikem/arduino/RadioHead/
+ * RH_RF22 Works with Hope-RF RF22B and RF23B based transceivers, and compatible chips and modules,
+ * including the RFM22B transceiver module such as hthis bare module: https://www.sparkfun.com/products/10153 and
+ * this shield: https://www.sparkfun.com/products/11018 and this board: https://www.anarduino.com/miniwireless and RF23BP modules
+ * such as: https://www.anarduino.com/details.jsp?pid=130 Supports GFSK, FSK and OOK. Access to other chip features such as
+ * on-chip temperature measurement, analog-digital converter, transmitter power control etc is also provided.
+ */
 #include <RH_RF22.h>
 #include <RHHardwareSPI1.h>
 
@@ -62,10 +70,10 @@ bool packetReceived[1200]; // Array to track which packets have been received
 uint16_t maxPacketNum = 0; // Highest packet number received
 
 // Communication statistics
-unsigned long packetsReceived = 0; // Total packets received (including duplicates)
-unsigned long lastPacketTime = 0;  // Timestamp of last packet reception
-int lastRSSI = 0;                  // Signal strength of last received packet
-unsigned long thermalDataDownloadDuration = 0;  // Track how long it took to download thermal data
+unsigned long packetsReceived = 0;             // Total packets received (including duplicates)
+unsigned long lastPacketTime = 0;              // Timestamp of last packet reception
+int lastRSSI = 0;                              // Signal strength of last received packet
+unsigned long thermalDataDownloadDuration = 0; // Track how long it took to download thermal data
 
 // Auto mode flag for continuous reception
 bool autoMode = false;
@@ -79,7 +87,7 @@ uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
 uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + THERMAL_PACKET_OVERHEAD];
 
 // Serial message radio reception parameters
-const uint8_t SERIAL_MSG_TYPE = 0xAA;          // Message type identifier for serial output
+const uint8_t SERIAL_MSG_TYPE = 0xAA; // Message type identifier for serial output
 // const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
@@ -342,10 +350,24 @@ void initRadio()
   }
 
   // Configure radio parameters
-  rf23.setFrequency(433.0);                     // Set frequency to 433MHz
-  rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // GFSK modulation, 9.6kbps
-  rf23.setTxPower(RH_RF22_TXPOW_20DBM);         // Set transmit power to 20dBm
-  rf23.setModeIdle();                           // Set radio to idle mode
+  rf23.setFrequency(433.0); // 433MHz (good for drone use)
+
+  // GFSK Modem Configurations - Ordered from fastest to slowest
+  // Uncomment ONE line to select your desired configuration
+
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125);    // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
+  rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
+
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
+
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb4_8Fd45);     // 4.8 kbps, 45 kHz deviation
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb2_4Fd36);     // 2.4 kbps, 36 kHz deviation
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
+
+  rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
+  rf23.setModeIdle();                          // Set radio to idle mode
   delay(100);
   Serial.println("GS Radio ready");
 }
@@ -483,10 +505,6 @@ void handleThermalEndPacket(uint8_t *buf)
     Serial.print(" packets but header expected ");
     Serial.println(expectedPackets);
   }
-
-  thermalDataDownloadDuration = millis() - thermalDataDownloadDuration;
-  
-  helperTime(thermalDataDownloadDuration);
 
   imageComplete = true;
   autoMode = false; // Exit auto mode
@@ -677,7 +695,6 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
   if (len < 2)
     return false; // Minimum packet size check
 
-
   // if (len < 3)
   //   return false; // Minimum packet size check (2-byte type + 1-byte header)
 
@@ -859,6 +876,15 @@ void showReceptionSummary()
   {
     Serial.println("\nThermal image ready! Type 'export' to export as CSV");
   }
+
+  thermalDataDownloadDuration = millis() - thermalDataDownloadDuration;
+  Serial.println("**** Thermal Data Download Duration ****");
+  helperTime(thermalDataDownloadDuration);
+  thermalDataDownloadDuration = 0;
+  Serial.print("Payload Expected Size (bytes): ");
+  Serial.println(expectedLength);
+  Serial.print("Last RSSI: ");
+  Serial.println(lastRSSI);
 }
 
 void exportThermalData()
