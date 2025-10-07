@@ -35,6 +35,7 @@
 #include <RHHardwareSPI1.h>
 #include <Wire.h>
 #include <Adafruit_INA219.h>
+#include <microlzw.h>
 
 // Pin definitions for hardware control
 const uint8_t RPI_ENABLE = 36; // Power control pin for Raspberry Pi
@@ -66,11 +67,20 @@ bool piCaptureInProgress = false;
 
 // Image data storage and tracking
 uint16_t capturedImageLength = 0; // Length of captured thermal image
+const int MAX_DATA_CAPTURE_SIZE = 160 * 120 * 2; // = 38400 bytes, according to camera specs
 
 // Buffer for thermal image storage
 const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
 uint8_t imgBuf[MAX_IMG];        // Buffer to store thermal image data
 
+// Compression buffers and configuration
+const uint32_t MAX_COMPRESSED = 20000; // Buffer for compressed data
+int compressedData[MAX_COMPRESSED / sizeof(int)]; // Compressed output buffer
+size_t compressedSize = 0; // Actual compressed size in int elements
+const int LZW_DICT_SIZE = 4096; // Dictionary size for LZW compression, typical values: 512, 1024, 2048, 4096
+bool imageIsCompressed = false; // Flag indicating if data is compressed, TODO: implement into header
+
+// RPI power-on tracking
 uint32_t rpiPowerOnTimestamp = 0;
 bool rpiBootNotificationSent = false;
 
@@ -359,6 +369,9 @@ void listenForCommands() {
     else if (cmd == 'r' || cmd == 'R') {
       sendThermalDataViaRadio();
     }
+    else if (cmd == 'c' || cmd == 'C') {
+      compressThermalData();
+    }
     else if (cmd == 'd' || cmd == 'D') {
       dumpRf23PendingPackets();
     }
@@ -366,26 +379,8 @@ void listenForCommands() {
       // Power control: ['p','1'] on, ['p','0'] off, ['p','s'] status
       if (len >= 2) {
         char sub = (char) radioRxBuffer[1];
-        if (sub == '1') {
-          digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
-          rpiPowerOnTimestamp = millis();
-          rpiBootNotificationSent = false;
-          radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
-        }
-        else if (sub == '0') {
-          digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
-          rpiPowerOnTimestamp = 0;
-          rpiBootNotificationSent = false;
-          radioPrintln("RPI POWER: OFF");
-        }
-        else if (sub == 's' || sub == 'S') {
-          int state = digitalRead(RPI_ENABLE);
-          radioPrint("RPI POWER STATE: ");
-          radioPrintln(state ? "ON" : "OFF");
-        }
-        else {
-          radioPrintln("RPI POWER: Unknown subcommand");
-        }
+        toggleRPI(sub);
+        
       }
       else {
         radioPrintln("RPI POWER: missing arg");
@@ -397,6 +392,37 @@ void listenForCommands() {
     else
       radioPrintln("Unknown command received via radio");
   }
+}
+
+/**
+ * Toggles the Raspberry Pi power state based on command, returns state
+ * * @param sub '1' to turn on, '0' to turn off, 's' for status
+ */
+int toggleRPI(char sub) {
+  if (sub == '1') {
+          digitalWrite(RPI_ENABLE, HIGH); // Turn Pi ON
+          rpiPowerOnTimestamp = millis();
+          rpiBootNotificationSent = false;
+          radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
+          return 1;
+        }
+        else if (sub == '0') {
+          digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
+          rpiPowerOnTimestamp = 0;
+          rpiBootNotificationSent = false;
+          radioPrintln("RPI POWER: OFF");
+          return 0;
+        }
+        else if (sub == 's' || sub == 'S') {
+          int state = digitalRead(RPI_ENABLE);
+          radioPrint("RPI POWER STATE: ");
+          radioPrintln(state ? "ON" : "OFF");
+          return state;
+        }
+        else {
+          radioPrintln("RPI POWER: Unknown subcommand");
+          return -1;
+        }
 }
 
 /**
@@ -439,6 +465,8 @@ void setup() {
   radioPrintln(" 't' - Check temperature sensors");
   radioPrintln(" 'c' - Check current sensors");
   radioPrintln(" 'd' - Dump RF23 RX FIFO contents");
+  radioPrintln(" 'p' - Toggle RPI power on/off");
+  radioPrintln(" 'l' - Compress captured image data using LZW compression");
   radioPrintln("Ready!");
 }
 
@@ -807,6 +835,21 @@ void loop() {
     case 'D':
       dumpRf23PendingPackets();
       break;
+    case 'p': // toggles on/off RPI, used for debugging
+    case 'P':
+      if (toggleRPI('s') == 1) {
+        toggleRPI('0'); // Turn off
+        radioPrintln("RPI STATUS: OFF");
+      }
+      else {
+        toggleRPI('1'); // Turn on
+        radioPrintln("RPI STATUS: ON");
+      }
+      break;
+    case 'l':
+    case 'L':
+      compressThermalData();
+      break;
     default:
       radioPrintln("Unknown command. Use 'z' pong, 'u' capture thermal, 'r' transmit thermal, 't' temps sensors, 'c' currents sensors, 'd' dump RF23 FIFO");
     }
@@ -1058,7 +1101,7 @@ void captureThermalImageUART() {
   radioPrintln(" image bytes");
 
   // Quick quality check (same logic you already had)
-  if (capturedImageLength >= 38400) {
+  if (capturedImageLength >= MAX_DATA_CAPTURE_SIZE) {
     int validPixels = 0;
     for (uint32_t i = 0; i + 1 < capturedImageLength; i += 2) {
       uint16_t pixel = imgBuf[i] | (uint16_t(imgBuf[i + 1]) << 8);
@@ -1130,6 +1173,57 @@ bool sendPacketReliable(uint8_t *data, uint8_t len) {
   }
   // rf23.setModeIdle();
   return false;
+}
+
+/**
+ * Compresses captured thermal image data using Micro LZW
+ *
+ * Reduces the size of thermal data before radio transmission.
+ * Compression ratio typically 2 - 4x for thermal data.
+ */
+void compressThermalData() {
+  if (capturedImageLength == 0) {
+    radioPrintln("No image data to compress!");
+    return;
+  }
+
+  radioPrintln("--- COMPRESSING THERMAL DATA ---");
+  radioPrint("Original size: ");
+  radioPrint(String(capturedImageLength));
+  radioPrintln(" bytes");
+
+  unsigned long startTime = millis();
+
+  // Compress the image data
+  compressedSize = 0;
+  mlzw_compress((char *) imgBuf, compressedData, &compressedSize, LZW_DICT_SIZE);
+
+  unsigned long compressTime = millis() - startTime;
+
+  // Convert compressed size from int count to bytes
+  size_t compressedBytes = compressedSize * sizeof(int);
+
+  radioPrint("Compressed size: ");
+  radioPrint(String(compressedBytes));
+  radioPrintln(" bytes");
+
+  float ratio = (float) capturedImageLength / compressedBytes;
+  radioPrint("Compression ratio: ");
+  radioPrint(String(ratio, 2));
+  radioPrintln("x");
+
+  radioPrint("Compression time: ");
+  radioPrint(String(compressTime));
+  radioPrintln(" ms");
+
+  if (compressedBytes >= capturedImageLength) {
+    radioPrintln("⚠️ Compressed size >= original - will send uncompressed");
+    imageIsCompressed = false;
+  }
+  else {
+    radioPrintln("✓ Compression successful!");
+    imageIsCompressed = true;
+  }
 }
 
 /**
