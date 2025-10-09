@@ -121,7 +121,6 @@ void handleThermalHeaderPacket(uint8_t *buf);
 void handleThermalEndPacket(uint8_t *buf);
 void handleThermalDataPacket(uint8_t *buf, uint8_t len);
 bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut = nullptr);
-void runAutoMode();
 void showReceptionSummary();
 void exportThermalData();
 void forwardToSatellite(char cmd);
@@ -138,13 +137,13 @@ void cmdLed(const char *args);
 void cmdAnalog(const char *args);
 void cmdDigital(const char *args);
 void cmdTime(const char *args);
-void cmdReset(const char *args);
+void cmdGSReset(const char *args);
+void cmdSatelliteReset(const char *args);
 void cmdHistory(const char *args);
 void cmdClear(const char *args);
 void cmdRPIControl(const char *args);
 void cmdTestInterrupt(const char *args);
 void cmdRadio(const char *args);
-void cmdAutoMode(const char *args);
 void cmdExport(const char *args);
 void cmdCapture(const char *args);
 void cmdRequest(const char *args);
@@ -161,13 +160,13 @@ const Command commands[] = {
     {"analog", "Read analog pin (analog <pin>)", cmdAnalog},
     {"digital", "Read/write digital pin (digital <pin> [value])", cmdDigital},
     {"time", "Show uptime", cmdTime},
-    {"reset", "Reset the system", cmdReset},
+    {"gs_reset", "Reset the ground station system", cmdGSReset},
+    {"sat_reset", "Reset the satellite system", cmdSatelliteReset},
     {"history", "Show command history", cmdHistory},
     {"clear", "Clear screen", cmdClear},
     {"rpi", "Control Raspberry Pi (rpi <on|off|status>)", cmdRPIControl},
     {"testint", "Test interrupt functionality (testint <seconds>)", cmdTestInterrupt},
     {"radio", "Radio control (radio <init|status|tx|rx|dump>)", cmdRadio},
-    {"auto", "Start auto reception mode", cmdAutoMode},
     {"export", "Export thermal data as CSV", cmdExport},
     {"capture", "Command satellite to capture thermal data", cmdCapture},
     {"request", "Request thermal data downlink from satellite", cmdRequest},
@@ -193,8 +192,6 @@ bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeou
       Serial.println("Timeout waiting for packet send");
   }
 
-  // small safety gap then go to idle
-  delay(5);
   digitalWrite(LED_PIN, LOW);
   // rf23.setModeIdle();
   return ok;
@@ -368,6 +365,7 @@ void initRadio()
 
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
   rf23.setModeIdle();                          // Set radio to idle mode
+  Serial.println("GS Radio hardcoded config: 433MHz, GFSK_Rb38_4Fd19_6 38.4 kbps, 19.6 kHz deviation, 30dBm tx power.");
   delay(100);
   Serial.println("GS Radio ready");
 }
@@ -568,15 +566,17 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
         maxPacketNum = packetNum; // Track highest packet number
       }
 
-      // Progress indication in auto mode
-      if (autoMode && receivedPackets % 10 == 0)
+      // Progress indication in auto mode - update every 25%
+      if (autoMode)
       {
-        Serial.print(".");
-        if (receivedPackets % 100 == 0)
+        float progress = (float)receivedPackets / expectedPackets * 100;
+        static uint8_t lastReportedQuarter = 0;
+        uint8_t currentQuarter = progress / 25;
+
+        if (currentQuarter > lastReportedQuarter && currentQuarter <= 4)
         {
-          float progress = (float)receivedPackets / expectedPackets * 100;
-          Serial.print(" ");
-          Serial.print(progress, 0);
+          lastReportedQuarter = currentQuarter;
+          Serial.print(currentQuarter * 25);
           Serial.println("%");
         }
       }
@@ -764,52 +764,6 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t len)
     }
   }
   return crc;
-}
-
-void runAutoMode()
-{
-  Serial.println("\n=== AUTO MODE - THERMAL IMAGE RECEPTION ===");
-  Serial.println("Clearing buffer and waiting for transmission...");
-  Serial.println("Start transmission from flat sat now!");
-  Serial.println("Press any key to abort\n");
-
-  clearReception(); // Reset reception state
-  autoMode = true;  // Enable auto mode
-  rf23.setModeRx(); // Ensure radio is in receive mode
-
-  unsigned long lastActivity = millis();
-  while (!Serial.available() && !imageComplete)
-  {
-    if (rf23.available())
-    {
-      handlePacket();
-      lastActivity = millis(); // Update activity timestamp
-    }
-
-    // Timeout if no activity for 30 seconds after header received
-    if (headerReceived && (millis() - lastActivity > 30000))
-    {
-      Serial.println("\n\nTimeout - no packets for 30 seconds");
-      break;
-    }
-    delay(1);
-  }
-
-  // Clear any key press from input buffer
-  while (Serial.available())
-    Serial.read();
-  autoMode = false; // Exit auto mode if end packet not received
-
-  // Handle different completion scenarios
-  if (!imageComplete && !headerReceived)
-  {
-    Serial.println("\nNo transmission detected");
-  }
-  else if (!imageComplete)
-  {
-    Serial.println("\nTransmission interrupted");
-    showReceptionSummary();
-  }
 }
 
 void showReceptionSummary()
@@ -1196,7 +1150,7 @@ void cmdTime(const char *args)
   helperTime(millis());
 }
 
-void cmdReset(const char *args)
+void cmdGSReset(const char *args)
 {
   Serial.println("Resetting GS system... manually reconnect to serial after 20 seconds.");
   Serial.println("Press 'Q' to cancel reset within 1 second...");
@@ -1215,6 +1169,26 @@ void cmdReset(const char *args)
 
   // Software reset for Teensy 4.1 (ARM Cortex-M7)
   SCB_AIRCR = 0x05FA0004;
+}
+
+void cmdSatelliteReset(const char *args)
+{
+  Serial.println("Resetting Satellite system... reboot should take 20 seconds.");
+  Serial.println("Press 'Q' to cancel reset within 1 second...");
+
+  // Check for interrupt during the 1-second delay
+  unsigned long startTime = millis();
+  while (millis() - startTime < 1000)
+  {
+    if (isInterruptRequested())
+    {
+      Serial.println("\nReset cancelled by user!");
+      return;
+    }
+    delay(50);
+  }
+
+  forwardToSatellite('~');
 }
 
 void cmdHistory(const char *args)
@@ -1394,11 +1368,6 @@ void cmdRadio(const char *args)
   {
     Serial.println("Usage: radio [init|status|tx|rx|dump]");
   }
-}
-
-void cmdAutoMode(const char *args)
-{
-  runAutoMode();
 }
 
 void cmdExport(const char *args)
