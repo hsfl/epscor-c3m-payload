@@ -6,6 +6,7 @@
  * to the ground station via radio communication.
  *
  * Key Features:
+ * - Triggers RPI thermal capture via UART command ("TRIGGER\n")
  * - Receives thermal image data from RPI via UART at 115200 baud
  * - Transmits image data via RFM23BP radio module in packetized format
  * - Handles reliable packet transmission with retry logic
@@ -19,12 +20,13 @@
  * - UART connection between Teensy and RPI
  *
  * Communication Protocol:
- * - UART: Receives thermal data with header/end markers
+ * - UART Trigger: Sends "TRIGGER\n" command to initiate RPI capture
+ * - UART Data: Receives thermal data with header/end markers
  * - Radio: Transmits packetized data with header/data/end packets
  *
  * @author EPSCOR C3M Team
  * @date 8/25/2025
- * @version 1.0
+ * @version 1.1
  */
 
 // Simplified Transmitter with UART (Essential Functions Only)
@@ -48,14 +50,15 @@
  *  Uncomment ONE of these for your build target:
  * */
 // #define DEBUG    // Verbose logging for development
-#define FLIGHT // Flight mode - minimal logging
+ #define FLIGHT // Flight mode - minimal logging
 
 // Pin definitions for hardware control
 const uint8_t RPI_ENABLE = 36; // Power control pin for Raspberry Pi
-const uint8_t TRIGGER_PIN = 2; // Trigger pin to signal RPI for capture
 const uint8_t LED_PIN = 13;
 
 // UART pins: Serial2 uses pins 7 (RX) and 8 (TX) automatically
+// UART trigger command to signal RPI for capture
+const char UART_TRIGGER_CMD[] = "TRIGGER\n";
 
 // Radio configuration pins and object
 const int RADIO_CS = 38;  // Chip select pin for RF22 module
@@ -785,10 +788,6 @@ void initRPI()
   pinMode(RPI_ENABLE, OUTPUT);
   digitalWrite(RPI_ENABLE, LOW);
 
-  // Configure trigger pin for RPI communication and leave HIGH (if LOW it will trigger thermal data capture script)
-  pinMode(TRIGGER_PIN, OUTPUT);
-  digitalWrite(TRIGGER_PIN, HIGH);
-
   // Initialize UART for RPi communication
   Serial2.begin(UART_BAUD); // High-speed UART for data transfer
   radioPrintln("RPI UART initialized at 115200 baud");
@@ -1175,14 +1174,13 @@ void captureThermalImageUART()
 
   piCaptureInProgress = true;
 
-  // Clear any pending UART bytes
+  // Clear any pending UART bytes before sending trigger
   while (Serial2.available())
     Serial2.read();
 
-  // Trigger pulse (active-low)
-  digitalWrite(TRIGGER_PIN, LOW);
-  delay(10);
-  digitalWrite(TRIGGER_PIN, HIGH);
+  // Send UART trigger command to Raspberry Pi
+  Serial2.print(UART_TRIGGER_CMD);
+  Serial2.flush(); // Ensure command is sent immediately
 
   radioPrintln("Waiting for framed message from RPI...");
 

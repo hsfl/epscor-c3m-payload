@@ -12,16 +12,16 @@ Key Features:
 - Averages multiple frames for noise reduction
 - Transmits data via UART with header/end markers
 - Provides real-time progress updates and data validation
-- Responds to trigger signals from Teensy microcontroller
+- Listens for UART trigger commands from Teensy microcontroller
 
 Hardware Requirements:
 - Raspberry Pi (3B+ or 4 recommended)
 - USB thermal camera (FLIR ONE, Seek Thermal, etc.)
 - UART connection to Teensy microcontroller
-- GPIO trigger input from Teensy
 
 Communication Protocol:
-- UART: 921600 baud, 8N1
+- UART: 115200 baud, 8N1
+- Trigger: "TRIGGER\n" command from Teensy
 - Header: Magic bytes (0xDE 0xAD 0xBE 0xEF) + 16-bit length
 - Data: Raw thermal image data (16-bit per pixel)
 - End: Magic bytes (0xFF 0xFF)
@@ -31,7 +31,6 @@ Communication Protocol:
 @version 1.0
 """
 
-import RPi.GPIO as GPIO
 import numpy as np
 import time
 import struct
@@ -41,12 +40,10 @@ import cv2
 from queue import Queue, Empty, Full
 import ctypes
 
-# GPIO Pin Configuration
-TRIGGER_PIN = 25	# Input from Teensy for capture trigger
-
 # UART Configuration for Teensy communication
 UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
 UART_BAUD = 115200         # High-speed UART to match Teensy baud rate
+TRIGGER_COMMAND = b'TRIGGER\n'  # UART command from Teensy to initiate capture
 
 # Camera Configuration
 MAX_FRAMES = 10           # Number of frames to capture and average
@@ -321,13 +318,45 @@ def send_data_uart(data, uart_port):
         print(f"UART transmission error: {e}")
         return False
 
+def wait_for_uart_trigger(uart_port, timeout=None):
+    """
+    Wait for UART trigger command from Teensy
+
+    Reads UART data line by line and returns True when trigger command is received.
+
+    Args:
+        uart_port: Serial port object for UART communication
+        timeout: Optional timeout in seconds (None for blocking)
+
+    Returns:
+        bool: True if trigger received, False on timeout
+    """
+    start_time = time.time()
+    buffer = b''
+
+    while True:
+        if timeout is not None:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                return False
+
+        if uart_port.in_waiting > 0:
+            chunk = uart_port.read(uart_port.in_waiting)
+            buffer += chunk
+
+            # Check for trigger command
+            if TRIGGER_COMMAND in buffer:
+                return True
+
+            # Keep buffer size manageable (only last 100 bytes)
+            if len(buffer) > 100:
+                buffer = buffer[-100:]
+        else:
+            time.sleep(0.01)  # Small delay to avoid busy-waiting
+
 def main():
     print("RPi Thermal Camera - UART Output")
     print("="*40)
-
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     # UART first (so we can notify Teensy if camera isn't present)
     try:
@@ -356,36 +385,37 @@ def main():
             # Clean exit so systemd can retry later
             return
 
-        print(f"\nSystem ready. Waiting for trigger on GPIO{TRIGGER_PIN}")
+        print(f"\nSystem ready. Waiting for UART trigger command: {TRIGGER_COMMAND.decode('ascii').strip()}")
         print(f"Data will be sent via UART: {UART_PORT} at {UART_BAUD} baud")
         send_status_uart("IDLE", uart)
 
         while True:
-            GPIO.wait_for_edge(TRIGGER_PIN, GPIO.FALLING)
-            timestamp = time.strftime("%H:%M:%S")
-            print(f"\n[{timestamp}] Capture triggered!")
-            print("="*40)
-            send_status_uart("CAPTURE_START", uart)
+            # Wait for trigger command from Teensy via UART
+            if wait_for_uart_trigger(uart):
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"\n[{timestamp}] Capture triggered via UART!")
+                print("="*40)
+                send_status_uart("CAPTURE_START", uart)
 
-            thermal_data = capture_and_average(timeout_s=8.0)
+                thermal_data = capture_and_average(timeout_s=8.0)
 
-            if thermal_data is None:
-                print("No thermal data available; notifying Teensy.")
-                send_status_uart("NO_FRAMES", uart)
-            else:
-                print("\nWaiting 3 seconds for Teensy to prepare...")
-                time.sleep(3)
-                success = send_data_uart(thermal_data, uart)
-                if success:
-                    print("✓ Data transmission successful!")
-                    send_status_uart("CAPTURE_DONE", uart)
+                if thermal_data is None:
+                    print("No thermal data available; notifying Teensy.")
+                    send_status_uart("NO_FRAMES", uart)
                 else:
-                    print("✗ Data transmission failed!")
-                    send_status_uart("TX_FAIL", uart)
+                    print("\nWaiting 3 seconds for Teensy to prepare...")
+                    time.sleep(3)
+                    success = send_data_uart(thermal_data, uart)
+                    if success:
+                        print("✓ Data transmission successful!")
+                        send_status_uart("CAPTURE_DONE", uart)
+                    else:
+                        print("✗ Data transmission failed!")
+                        send_status_uart("TX_FAIL", uart)
 
-            print("\nReady for next trigger...")
-            print("="*40)
-            send_status_uart("IDLE", uart)
+                print("\nReady for next trigger...")
+                print("="*40)
+                send_status_uart("IDLE", uart)
 
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -404,7 +434,6 @@ def main():
             uart.close()
         except Exception:
             pass
-        GPIO.cleanup()
 
 if __name__ == "__main__":
     main()

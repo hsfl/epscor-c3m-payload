@@ -602,8 +602,15 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
       // Progress indication in auto mode - update every 25%
       if (autoMode)
       {
-        float progress = (float)receivedPackets / expectedPackets * 100;
         static uint8_t lastReportedQuarter = 0;
+
+        // Reset progress tracking at start of new reception
+        if (receivedPackets == 1)
+        {
+          lastReportedQuarter = 0;
+        }
+
+        float progress = (float)receivedPackets / expectedPackets * 100;
         uint8_t currentQuarter = progress / 25;
 
         if (currentQuarter > lastReportedQuarter && currentQuarter <= 4)
