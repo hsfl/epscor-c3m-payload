@@ -47,6 +47,7 @@ struct Command
 // Radio configuration pins and object
 const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
+// note that hardware_spi1 uses the RHHardwareSPI1.h library (same as using SPI1 bus but more explicit for the RH_RF22 library driver)
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 
 const uint8_t LED_PIN = 13;
@@ -91,6 +92,11 @@ const uint8_t SERIAL_MSG_TYPE = 0xAA; // Message type identifier for serial outp
 // const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
+// Packet retry protocol
+const uint8_t RETRY_REQUEST_TYPE = 0xBB;          // Message type for requesting missing packets
+const uint8_t MAX_RETRY_PACKETS_PER_REQUEST = 20; // Max number of missing packets to request at once
+const uint8_t MAX_RETRY_ATTEMPTS = 3;             // Maximum number of retry rounds
+
 // Global variables
 String inputBuffer = "";
 String commandHistory[10];
@@ -126,6 +132,8 @@ void exportThermalData();
 void forwardToSatellite(char cmd);
 void dumpRf23PendingPacketsToSerial();
 void printRf23HexLines(const uint8_t *data, uint8_t length);
+// void requestMissingPackets();
+uint16_t collectMissingPackets(uint16_t *missingIndices, uint16_t maxCount);
 
 // Command function prototypes
 void cmdHelp(const char *args);
@@ -330,12 +338,14 @@ void initRadio()
   pinMode(31, OUTPUT);    // TX_ON pin
   digitalWrite(30, HIGH); // RX_ON = HIGH for receive mode
   digitalWrite(31, LOW);  // TX_ON = LOW for receive mode
-  delay(100);
+  delay(10);
 
   // Configure SPI1 interface for radio communication
   SPI1.setMISO(39); // Master In, Slave Out
   SPI1.setMOSI(26); // Master Out, Slave In
   SPI1.setSCK(27);  // Serial Clock
+  SPI1.begin();
+  delay(10);
 
   // Initialize RF22 radio module
   if (!rf23.init())
@@ -366,7 +376,7 @@ void initRadio()
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
   rf23.setModeIdle();                          // Set radio to idle mode
   Serial.println("GS Radio hardcoded config: 433MHz, GFSK_Rb38_4Fd19_6 38.4 kbps, 19.6 kHz deviation, 30dBm tx power.");
-  delay(100);
+  delay(10);
   Serial.println("GS Radio ready");
 }
 
@@ -426,6 +436,9 @@ void processPacket(uint8_t *buf, uint8_t len)
   else
   {
     // should never hit this but leave for debugging radio packets.
+    Serial.println("Header received: " + String(headerReceived));
+    Serial.println("imageComplete: " + String(imageComplete));
+    Serial.println("buf len: " + String(len));
     Serial.println("Unknown radio packet?! Dumping radio packets.");
     dumpRf23PendingPacketsToSerial();
   }
@@ -477,7 +490,6 @@ void handleThermalHeaderPacket(uint8_t *buf)
 
 void handleThermalEndPacket(uint8_t *buf)
 {
-  downloadingThermalData = false;
   uint16_t finalCount = buf[2] | (buf[3] << 8); // Extract final packet count
   expectedImageCrc = buf[4] | (buf[5] << 8);
   Serial.println("\n🏁 END PACKET RECEIVED!");
@@ -504,9 +516,30 @@ void handleThermalEndPacket(uint8_t *buf)
     Serial.println(expectedPackets);
   }
 
+  downloadingThermalData = false;
   imageComplete = true;
-  autoMode = false; // Exit auto mode
   showReceptionSummary();
+  autoMode = false; // Exit auto mode only if complete
+
+  // // Request missing packets if any
+  // if (receivedPackets < expectedPackets)
+  // {
+  //   imageComplete = false;
+  //   //requestMissingPackets();
+
+  //   //uh todo assume its good now
+  //   downloadingThermalData = false;
+  //   imageComplete = true;
+  //   showReceptionSummary();
+  //   autoMode = false; // Exit auto mode only if complete
+  // }
+  // else
+  // {
+  //   downloadingThermalData = false;
+  //   imageComplete = true;
+  //   showReceptionSummary();
+  //   autoMode = false; // Exit auto mode only if complete
+  // }
 }
 
 void handleThermalDataPacket(uint8_t *buf, uint8_t len)
@@ -1324,10 +1357,87 @@ void cmdRadio(const char *args)
   else if (argStr == "status")
   {
     Serial.println("\n=== RADIO STATUS ===");
-    Serial.print("Frequency: 433.0 MHz");
-    Serial.println();
-    Serial.print("Last RSSI: ");
-    Serial.println(lastRSSI);
+
+    // Basic configuration
+    Serial.println("Frequency: 433.3MHz");
+
+    // Signal strength
+    Serial.println("Last RSSI: " + String(rf23.lastRssi()) + " dBm");
+
+    if (rf23.lastRssi() > -70)
+    {
+      Serial.println(" (EXCELLENT)");
+    }
+    else if (rf23.lastRssi() > -85)
+    {
+      Serial.println(" (GOOD)");
+    }
+    else if (rf23.lastRssi() > -95)
+    {
+      Serial.println(" (FAIR)");
+    }
+    else
+    {
+      Serial.println(" (POOR)");
+    }
+
+    // Radio mode
+    Serial.print("Radio mode: ");
+    uint8_t mode = rf23.mode();
+    switch (mode)
+    {
+    case RHGenericDriver::RHModeInitialising:
+      Serial.println("Initializing");
+      break;
+    case RHGenericDriver::RHModeSleep:
+      Serial.println("Sleep");
+      break;
+    case RHGenericDriver::RHModeIdle:
+      Serial.println("Idle");
+      break;
+    case RHGenericDriver::RHModeTx:
+      Serial.println("Transmitting");
+      break;
+    case RHGenericDriver::RHModeRx:
+      Serial.println("Receiving");
+      break;
+    default:
+      Serial.println("Unknown");
+      break;
+    }
+
+    // TX Power
+    Serial.println("TX Power: 30dBM");
+
+    // Modem configuration details
+    Serial.print("Modem config: ");
+    // You'll need to track which config you set, or just print what you know
+    Serial.println("GFSK_Rb38_4Fd19_6 (38.4 kbps)");
+
+    // Temperature (if supported by RF22/23)
+    Serial.print("Radio temp: ");
+    Serial.print(rf23.temperatureRead());
+    Serial.println(" °C");
+
+    // Header settings
+    Serial.print("Header TO: 0x");
+    Serial.println(rf23.headerTo(), HEX);
+    Serial.print("Header FROM: 0x");
+    Serial.println(rf23.headerFrom(), HEX);
+    Serial.print("Header ID: 0x");
+    Serial.println(rf23.headerId(), HEX);
+    Serial.print("Header FLAGS: 0x");
+    Serial.println(rf23.headerFlags(), HEX);
+
+    // Statistics
+    Serial.print("RX Good: ");
+    Serial.println(rf23.rxGood());
+    Serial.print("RX Bad: ");
+    Serial.println(rf23.rxBad());
+    Serial.print("TX Good: ");
+    Serial.println(rf23.txGood());
+
+    // Your custom stats
     Serial.print("Packets received: ");
     Serial.println(packetsReceived);
     Serial.print("Auto mode: ");
@@ -1336,11 +1446,12 @@ void cmdRadio(const char *args)
     Serial.println(headerReceived ? "YES" : "NO");
     Serial.print("Image complete: ");
     Serial.println(imageComplete ? "YES" : "NO");
+
     if (headerReceived)
     {
-      Serial.print("Expected packets: ");
+      Serial.print("Expected thermal packets: ");
       Serial.println(expectedPackets);
-      Serial.print("Received packets: ");
+      Serial.print("Received thermal packets: ");
       Serial.println(receivedPackets);
     }
   }
@@ -1444,6 +1555,93 @@ void setup()
 
   printPrompt();
 }
+
+/**
+ * Collects indices of missing packets
+ *
+ * @param missingIndices Array to store missing packet indices
+ * @param maxCount Maximum number of indices to collect
+ * @return Number of missing packets found
+ */
+uint16_t collectMissingPackets(uint16_t *missingIndices, uint16_t maxCount)
+{
+  uint16_t count = 0;
+  for (uint16_t i = 0; i < expectedPackets && count < maxCount; i++)
+  {
+    if (!packetReceived[i])
+    {
+      missingIndices[count++] = i;
+    }
+  }
+  return count;
+}
+
+/**
+ * Requests retransmission of missing packets from satellite
+ *
+ * Sends retry request packets containing indices of missing packets,
+ * then waits for satellite to resend them. Can perform multiple retry
+ * rounds up to MAX_RETRY_ATTEMPTS.
+ */
+// void requestMissingPackets()
+// {
+//   downloadingThermalData = true;
+
+//   uint16_t missingIndices[MAX_RETRY_PACKETS_PER_REQUEST];
+
+//   for (uint8_t attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++)
+//   {
+//     uint16_t missingCount = collectMissingPackets(missingIndices, MAX_RETRY_PACKETS_PER_REQUEST);
+
+//     if (missingCount == 0)
+//     {
+//       Serial.println("\n✅ All packets received!");
+//       autoMode = false;
+//       return;
+//     }
+
+//     Serial.print("\n🔄 Retry attempt ");
+//     Serial.print(attempt + 1);
+//     Serial.print("/");
+//     Serial.print(MAX_RETRY_ATTEMPTS);
+//     Serial.print(" - Requesting ");
+//     Serial.print(missingCount);
+//     Serial.println(" missing packets...");
+
+//     // Build retry request packet: [TYPE, count_low, count_high, index1_low, index1_high, ...]
+//     memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
+//     radioTxBuffer[0] = RETRY_REQUEST_TYPE;
+//     radioTxBuffer[1] = missingCount & 0xFF;
+//     radioTxBuffer[2] = (missingCount >> 8) & 0xFF;
+
+//     uint8_t bufferPos = 3;
+//     for (uint16_t i = 0; i < missingCount && bufferPos + 1 < RADIO_PACKET_MAX_SIZE; i++)
+//     {
+//       radioTxBuffer[bufferPos++] = missingIndices[i] & 0xFF;
+//       radioTxBuffer[bufferPos++] = (missingIndices[i] >> 8) & 0xFF;
+//     }
+
+//     // Send retry request
+//     digitalWrite(LED_PIN, HIGH);
+//     if (!rf23.send(radioTxBuffer, bufferPos))
+//     {
+//       Serial.println("❌ Failed to send retry request");
+//       digitalWrite(LED_PIN, LOW);
+//       continue;
+//     }
+
+//     if (!rf23.waitPacketSent(500))
+//     {
+//       Serial.println("❌ Timeout sending retry request");
+//       digitalWrite(LED_PIN, LOW);
+//       continue;
+//     }
+//     digitalWrite(LED_PIN, LOW);
+
+//     Serial.println("✓ Retry request sent, waiting for packets...");
+//     return;
+//   }
+// }
 
 void loop()
 {
