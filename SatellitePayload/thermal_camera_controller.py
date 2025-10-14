@@ -47,7 +47,7 @@ TRIGGER_COMMAND = b'TRIGGER\n'  # UART command from Teensy to initiate capture
 
 # Camera Configuration
 MAX_FRAMES = 10           # Number of frames to capture and average
-THERMAL_QUEUE_SIZE = 2     # Size of frame queue for thermal data
+THERMAL_QUEUE_SIZE = 20     # Size of frame queue for thermal data (2x the avg capture frame needs)
 thermal_queue = Queue(THERMAL_QUEUE_SIZE)  # Queue for thermal frame data
 
 FRAME_CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.POINTER(uvc_frame), ctypes.c_void_p)
@@ -92,10 +92,12 @@ class ThermalCamera:
                     thermal_queue.get_nowait()
                 except Empty:
                     pass
+
                 try:
                     thermal_queue.put_nowait(thermal)
                 except Full:
                     pass
+                
         except Exception:
             # Never propagate exceptions across the C callback boundary.
             return
@@ -171,7 +173,12 @@ class ThermalCamera:
         except Exception:
             pass
 
-def capture_and_average(timeout_s=8.0):
+def is_valid_frame(frame):
+    """Skip FFC frames"""
+    zero_count = np.sum(frame < 1000)
+    return zero_count < (frame.size * 0.8)
+
+def capture_and_average(timeout_s=2.0):
     """
     Capture and average multiple thermal frames for noise reduction
     
@@ -184,6 +191,7 @@ def capture_and_average(timeout_s=8.0):
     """
     frames = []
 
+    # Empty the queue first.
     while True:
         try:
             thermal_queue.get_nowait()
@@ -199,8 +207,9 @@ def capture_and_average(timeout_s=8.0):
             break
         try:
             frame = thermal_queue.get(timeout=min(0.5, max(0.05, remaining)))
-            frames.append(frame)
-            print(f"Captured {len(frames)}/{MAX_FRAMES} frames")
+            if is_valid_frame(frame): #TODO check if this works
+                frames.append(frame)
+            #print(f"Captured {len(frames)}/{MAX_FRAMES} frames")
         except Empty:
             continue
 
@@ -215,15 +224,15 @@ def capture_and_average(timeout_s=8.0):
     stacked = np.stack(frames, axis=0).astype(np.float64)
     averaged = np.mean(stacked, axis=0).astype(np.uint16)
     
-    # Calculate and display temperature statistics
-    min_val = np.min(averaged)
-    max_val = np.max(averaged)
-    mean_val = np.mean(averaged)
+    # # Calculate and display temperature statistics
+    # min_val = np.min(averaged)
+    # max_val = np.max(averaged)
+    # mean_val = np.mean(averaged)
     
-    print(f"Temperature stats:")
-    print(f"  Min: {(min_val - 27315) / 100.0:.1f}°C")  # Convert from Kelvin*100
-    print(f"  Max: {(max_val - 27315) / 100.0:.1f}°C")
-    print(f"  Mean: {(mean_val - 27315) / 100.0:.1f}°C")
+    # print(f"Temperature stats:")
+    # print(f"  Min: {(min_val - 27315) / 100.0:.1f}°C")  # Convert from Kelvin*100
+    # print(f"  Max: {(max_val - 27315) / 100.0:.1f}°C")
+    # print(f"  Mean: {(mean_val - 27315) / 100.0:.1f}°C")
     
     return averaged.tobytes()  # Return as raw bytes for UART transmission
 
@@ -258,8 +267,8 @@ def send_data_uart(data, uart_port):
         print("UART: nothing to send (len=0).")
         return False
     
-    print(f"\nSending {len(data)} bytes via UART...")
-    print(f"UART port: {UART_PORT} at {UART_BAUD} baud")
+    # print(f"\nSending {len(data)} bytes via UART...")
+    # print(f"UART port: {UART_PORT} at {UART_BAUD} baud")
     
     try:
         # Create header with magic bytes and length
@@ -270,14 +279,14 @@ def send_data_uart(data, uart_port):
         length = len(data)
         header.extend([length & 0xFF, (length >> 8) & 0xFF])
         
-        print("Sending header...")
+        # print("Sending header...")
         uart_port.write(header)
         uart_port.flush()  # Ensure header is transmitted immediately
         
         # Small delay for header processing on receiver
         time.sleep(0.1)
         
-        print("Sending thermal data...")
+        # print("Sending thermal data...")
         start_time = time.time()
         
         # Send data in chunks for better throughput and progress tracking
@@ -291,15 +300,15 @@ def send_data_uart(data, uart_port):
             uart_port.write(chunk)
             total_sent += len(chunk)
             
-            # Progress update every 4KB
-            if total_sent % 4096 == 0 or total_sent == length:
-                elapsed = time.time() - start_time
-                rate = total_sent / elapsed if elapsed > 0 else 0
-                eta = (length - total_sent) / rate if rate > 0 else 0
+            # # Progress update every 4KB
+            # if total_sent % 4096 == 0 or total_sent == length:
+            #     elapsed = time.time() - start_time
+            #     rate = total_sent / elapsed if elapsed > 0 else 0
+            #     eta = (length - total_sent) / rate if rate > 0 else 0
                 
-                print(f"Progress: {total_sent}/{length} bytes "
-                      f"({total_sent/length*100:.1f}%) - "
-                      f"{rate:.0f} bytes/sec - ETA: {eta:.1f}s")
+            #     print(f"Progress: {total_sent}/{length} bytes "
+            #           f"({total_sent/length*100:.1f}%) - "
+            #           f"{rate:.0f} bytes/sec - ETA: {eta:.1f}s")
         
         # Send end markers to signal completion
         end_markers = bytearray([0xFF, 0xFF])
@@ -397,7 +406,7 @@ def main():
                 print("="*40)
                 send_status_uart("CAPTURE_START", uart)
 
-                thermal_data = capture_and_average(timeout_s=8.0)
+                thermal_data = capture_and_average()
 
                 if thermal_data is None:
                     print("No thermal data available; notifying Teensy.")
