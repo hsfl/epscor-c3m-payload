@@ -14,7 +14,7 @@
  * - Supports both capture and transmission operations
  *
  * Hardware Requirements:
- * - Teensy microcontroller
+ * - Teensy 4.1 microcontroller
  * - RF23BP radio module (433MHz)
  * - Raspberry Pi with thermal camera
  * - UART connection between Teensy and RPI
@@ -25,8 +25,8 @@
  * - Radio: Transmits packetized data with header/data/end packets
  *
  * @author EPSCOR C3M Team
- * @date 8/25/2025
- * @version 1.1
+ * @date 2025-10-14
+ * @version 1.0.0
  */
 
 // Simplified Transmitter with UART (Essential Functions Only)

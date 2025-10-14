@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Version Information
+
+**Version:** 1.0.0
+**Release Date:** October 14, 2025
+**Status:** Production Release
+
+This is the first production release of the EPSCOR C3M CubeSat payload system, ready for deployment to master branch.
+
 ## Project Overview
 
 This is the EPSCOR C3M CubeSat payload system for thermal imaging and data transmission. The system consists of:
@@ -154,7 +162,7 @@ Both satellite and ground station compute CRC16 over entire thermal image:
 ### Packet Tracking
 Ground station uses:
 - `bool packetReceived[1200]` array to track which packets arrived
-- Detects duplicates (radio retry logic may send same packet twice)
+- Detects duplicates (TODO radio retry logic may send same packet twice)
 - Reports missing packet ranges at end of reception
 - Counts CRC errors per packet: `crcErrorCount`
 
@@ -164,7 +172,7 @@ Satellite can forward its console output to ground station:
 - `SERIAL_CONTINUATION_FLAG` (0x80) indicates multi-chunk messages
 - Ground station displays with "SAT>" prefix
 
-### Timeouts & Retry Logic
+### Timeouts & Retry Logic (TODO)
 - Satellite retries failed packet sends up to `MAX_SEND_PACKET_RETRIES = 3`
 - Ground station has configurable reception timeout
 - Auto-mode continuously listens for new thermal data
@@ -204,14 +212,54 @@ Power Distribution Unit communication uses binary packet protocol:
 - Check USB camera connection and drivers
 - Validate thermal_queue is receiving frames
 
+## Version History
+
+### Version 1.0.0 (October 14, 2025)
+**Production Release - Master Branch**
+
+This release represents the stable, flight-ready version of the EPSCOR C3M CubeSat payload system.
+
+**Core Components:**
+- `ground_station_teensy.ino` v1.0.0 - Ground station firmware
+- `ground_station_serial_cli_teensy.py` v1.0.0 - Ground station Python CLI
+- `thermal_data_viewer.py` v1.0.0 - Thermal data visualization tool
+- `satellite_teensy.ino` v1.0.0 - Satellite firmware
+- `thermal_camera_controller.py` v1.0.0 - Raspberry Pi thermal capture script
+
+**Key Features:**
+- Stable UART communication between Raspberry Pi and Teensy (115200 baud)
+- Reliable radio transmission using RFM23BP (433MHz, GFSK modulation)
+- Robust packet transmission with CRC16 validation
+- Automatic CSV export and thermal visualization
+- Comprehensive telemetry and sensor monitoring
+- Debug and Flight modes for development and production
+
+**Radio Configuration:**
+- Frequency: 433 MHz
+- Modem: GFSK_Rb38_4Fd19_6 (38.4 kbps, 19.6 kHz deviation)
+- TX Power: 30dBm (1000mW) - RFM23BP maximum
+- Packet size: 49 bytes maximum (45 bytes data + 4 bytes overhead)
+
+**System Architecture:**
+- Thermal image size: 120x160 pixels (38,400 bytes)
+- Frame averaging: 10 frames for noise reduction
+- (TODO) Packet retry logic: Up to 3 retries per packet
+- CRC validation: Both per-packet and full-image CRC16
+- Status forwarding: Satellite console output relayed to ground station
+
+**Known Stable Configuration:**
+- UART: 115200 baud, reliable framing with magic headers
+- Radio: GFSK_Rb38_4Fd19_6 preset, 30dBm power
+- Camera: USB thermal camera (FLIR/Seek Thermal compatible)
+- Sensors: 7× TMP36 temperature sensors, 5× INA219 current sensors
+
 ## Git Workflow
 
-Current branch: `refactor_satellite`
-Main branch: `master`
+Current branch: `master` (as of v1.0.0 release)
+Development branch: `refactor_satellite` (merged to master)
 
-Recent work focuses on:
-- Radio GFSK configuration and power tuning (30dBm)
-- Downlink progress visualization and timing
-- Debug flag to skip telemetry during payload transmission
-- Fixing data packet mask issues (thermal vs serial packet detection)
+For development work:
+- Create feature branches from `master`
+- Test thoroughly before merging to `master`
+- Update version numbers for significant releases
 

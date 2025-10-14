@@ -11,7 +11,7 @@
  * - Version management
  *
  * Version: 1.0.0
- * Build Date: 2025-09-10
+ * Build Date: 2025-10-14
  * Author: Artemis CubeSat Team
  */
 
@@ -32,7 +32,7 @@
 #define VERSION_MAJOR 1
 #define VERSION_MINOR 0
 #define VERSION_PATCH 0
-#define VERSION_BUILD "2025-09-10"
+#define VERSION_BUILD "2025-10-14"
 #define VERSION_STRING "1.0.0"
 #define BUILD_INFO "Arduino Teensy 4.1 Ground Station Command Interpreter"
 

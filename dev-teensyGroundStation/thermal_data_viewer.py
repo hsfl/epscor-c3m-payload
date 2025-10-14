@@ -1,9 +1,18 @@
 """
 Thermal Data Viewer
+EPSCOR C3M Payload - Ground Station Component
+
 Displays thermal image data from CSV files captured by the ground station
 Usage: python thermal_data_viewer.py [filename]
 If no filename is provided, defaults to thermal_data_001.csv
+
+@author EPSCOR C3M Team
+@date 2025-10-14
+@version 1.0.0
 """
+
+__version__ = "1.0.0"
+__build_date__ = "2025-10-14"
 
 import numpy as np
 import matplotlib.pyplot as plt

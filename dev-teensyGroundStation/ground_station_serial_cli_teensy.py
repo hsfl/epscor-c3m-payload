@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-Simple Serial Port Reader/Writer
+Ground Station Serial CLI for Teensy
+EPSCOR C3M Payload - Ground Station Component
+
 Reads data from serial port and allows user to send commands back
 Enhanced with CSV export detection and thermal data visualization
+
+@author EPSCOR C3M Team
+@date 2025-10-14
+@version 1.0.0
 """
+
+__version__ = "1.0.0"
+__build_date__ = "2025-10-14"
 
 import serial
 import threading
