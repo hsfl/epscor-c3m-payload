@@ -52,6 +52,9 @@
 // #define DEBUG    // Verbose logging for development
  #define FLIGHT // Flight mode - minimal logging
 
+// Packed struct attribute for ensuring no padding bytes
+#define PACKED __attribute__((packed))
+
 // Pin definitions for hardware control
 const uint8_t RPI_ENABLE = 36; // Power control pin for Raspberry Pi
 const uint8_t LED_PIN = 13;
@@ -111,6 +114,71 @@ const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional 
 
 // Packet retry protocol
 const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing packets
+
+// === Packet Structure Definitions ===
+
+/**
+ * Header packet structure for thermal image transmission
+ * Sent first to inform ground station of total image size and packet count
+ * Total size: 10 bytes
+ */
+struct PACKED ThermalHeaderPacket
+{
+  uint8_t marker1;       // 0xFF
+  uint8_t marker2;       // 0xFF
+  uint16_t imageLength;  // Total image size in bytes
+  uint16_t totalPackets; // Number of data packets to follow
+  uint16_t magic[2];     // {0xDEAD, 0xBEEF}
+};
+
+/**
+ * Data packet structure for thermal image transmission
+ * Contains a chunk of image data with CRC for validation
+ * Size: 4 + PACKET_DATA_SIZE bytes (49 bytes max)
+ */
+struct PACKED ThermalDataPacket
+{
+  uint16_t packetIndex; // Packet sequence number
+  uint8_t data[PACKET_DATA_SIZE]; // Image data chunk (45 bytes max)
+  uint16_t crc16; // CRC16 of the data field only
+};
+
+/**
+ * End packet structure for thermal image transmission
+ * Signals completion and provides overall image CRC
+ * Total size: 6 bytes
+ */
+struct PACKED ThermalEndPacket
+{
+  uint8_t marker1;       // 0xEE
+  uint8_t marker2;       // 0xEE
+  uint16_t packetCount;  // Total packets sent
+  uint16_t imageCrc;     // CRC16 of entire image
+};
+
+/**
+ * Serial message packet structure for console output forwarding
+ * Allows satellite to send debug/status messages to ground station
+ * Size: 2 + message length
+ */
+struct PACKED SerialMessagePacket
+{
+  uint8_t messageType; // SERIAL_MSG_TYPE (0xAA)
+  uint8_t length;      // Length with optional continuation flag (bit 7)
+  uint8_t data[MAX_SERIAL_MSG_LEN]; // Message text
+};
+
+/**
+ * Retry request packet structure (received from ground station)
+ * Contains list of missing packet indices that need retransmission
+ * Size: 3 + (2 * number of indices)
+ */
+struct PACKED RetryRequestPacket
+{
+  uint8_t requestType;  // RETRY_REQUEST_TYPE (0xBB)
+  uint16_t packetCount; // Number of packets being requested
+  uint16_t indices[24]; // List of packet indices (max ~24 indices in 49 byte packet)
+};
 
 // Shared radio buffers to avoid stack allocations inside hot paths
 uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
@@ -211,13 +279,6 @@ void sendSerialBuffer()
   if (!radioReady || serialBuffer.length() == 0)
     return;
 
-  // Create packet: [MSG_TYPE][LENGTH][MESSAGE_DATA]
-  radioSerialTxBuffer[0] = SERIAL_MSG_TYPE;
-
-  // Create packet: [MSG_TYPE_LOW][MSG_TYPE_HIGH][LENGTH][MESSAGE_DATA]
-  // radioSerialTxBuffer[0] = SERIAL_MSG_TYPE & 0xFF;         // Low byte
-  // radioSerialTxBuffer[1] = (SERIAL_MSG_TYPE >> 8) & 0xFF;  // High byte
-
   // Split long messages into chunks
   while (serialBuffer.length() > 0)
   {
@@ -234,17 +295,20 @@ void sendSerialBuffer()
       break;
     }
 
+    // Build serial message packet
+    SerialMessagePacket* serialPacket = (SerialMessagePacket*)radioSerialTxBuffer;
+    serialPacket->messageType = SERIAL_MSG_TYPE;
+
     bool hasMore = remaining > chunkSize;
-    radioSerialTxBuffer[1] = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
-    // radioSerialTxBuffer[2] = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
+    serialPacket->length = chunkSize | (hasMore ? SERIAL_CONTINUATION_FLAG : 0);
 
     // Copy message data
     const char *src = serialBuffer.c_str();
-    memcpy(&radioSerialTxBuffer[2], src, chunkSize);
-    // memcpy(&radioSerialTxBuffer[3], src, chunkSize);
+    memcpy(serialPacket->data, src, chunkSize);
 
-    // Send packet
-    if (sendPacketReliable(radioSerialTxBuffer, chunkSize + 2))
+    // Send packet (header + actual data length)
+    uint8_t packetSize = sizeof(serialPacket->messageType) + sizeof(serialPacket->length) + chunkSize;
+    if (sendPacketReliable(radioSerialTxBuffer, packetSize))
     {
       // Remove sent chunk from buffer
       serialBuffer.remove(0, chunkSize);
@@ -1280,16 +1344,14 @@ void sendSpecificPacket(uint16_t packetIndex)
   uint16_t remaining = capturedImageLength - byteOffset;
   uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
 
-  // Build packet: [index_low, index_high, data..., crc_low, crc_high]
-  radioTxBuffer[0] = packetIndex & 0xFF;
-  radioTxBuffer[1] = (packetIndex >> 8) & 0xFF;
-  memcpy(&radioTxBuffer[2], &imgBuf[byteOffset], chunkSize);
+  // Build data packet
+  ThermalDataPacket* dataPacket = (ThermalDataPacket*)radioTxBuffer;
+  dataPacket->packetIndex = packetIndex;
+  memcpy(dataPacket->data, &imgBuf[byteOffset], chunkSize);
+  dataPacket->crc16 = crc16_ccitt(dataPacket->data, chunkSize);
 
-  uint16_t packetCrc = crc16_ccitt(&radioTxBuffer[2], chunkSize);
-  radioTxBuffer[2 + chunkSize] = packetCrc & 0xFF;
-  radioTxBuffer[3 + chunkSize] = (packetCrc >> 8) & 0xFF;
-
-  uint8_t frameLen = chunkSize + THERMAL_PACKET_OVERHEAD;
+  // Calculate actual packet size (may be smaller for last packet)
+  uint8_t frameLen = sizeof(dataPacket->packetIndex) + chunkSize + sizeof(dataPacket->crc16);
 
   if (sendPacketReliable(radioTxBuffer, frameLen))
   {
@@ -1322,27 +1384,28 @@ void handleRetryRequest(uint8_t *buf, uint8_t len)
     return;
   }
 
-  uint16_t requestCount = buf[1] | (buf[2] << 8);
+  // Parse retry request
+  RetryRequestPacket* retryRequest = (RetryRequestPacket*)buf;
 
-  if (requestCount == 0)
+  if (retryRequest->packetCount == 0)
   {
     radioPrintln("Retry request with 0 packets?");
     return;
   }
 
   radioPrint("🔄 Retry request received for ");
-  radioPrint(String(requestCount));
+  radioPrint(String(retryRequest->packetCount));
   radioPrintln(" packets");
 
-  // Parse requested packet indices (2 bytes each, starting at offset 3)
-  uint8_t bufferPos = 3;
+  // Calculate how many indices fit in the received packet
+  uint16_t maxIndices = (len - 3) / 2; // 3 bytes header, 2 bytes per index
+  uint16_t requestedCount = retryRequest->packetCount; // Copy from packed field
+  uint16_t indicesToProcess = min(requestedCount, maxIndices);
   uint16_t resentCount = 0;
 
-  for (uint16_t i = 0; i < requestCount && bufferPos + 1 < len; i++)
+  for (uint16_t i = 0; i < indicesToProcess; i++)
   {
-    uint16_t packetIndex = buf[bufferPos] | (buf[bufferPos + 1] << 8);
-    bufferPos += 2;
-
+    uint16_t packetIndex = retryRequest->indices[i];
     sendSpecificPacket(packetIndex);
     resentCount++;
     delay(5); // Small delay between packets to avoid overwhelming receiver
@@ -1351,7 +1414,7 @@ void handleRetryRequest(uint8_t *buf, uint8_t len)
   radioPrint("Resent ");
   radioPrint(String(resentCount));
   radioPrint("/");
-  radioPrint(String(requestCount));
+  radioPrint(String(retryRequest->packetCount));
   radioPrintln(" requested packets");
 }
 
@@ -1434,19 +1497,16 @@ void sendThermalDataViaRadio()
   Serial.println(String(imageCrc, HEX));
 #endif
 
-  memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
-  radioTxBuffer[0] = 0xFF;
-  radioTxBuffer[1] = 0xFF;
-  radioTxBuffer[2] = capturedImageLength & 0xFF;
-  radioTxBuffer[3] = (capturedImageLength >> 8) & 0xFF;
-  radioTxBuffer[4] = totalPackets & 0xFF;
-  radioTxBuffer[5] = (totalPackets >> 8) & 0xFF;
-  radioTxBuffer[6] = 0xDE;
-  radioTxBuffer[7] = 0xAD;
-  radioTxBuffer[8] = 0xBE;
-  radioTxBuffer[9] = 0xEF;
+  // Build and send header packet
+  ThermalHeaderPacket headerPacket;
+  headerPacket.marker1 = 0xFF;
+  headerPacket.marker2 = 0xFF;
+  headerPacket.imageLength = capturedImageLength;
+  headerPacket.totalPackets = totalPackets;
+  headerPacket.magic[0] = 0xDEAD;
+  headerPacket.magic[1] = 0xBEEF;
 
-  if (!sendPacketReliable(radioTxBuffer, 10))
+  if (!sendPacketReliable((uint8_t*)&headerPacket, sizeof(headerPacket)))
   {
     radioPrintln("❌ Failed to send header!");
     return;
@@ -1465,15 +1525,15 @@ void sendThermalDataViaRadio()
     uint16_t remaining = capturedImageLength - bytesSent;
     uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
 
-    radioTxBuffer[0] = packetNum & 0xFF;
-    radioTxBuffer[1] = (packetNum >> 8) & 0xFF;
-    memcpy(&radioTxBuffer[2], &imgBuf[bytesSent], chunkSize);
+    // Build data packet
+    ThermalDataPacket* dataPacket = (ThermalDataPacket*)radioTxBuffer;
+    dataPacket->packetIndex = packetNum;
+    memcpy(dataPacket->data, &imgBuf[bytesSent], chunkSize);
+    dataPacket->crc16 = crc16_ccitt(dataPacket->data, chunkSize);
 
-    uint16_t packetCrc = crc16_ccitt(&radioTxBuffer[2], chunkSize);
-    radioTxBuffer[2 + chunkSize] = packetCrc & 0xFF;
-    radioTxBuffer[3 + chunkSize] = (packetCrc >> 8) & 0xFF;
+    // Calculate actual packet size (may be smaller for last packet)
+    uint8_t frameLen = sizeof(dataPacket->packetIndex) + chunkSize + sizeof(dataPacket->crc16);
 
-    uint8_t frameLen = chunkSize + THERMAL_PACKET_OVERHEAD;
     if (sendPacketReliable(radioTxBuffer, frameLen))
     {
       successCount++;
@@ -1497,15 +1557,14 @@ void sendThermalDataViaRadio()
 #endif
   }
 
-  memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
-  radioTxBuffer[0] = 0xEE;
-  radioTxBuffer[1] = 0xEE;
-  radioTxBuffer[2] = packetNum & 0xFF;
-  radioTxBuffer[3] = (packetNum >> 8) & 0xFF;
-  radioTxBuffer[4] = imageCrc & 0xFF;
-  radioTxBuffer[5] = (imageCrc >> 8) & 0xFF;
+  // Build and send end packet
+  ThermalEndPacket endPacket;
+  endPacket.marker1 = 0xEE;
+  endPacket.marker2 = 0xEE;
+  endPacket.packetCount = packetNum;
+  endPacket.imageCrc = imageCrc;
 
-  if (!sendPacketReliable(radioTxBuffer, 6))
+  if (!sendPacketReliable((uint8_t*)&endPacket, sizeof(endPacket)))
   {
     radioPrintln("❌ Failed to send end data packet!");
     return;

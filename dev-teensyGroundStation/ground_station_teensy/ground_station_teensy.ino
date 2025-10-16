@@ -36,6 +36,9 @@
 #define VERSION_STRING "1.0.0"
 #define BUILD_INFO "Arduino Teensy 4.1 Ground Station Command Interpreter"
 
+// Packed struct attribute for ensuring no padding bytes
+#define PACKED __attribute__((packed))
+
 // Command structure definition
 struct Command
 {
@@ -96,6 +99,71 @@ const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional 
 const uint8_t RETRY_REQUEST_TYPE = 0xBB;          // Message type for requesting missing packets
 const uint8_t MAX_RETRY_PACKETS_PER_REQUEST = 20; // Max number of missing packets to request at once
 const uint8_t MAX_RETRY_ATTEMPTS = 3;             // Maximum number of retry rounds
+
+// === Packet Structure Definitions (Must match satellite!) ===
+
+/**
+ * Header packet structure for thermal image transmission
+ * Sent first to inform ground station of total image size and packet count
+ * Total size: 10 bytes
+ */
+struct PACKED ThermalHeaderPacket
+{
+  uint8_t marker1;       // 0xFF
+  uint8_t marker2;       // 0xFF
+  uint16_t imageLength;  // Total image size in bytes
+  uint16_t totalPackets; // Number of data packets to follow
+  uint16_t magic[2];     // {0xDEAD, 0xBEEF}
+};
+
+/**
+ * Data packet structure for thermal image transmission
+ * Contains a chunk of image data with CRC for validation
+ * Size: 4 + PACKET_DATA_SIZE bytes (49 bytes max)
+ */
+struct PACKED ThermalDataPacket
+{
+  uint16_t packetIndex; // Packet sequence number
+  uint8_t data[PACKET_DATA_SIZE]; // Image data chunk (45 bytes max)
+  uint16_t crc16; // CRC16 of the data field only
+};
+
+/**
+ * End packet structure for thermal image transmission
+ * Signals completion and provides overall image CRC
+ * Total size: 6 bytes
+ */
+struct PACKED ThermalEndPacket
+{
+  uint8_t marker1;       // 0xEE
+  uint8_t marker2;       // 0xEE
+  uint16_t packetCount;  // Total packets sent
+  uint16_t imageCrc;     // CRC16 of entire image
+};
+
+/**
+ * Serial message packet structure for console output forwarding
+ * Allows satellite to send debug/status messages to ground station
+ * Size: 2 + message length
+ */
+struct PACKED SerialMessagePacket
+{
+  uint8_t messageType; // SERIAL_MSG_TYPE (0xAA)
+  uint8_t length;      // Length with optional continuation flag (bit 7)
+  uint8_t data[RADIO_PACKET_MAX_SIZE - 2]; // Message text (variable size)
+};
+
+/**
+ * Retry request packet structure (sent to satellite)
+ * Contains list of missing packet indices that need retransmission
+ * Size: 3 + (2 * number of indices)
+ */
+struct PACKED RetryRequestPacket
+{
+  uint8_t requestType;  // RETRY_REQUEST_TYPE (0xBB)
+  uint16_t packetCount; // Number of packets being requested
+  uint16_t indices[24]; // List of packet indices (max ~24 indices in 49 byte packet)
+};
 
 // Global variables
 String inputBuffer = "";
@@ -446,10 +514,11 @@ void processPacket(uint8_t *buf, uint8_t len)
 
 void handleThermalHeaderPacket(uint8_t *buf)
 {
-  // Serial.println("Inside satellite header packet");
-  //  Extract image size and packet count (little-endian format)
-  expectedLength = buf[2] | (buf[3] << 8);
-  expectedPackets = buf[4] | (buf[5] << 8);
+  // Parse header packet
+  ThermalHeaderPacket* headerPacket = (ThermalHeaderPacket*)buf;
+
+  expectedLength = headerPacket->imageLength;
+  expectedPackets = headerPacket->totalPackets;
 
   Serial.println("\n📦 THERMAL IMAGE HEADER RECEIVED!");
   Serial.print("Expected size: ");
@@ -465,8 +534,8 @@ void handleThermalHeaderPacket(uint8_t *buf)
     return;
   }
 
-  // Validate magic bytes (0xDE 0xAD 0xBE 0xEF)
-  if (buf[6] == 0xDE && buf[7] == 0xAD && buf[8] == 0xBE && buf[9] == 0xEF)
+  // Validate magic bytes (0xDEAD 0xBEEF)
+  if (headerPacket->magic[0] == 0xDEAD && headerPacket->magic[1] == 0xBEEF)
   {
     Serial.println("✓ Header valid - receiving thermal data...");
     headerReceived = true;
@@ -490,8 +559,12 @@ void handleThermalHeaderPacket(uint8_t *buf)
 
 void handleThermalEndPacket(uint8_t *buf)
 {
-  uint16_t finalCount = buf[2] | (buf[3] << 8); // Extract final packet count
-  expectedImageCrc = buf[4] | (buf[5] << 8);
+  // Parse end packet
+  ThermalEndPacket* endPacket = (ThermalEndPacket*)buf;
+
+  uint16_t finalCount = endPacket->packetCount;
+  expectedImageCrc = endPacket->imageCrc;
+
   Serial.println("\n🏁 END PACKET RECEIVED!");
   Serial.print("Transmitter sent ");
   Serial.print(finalCount);
@@ -551,11 +624,13 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
     return; // Minimum packet size check
   }
 
-  // Extract packet number and data length
-  uint16_t packetNum = buf[0] | (buf[1] << 8);     // Little-endian packet number
-  uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD; // Data length excludes packet number and CRC
-  uint16_t packetCrc = buf[2 + dataLen] | (buf[3 + dataLen] << 8);
-  uint16_t computedCrc = crc16_ccitt(&buf[2], dataLen);
+  // Parse data packet
+  ThermalDataPacket* dataPacket = (ThermalDataPacket*)buf;
+
+  uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD; // Data length excludes packet index and CRC
+  uint16_t packetNum = dataPacket->packetIndex;
+  uint16_t packetCrc = dataPacket->crc16;
+  uint16_t computedCrc = crc16_ccitt(dataPacket->data, dataLen);
 
   if (computedCrc != packetCrc)
   {
@@ -590,8 +665,8 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
     // Buffer overflow protection
     if (bufferPos + dataLen <= bound)
     {
-      memcpy(&imgBuffer[bufferPos], &buf[2], dataLen); // Copy data to buffer
-      packetReceived[packetNum] = true;                // Mark packet as received
+      memcpy(&imgBuffer[bufferPos], dataPacket->data, dataLen); // Copy data to buffer
+      packetReceived[packetNum] = true;                         // Mark packet as received
       receivedPackets++;
 
       if (packetNum > maxPacketNum)
@@ -735,14 +810,11 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
   if (len < 2)
     return false; // Minimum packet size check
 
-  // if (len < 3)
-  //   return false; // Minimum packet size check (2-byte type + 1-byte header)
+  // Parse serial message
+  SerialMessagePacket* serialPacket = (SerialMessagePacket*)buf;
 
-  uint8_t header = buf[1];
-  // uint8_t header = buf[2];  // Header is now at index 2 after 2-byte message type
-
-  bool hasMore = (header & SERIAL_CONTINUATION_FLAG) != 0;
-  uint8_t msgLen = header & 0x7F; // Lower 7 bits carry the actual length
+  bool hasMore = (serialPacket->length & SERIAL_CONTINUATION_FLAG) != 0;
+  uint8_t msgLen = serialPacket->length & 0x7F; // Lower 7 bits carry the actual length
 
   if (msgLen == 0 || len < msgLen + 2)
     return false; // Invalid message length or packet too short
@@ -754,8 +826,7 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
   message.reserve(msgLen);
   for (uint8_t i = 0; i < msgLen; i++)
   {
-    message += (char)buf[2 + i];
-    // message += (char) buf[3 + i];  // Message data starts at index 3
+    message += (char)serialPacket->data[i];
   }
 
   if (messageOut != nullptr)
