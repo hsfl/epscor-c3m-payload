@@ -108,8 +108,6 @@ const uint8_t PACKET_DATA_SIZE = RADIO_PACKET_MAX_SIZE - THERMAL_PACKET_OVERHEAD
 // Serial message radio transmission parameters
 const uint8_t SERIAL_MSG_TYPE = 0xAA;                         // Message type identifier for serial output
 const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
-// const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
-// const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 3; // Maximum serial message length per packet payload
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
 
 // Packet retry protocol
@@ -135,6 +133,7 @@ struct PACKED ThermalHeaderPacket
  * Data packet structure for thermal image transmission
  * Contains a chunk of image data with CRC for validation
  * Size: 4 + PACKET_DATA_SIZE bytes (49 bytes max)
+ * NOTE: For variable-length packets, CRC must be accessed via buffer offset, not struct member
  */
 struct PACKED ThermalDataPacket
 {
@@ -1319,7 +1318,7 @@ void captureThermalImageUART()
  *
  * @param packetIndex The index of the packet to send (0-based)
  */
-void sendSpecificPacket(uint16_t packetIndex)
+void sendSpecificPacket(uint16_t packetIndex) // TODO: implement retry logic
 {
   if (capturedImageLength == 0)
   {
@@ -1348,10 +1347,16 @@ void sendSpecificPacket(uint16_t packetIndex)
   ThermalDataPacket* dataPacket = (ThermalDataPacket*)radioTxBuffer;
   dataPacket->packetIndex = packetIndex;
   memcpy(dataPacket->data, &imgBuf[byteOffset], chunkSize);
-  dataPacket->crc16 = crc16_ccitt(dataPacket->data, chunkSize);
+
+  // Calculate CRC and place it at correct position for variable-length packet
+  uint16_t packetCrc = crc16_ccitt(dataPacket->data, chunkSize);
+  // Write CRC16 at correct position (after actual data, not at struct's fixed offset)
+  // CRC offset = 2 bytes (packetIndex) + chunkSize bytes (data)
+  uint16_t crcOffset = 2 + chunkSize;
+  memcpy(&radioTxBuffer[crcOffset], &packetCrc, sizeof(uint16_t));
 
   // Calculate actual packet size (may be smaller for last packet)
-  uint8_t frameLen = sizeof(dataPacket->packetIndex) + chunkSize + sizeof(dataPacket->crc16);
+  uint8_t frameLen = 2 + chunkSize + 2;
 
   if (sendPacketReliable(radioTxBuffer, frameLen))
   {
@@ -1529,11 +1534,19 @@ void sendThermalDataViaRadio()
     ThermalDataPacket* dataPacket = (ThermalDataPacket*)radioTxBuffer;
     dataPacket->packetIndex = packetNum;
     memcpy(dataPacket->data, &imgBuf[bytesSent], chunkSize);
-    dataPacket->crc16 = crc16_ccitt(dataPacket->data, chunkSize);
+
+    // Calculate CRC and place it at correct position for variable-length packet
+    uint16_t packetCrc = crc16_ccitt(dataPacket->data, chunkSize);
+    // Write CRC16 at correct position (after actual data, not at struct's fixed offset)
+    // CRC offset = 2 bytes (packetIndex) + chunkSize bytes (data)
+    uint16_t crcOffset = 2 + chunkSize;
+    memcpy(&radioTxBuffer[crcOffset], &packetCrc, sizeof(uint16_t));
 
     // Calculate actual packet size (may be smaller for last packet)
-    uint8_t frameLen = sizeof(dataPacket->packetIndex) + chunkSize + sizeof(dataPacket->crc16);
+    // Packet structure: [2 bytes packetIndex][variable data][2 bytes CRC]
+    uint8_t frameLen = 2 + chunkSize + 2;
 
+    // send packet
     if (sendPacketReliable(radioTxBuffer, frameLen))
     {
       successCount++;

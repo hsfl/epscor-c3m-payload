@@ -77,7 +77,8 @@ uint16_t maxPacketNum = 0; // Highest packet number received
 unsigned long packetsReceived = 0;             // Total packets received (including duplicates)
 unsigned long lastPacketTime = 0;              // Timestamp of last packet reception
 int lastRSSI = 0;                              // Signal strength of last received packet
-unsigned long thermalDataDownloadDuration = 0; // Track how long it took to download thermal data
+unsigned long thermalDataDownloadDuration = 0; // Track total time from request to completion
+unsigned long thermalDataTransferDuration = 0; // Track pure data transfer time (first packet to last packet)
 
 // Auto mode flag for continuous reception
 bool autoMode = false;
@@ -550,6 +551,9 @@ void handleThermalHeaderPacket(uint8_t *buf)
     crcVerified = false;
     memset(packetReceived, false, sizeof(packetReceived)); // Reset packet tracking
     memset(imgBuffer, 0, expectedLength);
+
+    // Start timing the pure data transfer (from first packet arrival)
+    thermalDataTransferDuration = millis();
   }
   else
   {
@@ -624,12 +628,19 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
     return; // Minimum packet size check
   }
 
-  // Parse data packet
+  // Parse data packet using struct for packet index and data
   ThermalDataPacket* dataPacket = (ThermalDataPacket*)buf;
 
   uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD; // Data length excludes packet index and CRC
   uint16_t packetNum = dataPacket->packetIndex;
-  uint16_t packetCrc = dataPacket->crc16;
+
+  // Read CRC from correct position for variable-length packet
+  // CRC is at: buf[2 + dataLen], not at struct's fixed offset
+  // CRC offset = 2 bytes (packetIndex) + dataLen bytes (data)
+  uint16_t crcOffset = 2 + dataLen;
+  uint16_t packetCrc;
+  memcpy(&packetCrc, &buf[crcOffset], sizeof(uint16_t));
+
   uint16_t computedCrc = crc16_ccitt(dataPacket->data, dataLen);
 
   if (computedCrc != packetCrc)
@@ -942,14 +953,27 @@ void showReceptionSummary()
     Serial.println("\nThermal image ready! Type 'export' to export as CSV");
   }
 
+  // Calculate both timing metrics
+  thermalDataTransferDuration = millis() - thermalDataTransferDuration;
   thermalDataDownloadDuration = millis() - thermalDataDownloadDuration;
-  Serial.println("**** Thermal Data Download Duration ****");
+  unsigned long satelliteResponseTime = thermalDataDownloadDuration - thermalDataTransferDuration;
+
+  Serial.println("\n**** Thermal Data Download Statistics ****");
+  Serial.print("Total Duration (request → completion): ");
   helperTime(thermalDataDownloadDuration);
-  thermalDataDownloadDuration = 0;
+  Serial.print("Data Transfer Time (first → last packet): ");
+  helperTime(thermalDataTransferDuration);
+  Serial.print("Satellite Response Time (request → first packet): ");
+  helperTime(satelliteResponseTime);
+
   Serial.print("Payload Expected Size (bytes): ");
   Serial.println(expectedLength);
   Serial.print("Last RSSI: ");
   Serial.println(lastRSSI);
+
+  // Reset timing variables
+  thermalDataDownloadDuration = 0;
+  thermalDataTransferDuration = 0;
 }
 
 void exportThermalData()
@@ -1019,6 +1043,7 @@ void forwardToSatellite(char cmd)
   else if (cmd == 'r')
   {
     Serial.println("\n--- REQUESTING THERMAL DATA DOWNLINK ---");
+    thermalDataDownloadDuration = millis(); // Start measuring user latency from request
   }
   else
   {
