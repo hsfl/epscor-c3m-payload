@@ -105,6 +105,9 @@ bool commandComplete = false;
 bool serialConnected = false;
 bool interruptRequested = false;
 const int RASPBERRY_PI_GPIO_PIN = 36;
+const String THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---";
+const String THERMAL_CSV_START = "=== START CSV ===";
+const String THERMAL_CSV_END = "=== END CSV ===";
 
 // Forward declarations
 void parseCommand(const String &input);
@@ -156,6 +159,7 @@ void cmdExport(const char *args);
 void cmdCapture(const char *args);
 void cmdRequest(const char *args);
 void cmdRadioStatus(const char *args);
+void cmdSensor(const char *args);
 
 // Command table - easily extensible
 const Command commands[] = {
@@ -178,7 +182,8 @@ const Command commands[] = {
     {"export", "Export thermal data as CSV", cmdExport},
     {"capture", "Command satellite to capture thermal data", cmdCapture},
     {"request", "Request thermal data downlink from satellite", cmdRequest},
-    {"rstatus", "Show radio reception status", cmdRadioStatus}};
+    {"rstatus", "Show radio reception status", cmdRadioStatus},
+    {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor}};
 
 const int numCommands = sizeof(commands) / sizeof(commands[0]);
 
@@ -896,7 +901,7 @@ void exportThermalData()
 
   Serial.println("\n--- EXPORTING THERMAL DATA ---");
   Serial.println("Copying data below to a 'thermal_image.csv'");
-  Serial.println("=== START CSV ===");
+  Serial.println(THERMAL_CSV_START);
 
   // Export thermal data as CSV (120x160 pixel grid)
   for (int row = 0; row < 120; row++)
@@ -928,7 +933,7 @@ void exportThermalData()
     Serial.println(); // New line for each row
   }
 
-  Serial.println("=== END CSV ===");
+  Serial.println(THERMAL_CSV_END);
   // Serial.println("\nVisualize with Python:");
   // Serial.println(" import numpy as np");
   // Serial.println(" import matplotlib.pyplot as plt");
@@ -942,7 +947,7 @@ void forwardToSatellite(char cmd)
 {
   if (cmd == 'u')
   {
-    Serial.println("\n--- UART THERMAL CAPTURE ---");
+    Serial.println(THERMAL_CAPTURE_TIMESTAMP_FLAG);
     thermalDataDownloadDuration = millis();
   }
   else if (cmd == 'r')
@@ -1297,6 +1302,69 @@ void cmdRPIControl(const char *args)
 
   // fallback usage
   Serial.println("Usage: rpi [on|off|status]");
+}
+
+void cmdSensor(const char *args)
+{
+  String argStr = String(args);
+  argStr.trim();
+  argStr.toLowerCase();
+
+  if (argStr.length() == 0)
+  {
+    Serial.println("Usage: sensor <gps|imu|both|gps_init|imu_init>");
+    return;
+  }
+
+  char subcommand = 0;
+  const char *action = nullptr;
+
+  if (argStr == "gps" || argStr == "g")
+  {
+    subcommand = 'g';
+    action = "GPS data request";
+  }
+  else if (argStr == "imu" || argStr == "i")
+  {
+    subcommand = 'i';
+    action = "IMU data request";
+  }
+  else if (argStr == "both" || argStr == "b")
+  {
+    subcommand = 'b';
+    action = "combined GPS/IMU data request";
+  }
+  else if (argStr == "gps_init" || argStr == "init_gps" || argStr == "reinit_gps" || argStr == "ginit")
+  {
+    subcommand = 'G';
+    action = "GPS reinitialization";
+  }
+  else if (argStr == "imu_init" || argStr == "init_imu" || argStr == "reinit_imu" || argStr == "iinit")
+  {
+    subcommand = 'I';
+    action = "IMU reinitialization";
+  }
+  else
+  {
+    Serial.println("Usage: sensor <gps|imu|both|gps_init|imu_init>");
+    return;
+  }
+
+  radioTxBuffer[0] = 's';
+  radioTxBuffer[1] = (uint8_t)subcommand;
+
+  Serial.print("Forwarding sensor command: ");
+  Serial.println(action);
+
+  if (sendBytesToSatellite(radioTxBuffer, 2))
+  {
+    Serial.println("Sensor command forwarded");
+    rf23.setModeRx();
+  }
+  else
+  {
+    Serial.println("Failed to forward sensor command");
+  }
 }
 
 void cmdTestInterrupt(const char *args)

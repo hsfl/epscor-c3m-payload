@@ -22,13 +22,275 @@ import signal
 import os
 import subprocess
 import glob
+import re
 from serial.tools import list_ports
+from datetime import datetime
 
 BAUD_RATE = 115200
 
 # CSV export detection constants
-CSV_START_MARKER = "=== START CSV ==="
-CSV_END_MARKER = "=== END CSV ==="
+THERMAL_CSV_START = "=== START CSV ==="
+THERMAL_CSV_END = "=== END CSV ==="
+THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---"
+ThermalCaptureTimestamp = datetime.now()
+
+# Sensor telemetry cache
+sensor_cache = {"gps": {}, "imu": {}}
+_current_sensor_section = None
+
+
+def _reset_sensor_section(section: str):
+    """Prepare cache for a fresh sensor block."""
+    if section not in sensor_cache:
+        return
+    sensor_cache[section] = {
+        "last_update": datetime.now().isoformat(timespec="seconds") + "Z"
+    }
+
+
+def _ensure_section(section: str):
+    if section not in sensor_cache or not isinstance(sensor_cache[section], dict):
+        sensor_cache[section] = {}
+    sensor_cache[section].setdefault(
+        "last_update", datetime.now().isoformat(timespec="seconds") + "Z"
+    )
+    return sensor_cache[section]
+
+
+NUMBER_PATTERN = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def _safe_float(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_first_float(text):
+    match = NUMBER_PATTERN.search(text)
+    if match:
+        return _safe_float(match.group(0))
+    return None
+
+
+def _sanitize_key(label: str) -> str:
+    label = label.strip().lower()
+    label = label.replace("(", " ").replace(")", " ")
+    label = re.sub(r"[^a-z0-9]+", "_", label)
+    return label.strip("_")
+
+
+def _store_generic(section: str, label: str, value: str):
+    key = _sanitize_key(label)
+    if not key:
+        return
+    section_dict = _ensure_section(section)
+    section_dict[key] = value.strip()
+
+
+def _parse_triple(line):
+    match = re.search(
+        r"x\s*=\s*([-+0-9.eE]+).*,\s*y\s*=\s*([-+0-9.eE]+).*,\s*z\s*=\s*([-+0-9.eE]+)",
+        line,
+    )
+    if not match:
+        return None
+    try:
+        return tuple(float(match.group(i)) for i in range(1, 4))
+    except ValueError:
+        return None
+
+
+def update_sensor_cache(line: str):
+    """Track GPS/IMU telemetry blocks emitted by the satellite."""
+    global _current_sensor_section
+
+    if not line:
+        return
+
+    text = line.strip("\r\n")
+    if text.startswith("SAT> "):
+        text = text[5:]
+    if text.startswith("Teensy: "):
+        text = text[8:]
+
+    stripped = text.strip()
+    if not stripped:
+        return
+
+    upper = stripped.upper()
+
+    if "SENSOR DATA" in upper and ("---" in stripped or "===" in stripped):
+        _current_sensor_section = None
+        return
+
+    if "GPS DATA" in upper and ("---" in stripped or "===" in stripped):
+        _reset_sensor_section("gps")
+        _current_sensor_section = "gps"
+        return
+
+    if "IMU DATA" in upper and ("---" in stripped or "===" in stripped):
+        _reset_sensor_section("imu")
+        _current_sensor_section = "imu"
+        return
+
+    if stripped.startswith("===") and "DATA" not in upper:
+        _current_sensor_section = None
+        return
+
+    if _current_sensor_section is None:
+        return
+
+    handled = False
+    if _current_sensor_section == "gps":
+        handled = _parse_gps_line(stripped)
+    elif _current_sensor_section == "imu":
+        handled = _parse_imu_line(stripped)
+
+    if handled:
+        return
+
+    if ":" in stripped:
+        label, value = stripped.split(":", 1)
+        _store_generic(_current_sensor_section, label, value)
+
+
+def _parse_gps_line(line: str):
+    gps = _ensure_section("gps")
+
+    if line.startswith("GPS not connected"):
+        gps["status"] = "not_connected"
+        gps.pop("fix_status", None)
+        return True
+
+    if line.startswith("No GPS fix"):
+        gps["fix_status"] = "no_fix"
+        gps["status"] = "searching_fix"
+        return True
+
+    if line.startswith("Satellites visible:"):
+        value = _extract_first_float(line)
+        if value is not None:
+            gps["satellites_visible"] = int(value)
+        return True
+
+    if line.startswith("Time (UTC):"):
+        gps["time_utc"] = line.split(":", 1)[1].strip()
+        gps.setdefault("status", "ok")
+        return True
+
+    if line.startswith("Date:"):
+        gps["date"] = line.split(":", 1)[1].strip()
+        gps.setdefault("status", "ok")
+        return True
+
+    if line.startswith("Location:"):
+        gps["location_raw"] = line.split(":", 1)[1].strip()
+        gps.setdefault("status", "ok")
+        return True
+
+    if line.startswith("Decimal:"):
+        try:
+            _, payload = line.split(":", 1)
+            lat_str, lon_str = payload.split(",", 1)
+            lat = _safe_float(lat_str.strip())
+            lon = _safe_float(lon_str.strip())
+            if lat is not None:
+                gps["latitude_deg"] = lat
+            if lon is not None:
+                gps["longitude_deg"] = lon
+        except ValueError:
+            pass
+        gps.setdefault("status", "ok")
+        return True
+
+    if line.startswith("Altitude:"):
+        value = _extract_first_float(line)
+        if value is not None:
+            gps["altitude_m"] = value
+        gps.setdefault("status", "ok")
+        return True
+
+    if line.startswith("Speed:"):
+        value = _extract_first_float(line)
+        if value is not None:
+            gps["speed_knots"] = value
+        gps.setdefault("status", "ok")
+        return True
+
+    if line.startswith("Satellites:"):
+        value = _extract_first_float(line)
+        if value is not None:
+            gps["satellites_in_use"] = int(value)
+        gps.setdefault("status", "ok")
+        return True
+
+    if line.startswith("Fix quality:"):
+        value = _extract_first_float(line)
+        if value is not None:
+            gps["fix_quality"] = int(value)
+            if value > 0:
+                gps["fix_status"] = "fix"
+        gps.setdefault("status", "ok")
+        return True
+
+    return False
+
+
+def _parse_imu_line(line: str):
+    imu = _ensure_section("imu")
+
+    if line.startswith("IMU not connected"):
+        imu["status"] = "not_connected"
+        return True
+
+    triple = _parse_triple(line)
+    if triple:
+        if "ACCELERATION" in line.upper():
+            imu["accel_x_mps2"], imu["accel_y_mps2"], imu["accel_z_mps2"] = triple
+            imu.setdefault("status", "ok")
+            return True
+        if "GYRO" in line.upper():
+            imu["gyro_x_dps"], imu["gyro_y_dps"], imu["gyro_z_dps"] = triple
+            imu.setdefault("status", "ok")
+            return True
+        if "MAGNETIC" in line.upper():
+            imu["mag_x_uT"], imu["mag_y_uT"], imu["mag_z_uT"] = triple
+            imu.setdefault("status", "ok")
+            return True
+
+    if line.startswith("Temperature:"):
+        value = _extract_first_float(line)
+        if value is not None:
+            imu["temperature_c"] = value
+        imu.setdefault("status", "ok")
+        return True
+
+    return False
+
+
+def build_sensor_metadata_lines(capture_timestamp=None):
+    """Convert cached telemetry into CSV comment rows."""
+    lines = []
+    if capture_timestamp is not None:
+        lines.append(f"# CAPTURED_AT,{capture_timestamp.isoformat(timespec='seconds')}")
+
+    for section in ("gps", "imu"):
+        data = sensor_cache.get(section)
+        if not data:
+            continue
+        section_prefix = section.upper()
+        lines.append(f"# {section_prefix}_DATA_START")
+        for key in sorted(data.keys()):
+            value = data[key]
+            if isinstance(value, float):
+                value_str = f"{value:.6f}".rstrip("0").rstrip(".")
+            else:
+                value_str = str(value)
+            lines.append(f"# {section_prefix}_{key},{value_str}")
+        lines.append(f"# {section_prefix}_DATA_END")
+    return lines
 
 def find_serial_port():
     """Find available serial ports"""
@@ -101,6 +363,7 @@ def run_thermal_viewer(filename):
 
 def read_serial(ser, stop_event):
     """Read data from serial port in a separate thread"""
+    global ThermalCaptureTimestamp
     csv_capture_mode = False
     csv_data = []
     
@@ -111,22 +374,36 @@ def read_serial(ser, stop_event):
                 if data:
                     # Print the data as-is, preserving original newlines
                     print(f"{data}", end='', flush=True)
+
+                    # Update sensor telemetry cache with incoming line
+                    update_sensor_cache(data)
                     
+                    # Check for thermal data capture command time and save it for the csv.
+                    if THERMAL_CAPTURE_TIMESTAMP_FLAG in data:
+                        ThermalCaptureTimestamp = datetime.now()
+                        continue
+
                     # Check for CSV start marker
-                    if CSV_START_MARKER in data:
+                    if THERMAL_CSV_START in data:
                         print(f"\n🎯 CSV export detected! Starting data capture...")
                         csv_capture_mode = True
                         csv_data = []
+                        if THERMAL_CAPTURE_TIMESTAMP_FLAG not in data:
+                            ThermalCaptureTimestamp = datetime.now()
                         continue
                     
                     # Check for CSV end marker
-                    if CSV_END_MARKER in data:
+                    if THERMAL_CSV_END in data:
                         if csv_capture_mode:
                             print(f"\n🏁 CSV export complete! Processing data...")
                             csv_capture_mode = False
                             
                             # Save the captured data
-                            csv_content = '\n'.join(csv_data)
+                            metadata_lines = build_sensor_metadata_lines(ThermalCaptureTimestamp)
+                            if metadata_lines:
+                                csv_content = '\n'.join(metadata_lines + [''] + csv_data)
+                            else:
+                                csv_content = '\n'.join(csv_data)
                             filename = get_next_thermal_filename()
                             
                             if save_thermal_data(csv_content, filename):
@@ -139,7 +416,11 @@ def read_serial(ser, stop_event):
                     # If in CSV capture mode, collect the data
                     if csv_capture_mode:
                         # Remove the "Teensy: " prefix and store clean data
-                        clean_data = data.replace("Teensy: ", "").rstrip('\n\r')
+                        clean_data = (
+                            data.replace("Teensy: ", "")
+                            .replace("SAT> ", "")
+                            .rstrip('\n\r')
+                        )
                         if clean_data:  # Only add non-empty lines
                             csv_data.append(clean_data)
                     
