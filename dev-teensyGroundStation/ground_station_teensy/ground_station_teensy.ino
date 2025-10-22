@@ -95,11 +95,18 @@ uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + THERMAL_PACKET_OVERHEAD];
 const uint8_t SERIAL_MSG_TYPE = 0xAA; // Message type identifier for serial output
 // const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
 const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
+const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
 
 // Packet retry protocol
 const uint8_t RETRY_REQUEST_TYPE = 0xBB;          // Message type for requesting missing packets
 const uint8_t MAX_RETRY_PACKETS_PER_REQUEST = 20; // Max number of missing packets to request at once
 const uint8_t MAX_RETRY_ATTEMPTS = 3;             // Maximum number of retry rounds
+
+// Retry timeout tracking
+unsigned long lastRetryRequestTime = 0;      // When we last sent a retry request
+const unsigned long RETRY_TIMEOUT_MS = 10000; // Wait 10 seconds before re-requesting
+uint8_t retryAttemptCount = 0;               // How many times we've requested retries
+bool waitingForRetry = false;                // Flag: are we currently waiting for retry packets?
 
 // === Packet Structure Definitions (Must match satellite!) ===
 
@@ -151,19 +158,20 @@ struct PACKED SerialMessagePacket
 {
   uint8_t messageType; // SERIAL_MSG_TYPE (0xAA)
   uint8_t length;      // Length with optional continuation flag (bit 7)
-  uint8_t data[RADIO_PACKET_MAX_SIZE - 2]; // Message text (variable size)
+  uint8_t data[MAX_SERIAL_MSG_LEN]; // Message text (variable size)
 };
 
 /**
  * Retry request packet structure (sent to satellite)
- * Contains list of missing packet indices that need retransmission
- * Size: 3 + (2 * number of indices)
+ * Contains bitmap of missing packet indices that need retransmission
+ * Offset allows handling images with >360 packets
  */
 struct PACKED RetryRequestPacket
 {
-  uint8_t requestType;  // RETRY_REQUEST_TYPE (0xBB)
-  uint16_t packetCount; // Number of packets being requested
-  uint16_t indices[24]; // List of packet indices (max ~24 indices in 49 byte packet)
+  uint8_t  type;         // RETRY_REQUEST_TYPE (0xBB)
+  uint16_t packetCount;  // Number of missing packets in this request i.e. number of '1' bits in bitmap
+  uint16_t offset;       // Starting packet index of the range this bitmap covers 
+  uint8_t bitmap[45];    // 360 bits = 45 bytes, bit=1 means packet is missing
 };
 
 // Global variables
@@ -201,8 +209,7 @@ void exportThermalData();
 void forwardToSatellite(char cmd);
 void dumpRf23PendingPacketsToSerial();
 void printRf23HexLines(const uint8_t *data, uint8_t length);
-// void requestMissingPackets();
-uint16_t collectMissingPackets(uint16_t *missingIndices, uint16_t maxCount);
+void requestMissingPackets();
 
 // Command function prototypes
 void cmdHelp(const char *args);
@@ -464,6 +471,11 @@ void clearReception()
   memset(imgBuffer, 0, MAX_IMG);
   memset(packetReceived, false, sizeof(packetReceived)); // Clear packet tracking array
   lastPacketTime = 0;
+
+  // Reset retry state
+  waitingForRetry = false;
+  lastRetryRequestTime = 0;
+  retryAttemptCount = 0;
 }
 
 void handlePacket()
@@ -566,14 +578,57 @@ void handleThermalEndPacket(uint8_t *buf)
   // Parse end packet
   ThermalEndPacket* endPacket = (ThermalEndPacket*)buf;
 
-  uint16_t finalCount = endPacket->packetCount;
+  uint16_t pktCount = endPacket->packetCount;
   expectedImageCrc = endPacket->imageCrc;
 
   Serial.println("\n🏁 END PACKET RECEIVED!");
+
+  // If we're in retry mode, interpret packetCount as number of retry packets sent
+  if (waitingForRetry)
+  {
+    Serial.print("Satellite resent ");
+    Serial.print(pktCount);
+    Serial.println(" retry packets");
+
+    // Verify CRC of received image
+    if (expectedLength > 0)
+    {
+      lastComputedImageCrc = crc16_ccitt(imgBuffer, expectedLength);
+      crcVerified = (expectedImageCrc == lastComputedImageCrc);
+      Serial.print("Image CRC16 expected 0x");
+      Serial.print(expectedImageCrc, HEX);
+      Serial.print(", computed 0x");
+      Serial.print(lastComputedImageCrc, HEX);
+      Serial.println(crcVerified ? " (match)" : " (MISMATCH)");
+    }
+
+    // Check if we now have all packets
+    if (receivedPackets >= expectedPackets)
+    {
+      Serial.println("\n✅ All missing packets received!");
+      waitingForRetry = false;
+      downloadingThermalData = false;
+      imageComplete = true;
+
+      showReceptionSummary();
+      autoMode = false;
+    }
+    else
+    {
+      // Still missing packets - will retry again after timeout
+      Serial.print("⚠️ Still missing ");
+      Serial.print(expectedPackets - receivedPackets);
+      Serial.println(" packets - waiting for retry timeout");
+    }
+    return;
+  }
+
+  // Original transmission logic (first END packet received)
   Serial.print("Transmitter sent ");
-  Serial.print(finalCount);
+  Serial.print(pktCount);
   Serial.println(" packets");
 
+  // verify CRC of received image is what was expected
   if (expectedLength > 0)
   {
     lastComputedImageCrc = crc16_ccitt(imgBuffer, expectedLength);
@@ -585,43 +640,41 @@ void handleThermalEndPacket(uint8_t *buf)
     Serial.println(crcVerified ? " (match)" : " (MISMATCH)");
   }
 
-  if (finalCount != expectedPackets)
+  // case where transmitter does not send all packets
+  if (pktCount != expectedPackets)
   {
     Serial.print("⚠️ End packet reports ");
-    Serial.print(finalCount);
+    Serial.print(pktCount);
     Serial.print(" packets but header expected ");
     Serial.println(expectedPackets);
   }
 
-  downloadingThermalData = false;
+  // case where all packets were sent out, but not all were received
+  if (receivedPackets < expectedPackets) {
+    Serial.print("⚠️ Only ");
+    Serial.print(receivedPackets);
+    Serial.print(" of ");
+    Serial.print(expectedPackets);
+    Serial.println(" packets were received");
+
+    imageComplete = false;
+    waitingForRetry = true;
+    lastRetryRequestTime = millis();
+    retryAttemptCount = 1;
+    requestMissingPackets();
+    return;
+  }
+
+  // case where all packets were received successfully
+  downloadingThermalData = false; // exit downloading state
   imageComplete = true;
   showReceptionSummary();
   autoMode = false; // Exit auto mode only if complete
-
-  // // Request missing packets if any
-  // if (receivedPackets < expectedPackets)
-  // {
-  //   imageComplete = false;
-  //   //requestMissingPackets();
-
-  //   //uh todo assume its good now
-  //   downloadingThermalData = false;
-  //   imageComplete = true;
-  //   showReceptionSummary();
-  //   autoMode = false; // Exit auto mode only if complete
-  // }
-  // else
-  // {
-  //   downloadingThermalData = false;
-  //   imageComplete = true;
-  //   showReceptionSummary();
-  //   autoMode = false; // Exit auto mode only if complete
-  // }
 }
 
 void handleThermalDataPacket(uint8_t *buf, uint8_t len)
 {
-  // Serial.println("Inside satellite data packet");
+  // Error checks
   if (len <= THERMAL_PACKET_OVERHEAD)
   {
     Serial.println("ERROR: data packet len less than thermal packet overhead?!");
@@ -630,13 +683,10 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
 
   // Parse data packet using struct for packet index and data
   ThermalDataPacket* dataPacket = (ThermalDataPacket*)buf;
-
-  uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD; // Data length excludes packet index and CRC
+  uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD; 
   uint16_t packetNum = dataPacket->packetIndex;
 
-  // Read CRC from correct position for variable-length packet
-  // CRC is at: buf[2 + dataLen], not at struct's fixed offset
-  // CRC offset = 2 bytes (packetIndex) + dataLen bytes (data)
+  // Verify CRC
   uint16_t crcOffset = 2 + dataLen;
   uint16_t packetCrc;
   memcpy(&packetCrc, &buf[crcOffset], sizeof(uint16_t));
@@ -645,7 +695,16 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
 
   if (computedCrc != packetCrc)
   {
-    Serial.println("crc error increment up...");
+    // TODO: investigate why CRC mismatch is occurring
+    Serial.println("CRC error detected, dropping packet: ");
+    // print whole packet
+    for (uint8_t i = 0; i < len; i++)
+    {
+      Serial.print(buf[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+
     crcErrorCount++;
     if (crcErrorCount <= 10)
     {
@@ -664,9 +723,11 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
     return; // Discard corrupt packet
   }
 
+  // packet index is within bounds
   if (packetNum >= 1200)
-    return; // Bounds check for packet number
+    return;
 
+  // passed all checks, mark as downloading
   downloadingThermalData = true;
   // Process packet only if not already received (duplicate detection)
   if (!packetReceived[packetNum])
@@ -683,6 +744,12 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
       if (packetNum > maxPacketNum)
       {
         maxPacketNum = packetNum; // Track highest packet number
+      }
+
+      // Reset retry timeout when we receive new packets
+      if (waitingForRetry)
+      {
+        lastRetryRequestTime = millis();
       }
 
       // Progress indication in auto mode - update every 25%
@@ -705,6 +772,22 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
           Serial.print(currentQuarter * 25);
           Serial.println("%");
         }
+      }
+
+      // Check if all packets now received during retry phase
+      if (waitingForRetry && receivedPackets >= expectedPackets)
+      {
+        Serial.println("\n✅ All missing packets received!");
+        waitingForRetry = false;
+        downloadingThermalData = false;
+        imageComplete = true;
+
+        // Verify CRC
+        lastComputedImageCrc = crc16_ccitt(imgBuffer, expectedLength);
+        crcVerified = (expectedImageCrc == lastComputedImageCrc);
+
+        showReceptionSummary();
+        autoMode = false;
       }
     }
     else
@@ -966,8 +1049,8 @@ void showReceptionSummary()
   Serial.print("Satellite Response Time (request → first packet): ");
   helperTime(satelliteResponseTime);
 
-  Serial.print("Payload Expected Size (bytes): ");
-  Serial.println(expectedLength);
+  // Serial.print("Payload Expected Size (bytes): ");
+  // Serial.println(expectedLength);
   Serial.print("Last RSSI: ");
   Serial.println(lastRSSI);
 
@@ -1660,91 +1743,72 @@ void setup()
 }
 
 /**
- * Collects indices of missing packets
- *
- * @param missingIndices Array to store missing packet indices
- * @param maxCount Maximum number of indices to collect
- * @return Number of missing packets found
+ * Requests retransmission of missing packets from satellite using a bitmap
  */
-uint16_t collectMissingPackets(uint16_t *missingIndices, uint16_t maxCount)
+void requestMissingPackets()
 {
-  uint16_t count = 0;
-  for (uint16_t i = 0; i < expectedPackets && count < maxCount; i++)
-  {
-    if (!packetReceived[i])
-    {
-      missingIndices[count++] = i;
+  uint16_t missingPacketCount = expectedPackets - receivedPackets;
+  Serial.print("Requesting retransmission of ");
+  Serial.print(missingPacketCount);
+  Serial.println(" missing packets...");
+
+  // Find the index of the first missing packet
+  int firstMissingIndex = -1;
+  for (int i = 0; i < expectedPackets; i++) {
+    if (!packetReceived[i]) {
+      firstMissingIndex = i;
+      break;
     }
   }
-  return count;
+  // in theory, would never reach here since we check for missing packets before calling this function but just in case
+  if (firstMissingIndex == -1) return; // No missing packets
+
+  /* Send up to 3 requests at a time, each covering a chunk of 360 packets */
+  for (int retryPacketNum = 0; retryPacketNum < 3; retryPacketNum++) {
+    uint16_t offset = firstMissingIndex + (retryPacketNum * 360);
+    if (offset >= expectedPackets) break;
+
+    /* Build bitmap for this chunk */
+    uint8_t bitmap[45]; // 45 bytes * 8 bits = 360 max packets per request
+    memset(bitmap, 0, sizeof(bitmap));
+    uint16_t packetCount = 0;
+    
+    for (int i = 0; i < 360; i++) {
+      uint16_t packetIndex = offset + i;
+      if (packetIndex >= expectedPackets) break; // No more packets to process
+
+      // check PacketReceived to build bitmap
+      if (!packetReceived[packetIndex]) {
+        uint16_t byteIndex = i / 8;
+        uint8_t bitIndex = i % 8;
+        bitmap[byteIndex] |= (1 << bitIndex);
+        packetCount++;
+      }
+    }
+    // if bitmap has no missing packets, skip sending
+    if (packetCount == 0) continue;
+
+    /* Construct retry request packet */
+    RetryRequestPacket retryPacket;
+    retryPacket.type = RETRY_REQUEST_TYPE;
+    retryPacket.offset = offset;
+    retryPacket.packetCount = packetCount;
+    memcpy(retryPacket.bitmap, bitmap, sizeof(bitmap));
+
+    /* Send retry request packet */
+    if (!rf23.send((uint8_t *) &retryPacket, sizeof(retryPacket))) {
+      Serial.println("Failed to queue retry packet for transmission");
+    }
+    else {
+      if (!rf23.waitPacketSent(500)) {
+        Serial.println("Failed to send retry packet");
+      }
+      else {
+        Serial.println("Retry packet sent successfully");
+      }
+    }
+  }
 }
-
-/**
- * Requests retransmission of missing packets from satellite
- *
- * Sends retry request packets containing indices of missing packets,
- * then waits for satellite to resend them. Can perform multiple retry
- * rounds up to MAX_RETRY_ATTEMPTS.
- */
-// void requestMissingPackets()
-// {
-//   downloadingThermalData = true;
-
-//   uint16_t missingIndices[MAX_RETRY_PACKETS_PER_REQUEST];
-
-//   for (uint8_t attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++)
-//   {
-//     uint16_t missingCount = collectMissingPackets(missingIndices, MAX_RETRY_PACKETS_PER_REQUEST);
-
-//     if (missingCount == 0)
-//     {
-//       Serial.println("\n✅ All packets received!");
-//       autoMode = false;
-//       return;
-//     }
-
-//     Serial.print("\n🔄 Retry attempt ");
-//     Serial.print(attempt + 1);
-//     Serial.print("/");
-//     Serial.print(MAX_RETRY_ATTEMPTS);
-//     Serial.print(" - Requesting ");
-//     Serial.print(missingCount);
-//     Serial.println(" missing packets...");
-
-//     // Build retry request packet: [TYPE, count_low, count_high, index1_low, index1_high, ...]
-//     memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
-//     radioTxBuffer[0] = RETRY_REQUEST_TYPE;
-//     radioTxBuffer[1] = missingCount & 0xFF;
-//     radioTxBuffer[2] = (missingCount >> 8) & 0xFF;
-
-//     uint8_t bufferPos = 3;
-//     for (uint16_t i = 0; i < missingCount && bufferPos + 1 < RADIO_PACKET_MAX_SIZE; i++)
-//     {
-//       radioTxBuffer[bufferPos++] = missingIndices[i] & 0xFF;
-//       radioTxBuffer[bufferPos++] = (missingIndices[i] >> 8) & 0xFF;
-//     }
-
-//     // Send retry request
-//     digitalWrite(LED_PIN, HIGH);
-//     if (!rf23.send(radioTxBuffer, bufferPos))
-//     {
-//       Serial.println("❌ Failed to send retry request");
-//       digitalWrite(LED_PIN, LOW);
-//       continue;
-//     }
-
-//     if (!rf23.waitPacketSent(500))
-//     {
-//       Serial.println("❌ Timeout sending retry request");
-//       digitalWrite(LED_PIN, LOW);
-//       continue;
-//     }
-//     digitalWrite(LED_PIN, LOW);
-
-//     Serial.println("✓ Retry request sent, waiting for packets...");
-//     return;
-//   }
-// }
 
 void loop()
 {
@@ -1771,6 +1835,37 @@ void loop()
     {
       // dont spam the serial line when reading data packets.
       printPrompt();
+    }
+  }
+
+  // Check if we need to retry missing packet requests
+  if (waitingForRetry && !imageComplete)
+  {
+    unsigned long currentTime = millis();
+
+    // If timeout expired and still missing packets
+    if (currentTime - lastRetryRequestTime >= RETRY_TIMEOUT_MS)
+    {
+      if (receivedPackets < expectedPackets && retryAttemptCount < MAX_RETRY_ATTEMPTS)
+      {
+        Serial.print("\n⏱️ Retry timeout - attempting retry ");
+        Serial.print(retryAttemptCount + 1);
+        Serial.print(" of ");
+        Serial.println(MAX_RETRY_ATTEMPTS);
+
+        requestMissingPackets();
+        lastRetryRequestTime = currentTime;
+        retryAttemptCount++;
+      }
+      else if (retryAttemptCount >= MAX_RETRY_ATTEMPTS)
+      {
+        Serial.println("\n❌ Max retry attempts reached - giving up");
+        waitingForRetry = false;
+        downloadingThermalData = false;
+        autoMode = false;
+        showReceptionSummary();
+        printPrompt();
+      }
     }
   }
 

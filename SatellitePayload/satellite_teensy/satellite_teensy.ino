@@ -133,7 +133,7 @@ struct PACKED ThermalHeaderPacket
  * Data packet structure for thermal image transmission
  * Contains a chunk of image data with CRC for validation
  * Size: 4 + PACKET_DATA_SIZE bytes (49 bytes max)
- * NOTE: For variable-length packets, CRC must be accessed via buffer offset, not struct member
+ * Note: For variable-length packets, CRC must be accessed via buffer offset, not struct member
  */
 struct PACKED ThermalDataPacket
 {
@@ -169,14 +169,14 @@ struct PACKED SerialMessagePacket
 
 /**
  * Retry request packet structure (received from ground station)
- * Contains list of missing packet indices that need retransmission
- * Size: 3 + (2 * number of indices)
+ * Contains bitmap of missing packet indices that need retransmission
+ * Offset allows handling images with >360 packets
  */
-struct PACKED RetryRequestPacket
-{
-  uint8_t requestType;  // RETRY_REQUEST_TYPE (0xBB)
-  uint16_t packetCount; // Number of packets being requested
-  uint16_t indices[24]; // List of packet indices (max ~24 indices in 49 byte packet)
+struct PACKED RetryRequestPacket {
+  uint8_t  type;         // RETRY_REQUEST_TYPE (0xBB)
+  uint16_t packetCount;  // Number of missing packets in this request
+  uint16_t offset;       // Starting packet index this bitmap covers
+  uint8_t bitmap[45];    // 360 bits = 45 bytes, bit=1 means packet is missing
 };
 
 // Shared radio buffers to avoid stack allocations inside hot paths
@@ -190,6 +190,10 @@ uint8_t radioSerialTxBuffer[MAX_SERIAL_MSG_LEN + RADIO_PACKET_MAX_SIZE];
  */
 void dumpRf23PendingPackets();
 void dumpRf23PacketHexLines(const uint8_t *data, uint8_t length);
+
+/**
+ * Retry handlers for missing packet requests from ground station
+ */
 void handleRetryRequest(uint8_t *buf, uint8_t len);
 void sendSpecificPacket(uint16_t packetIndex);
 
@@ -1318,7 +1322,7 @@ void captureThermalImageUART()
  *
  * @param packetIndex The index of the packet to send (0-based)
  */
-void sendSpecificPacket(uint16_t packetIndex) // TODO: implement retry logic
+void sendSpecificPacket(uint16_t packetIndex)
 {
   if (capturedImageLength == 0)
   {
@@ -1348,34 +1352,29 @@ void sendSpecificPacket(uint16_t packetIndex) // TODO: implement retry logic
   dataPacket->packetIndex = packetIndex;
   memcpy(dataPacket->data, &imgBuf[byteOffset], chunkSize);
 
-  // Calculate CRC and place it at correct position for variable-length packet
+  // Calculate CRC
   uint16_t packetCrc = crc16_ccitt(dataPacket->data, chunkSize);
-  // Write CRC16 at correct position (after actual data, not at struct's fixed offset)
-  // CRC offset = 2 bytes (packetIndex) + chunkSize bytes (data)
   uint16_t crcOffset = 2 + chunkSize;
   memcpy(&radioTxBuffer[crcOffset], &packetCrc, sizeof(uint16_t));
 
-  // Calculate actual packet size (may be smaller for last packet)
+  // Calculate actual packet size
   uint8_t frameLen = 2 + chunkSize + 2;
 
-  if (sendPacketReliable(radioTxBuffer, frameLen))
-  {
-#ifdef DEBUG
-    Serial.print("Resent packet ");
-    Serial.println(packetIndex);
-#endif
-  }
-  else
-  {
+  if (!sendPacketReliable(radioTxBuffer, frameLen)) {
     radioPrint("Failed to resend packet ");
     radioPrintln(String(packetIndex));
+  } else {
+    #ifdef DEBUG
+    radioPrint("Resent packet ");
+    radioPrintln(String(packetIndex));
+    #endif
   }
 }
 
 /**
  * Handles retry request from ground station
  *
- * Parses the retry request packet containing indices of missing packets
+ * Parses the retry request packet containing bitmap of missing packets
  * and retransmits those specific packets, followed by an end packet.
  *
  * @param buf Buffer containing retry request packet
@@ -1383,44 +1382,70 @@ void sendSpecificPacket(uint16_t packetIndex) // TODO: implement retry logic
  */
 void handleRetryRequest(uint8_t *buf, uint8_t len)
 {
-  if (len < 3)
+  // Size check, drop packet if too short
+  if (len < sizeof(RetryRequestPacket))
   {
     radioPrintln("ERROR: Invalid retry request packet (too short)");
     return;
   }
 
   // Parse retry request
-  RetryRequestPacket* retryRequest = (RetryRequestPacket*)buf;
+  RetryRequestPacket *retryRequest = (RetryRequestPacket *) buf;
+  uint16_t expectedMissingCount = retryRequest->packetCount;
+  uint16_t startIndex = retryRequest->offset;
+  uint8_t *bitmap = retryRequest->bitmap;
 
-  if (retryRequest->packetCount == 0)
-  {
-    radioPrintln("Retry request with 0 packets?");
+
+  // No missing packets - just resend END packet to acknowledge request
+  if (expectedMissingCount == 0) {
+    #ifdef DEBUG
+    radioPrintln("Retry request with 0 missing packets - sending END packet");
+    #endif
+
+    const uint16_t totalPackets = (capturedImageLength + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;
+    const uint16_t imageCrc = crc16_ccitt(imgBuf, capturedImageLength); 
+
+    ThermalEndPacket endPacket;
+    endPacket.marker1 = 0xEE;
+    endPacket.marker2 = 0xEE;
+    endPacket.packetCount = totalPackets;
+    endPacket.imageCrc = imageCrc;
+
+    sendPacketReliable((uint8_t*)&endPacket, sizeof(endPacket));
     return;
   }
 
-  radioPrint("🔄 Retry request received for ");
-  radioPrint(String(retryRequest->packetCount));
-  radioPrintln(" packets");
-
-  // Calculate how many indices fit in the received packet
-  uint16_t maxIndices = (len - 3) / 2; // 3 bytes header, 2 bytes per index
-  uint16_t requestedCount = retryRequest->packetCount; // Copy from packed field
-  uint16_t indicesToProcess = min(requestedCount, maxIndices);
+  // Scan bitmap and resend missing packets
   uint16_t resentCount = 0;
+  for (uint16_t bitIndex = 0; bitIndex < 360; bitIndex++) {
+    uint16_t packetIndex = startIndex + bitIndex;
 
-  for (uint16_t i = 0; i < indicesToProcess; i++)
-  {
-    uint16_t packetIndex = retryRequest->indices[i];
-    sendSpecificPacket(packetIndex);
-    resentCount++;
-    delay(5); // Small delay between packets to avoid overwhelming receiver
+    // Stop if we exceed total packets
+    const uint16_t totalPackets = (capturedImageLength + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;
+    if (packetIndex >= totalPackets) break;
+
+    // Check if this packet is marked as missing
+    uint16_t byteIndex = bitIndex / 8;
+    uint8_t bitPos = bitIndex % 8;
+    if (bitmap[byteIndex] & (1 << bitPos)) {
+      // Resend the specific missing packet
+      sendSpecificPacket(packetIndex);
+      resentCount++;
+    }
   }
 
-  radioPrint("Resent ");
-  radioPrint(String(resentCount));
-  radioPrint("/");
-  radioPrint(String(retryRequest->packetCount));
-  radioPrintln(" requested packets");
+  // Send END packet to signal retry completion
+  const uint16_t totalPackets = resentCount;
+  const uint16_t imageCrc = crc16_ccitt(imgBuf, capturedImageLength);
+
+  ThermalEndPacket endPacket;
+  endPacket.marker1 = 0xEE;
+  endPacket.marker2 = 0xEE;
+  endPacket.packetCount = totalPackets; 
+  endPacket.imageCrc = imageCrc;
+
+  sendPacketReliable((uint8_t *) &endPacket, sizeof(endPacket));
+
 }
 
 /**
@@ -1438,9 +1463,9 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
 {
   if (len == 0 || len > rf23.maxMessageLength())
   {
-#ifdef DEBUG
+  #ifdef DEBUG
     Serial.println("Invalid message length: " + len);
-#endif
+  #endif
     // TODO should probably send a message to gs or log somewhere the packet was too big to send?
     return false;
   }
