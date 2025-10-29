@@ -1513,9 +1513,9 @@ void sendThermalDataViaRadio()
 
   const uint16_t imageCrc = crc16_ccitt(imgBuf, capturedImageLength);
 
-  radioPrintln("--- SENDING THERMAL IMAGE VIA RADIO ---");
-  radioPrintln("Image size: " + String(capturedImageLength) + " bytes");
-  radioPrintln("Total packets: " + String(totalPackets));
+  // radioPrintln("--- SENDING THERMAL IMAGE VIA RADIO ---");
+  // radioPrintln("Image size: " + String(capturedImageLength) + " bytes");
+  // radioPrintln("Total packets: " + String(totalPackets));
 
 #ifdef DEBUG
   Serial.println(F("=== Radio thermal downlink ==="));

@@ -99,14 +99,15 @@ const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial 
 
 // Packet retry protocol
 const uint8_t RETRY_REQUEST_TYPE = 0xBB;          // Message type for requesting missing packets
-const uint8_t MAX_RETRY_PACKETS_PER_REQUEST = 20; // Max number of missing packets to request at once
-const uint8_t MAX_RETRY_ATTEMPTS = 3;             // Maximum number of retry rounds
+const uint8_t MAX_RETRY_ATTEMPTS = 5;             // Maximum number of retry rounds
 
 // Retry timeout tracking
 unsigned long lastRetryRequestTime = 0;      // When we last sent a retry request
-const unsigned long RETRY_TIMEOUT_MS = 10000; // Wait 10 seconds before re-requesting
+const unsigned long RETRY_TIMEOUT_MS = 20000; // Wait 20 seconds before re-requesting
+const unsigned long RETRY_GRACE_PERIOD_MS = 5000; // Wait 5 seconds after end packet before requesting retries
 uint8_t retryAttemptCount = 0;               // How many times we've requested retries
 bool waitingForRetry = false;                // Flag: are we currently waiting for retry packets?
+unsigned long endPacketReceivedTime;         // When we received the end packet
 
 // === Packet Structure Definitions (Must match satellite!) ===
 
@@ -659,9 +660,12 @@ void handleThermalEndPacket(uint8_t *buf)
 
     imageComplete = false;
     waitingForRetry = true;
+    endPacketReceivedTime = millis();
     lastRetryRequestTime = millis();
-    retryAttemptCount = 1;
-    requestMissingPackets();
+    retryAttemptCount = 0; // Will be incremented when first retry is sent
+    Serial.print("Waiting ");
+    Serial.print(RETRY_GRACE_PERIOD_MS / 1000);
+    Serial.println(" seconds for any in-flight packets before requesting retries...");
     return;
   }
 
@@ -1122,11 +1126,13 @@ void forwardToSatellite(char cmd)
   {
     Serial.println("\n--- UART THERMAL CAPTURE ---");
     thermalDataDownloadDuration = millis();
+    thermalDataTransferDuration = 0; // Reset transfer timer
   }
   else if (cmd == 'r')
   {
     Serial.println("\n--- REQUESTING THERMAL DATA DOWNLINK ---");
     thermalDataDownloadDuration = millis(); // Start measuring user latency from request
+    thermalDataTransferDuration = 0; // Reset transfer timer (will be set when header arrives)
   }
   else
   {
@@ -1843,8 +1849,13 @@ void loop()
   {
     unsigned long currentTime = millis();
 
+    // For first retry attempt, wait grace period after end packet
+    // For subsequent retries, use the standard retry timeout
+    unsigned long waitTime = (retryAttemptCount == 0) ? RETRY_GRACE_PERIOD_MS : RETRY_TIMEOUT_MS;
+    unsigned long timeReference = (retryAttemptCount == 0) ? endPacketReceivedTime : lastRetryRequestTime;
+
     // If timeout expired and still missing packets
-    if (currentTime - lastRetryRequestTime >= RETRY_TIMEOUT_MS)
+    if (currentTime - timeReference >= waitTime)
     {
       if (receivedPackets < expectedPackets && retryAttemptCount < MAX_RETRY_ATTEMPTS)
       {
