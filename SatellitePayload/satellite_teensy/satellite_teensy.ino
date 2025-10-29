@@ -33,6 +33,10 @@
 // UART TRANSMITTER CODE - satellite teensy (8/25/2025)
 #include <Arduino.h>
 #include <SPI.h>
+#include <Adafruit_GPS.h>
+#include <Adafruit_LIS3MDL.h>
+#include <Adafruit_LSM6DSOX.h>
+#include <Adafruit_Sensor.h>
 /**
  * https://www.airspayce.com/mikem/arduino/RadioHead/
  * RH_RF22 Works with Hope-RF RF22B and RF23B based transceivers, and compatible chips and modules,
@@ -50,7 +54,7 @@
  *  Uncomment ONE of these for your build target:
  * */
 // #define DEBUG    // Verbose logging for development
- #define FLIGHT // Flight mode - minimal logging
+#define FLIGHT // Flight mode - minimal logging
 
 // Pin definitions for hardware control
 const uint8_t RPI_ENABLE = 36; // Power control pin for Raspberry Pi
@@ -152,6 +156,24 @@ Adafruit_INA219 currentSensors[] = {
     Adafruit_INA219(INA219_ADDR_BATTERY)};
 const char *currentSensorsLabels[] = {"Solar Panel 1", "Solar Panel 2", "Solar Panel 3", "Solar Panel 4", "Battery Board"};
 const int numCurrentSensors = 5;
+
+// GPS/IMU hardware
+#define GPSSerial Serial7
+Adafruit_GPS GPS(&GPSSerial);
+const bool GPSECHO = false;
+bool gpsConnected = false;
+
+Adafruit_LIS3MDL lis = Adafruit_LIS3MDL();
+Adafruit_LSM6DSOX lsm6dsox = Adafruit_LSM6DSOX();
+bool imuConnected = false;
+
+// Forward declarations for GPS/IMU helpers
+void initGPS(bool announce = true);
+void initIMU(bool announce = true);
+void serviceGPS();
+void printGPSData();
+void printIMUData();
+void handleSensorCommand(uint8_t *buf, uint8_t len);
 
 /**
  * Sends a serial message via radio to ground station
@@ -446,6 +468,10 @@ void listenForCommands()
         radioPrintln("RPI POWER: missing arg");
       }
     }
+    else if (cmd == 's' || cmd == 'S')
+    {
+      handleSensorCommand(radioRxBuffer, len);
+    }
     else if (cmd == 'g' || cmd == 'G')
     {
       radioPrintln("pong from satellite"); // reply back to GS
@@ -478,9 +504,15 @@ void setup()
   // Send startup message via radio instead of serial
   radioPrintln("=== Artemis Cubesat Teensy 4.1 Satellite Transmitter ===");
 
+  Wire.begin();
+
   initTemperatureSensors();
 
   initCurrentSensors();
+
+  initGPS();
+
+  initIMU();
 
   // TODO: Implement initPDU
 
@@ -501,6 +533,8 @@ void setup()
   radioPrintln(" 't' - Check temperature sensors");
   radioPrintln(" 'c' - Check current sensors");
   radioPrintln(" 'd' - Dump RF23 RX FIFO contents");
+  radioPrintln(" 'sg'/'si'/'sb' - GPS, IMU, or both sensor data");
+  radioPrintln(" 'sG'/'sI' - Reinitialize GPS or IMU");
   radioPrintln("Ready!");
 }
 
@@ -782,6 +816,263 @@ int getValidCurrentData(float currents[], float voltages[])
   return validCount;
 }
 
+static String twoDigit(uint8_t value)
+{
+  if (value < 10)
+  {
+    return "0" + String(value);
+  }
+  return String(value);
+}
+
+void initGPS(bool announce)
+{
+  if (announce)
+  {
+    radioPrintln("Initializing GPS...");
+  }
+
+  gpsConnected = false;
+
+  GPS.begin(9600);
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+  delay(1000);
+
+  if (GPS.available() == 0)
+  {
+    if (announce)
+    {
+      radioPrintln("GPS module not detected");
+    }
+    gpsConnected = false;
+  }
+  else
+  {
+    if (announce)
+    {
+      radioPrintln("GPS module connected");
+    }
+    gpsConnected = true;
+  }
+
+  while (GPS.available())
+  {
+    GPS.read();
+  }
+
+  if (announce)
+  {
+    if (gpsConnected)
+    {
+      radioPrintln("GPS initialization complete");
+    }
+    else
+    {
+      radioPrintln("GPS initialization failed");
+    }
+  }
+}
+
+void initIMU(bool announce)
+{
+  if (announce)
+  {
+    radioPrintln("Initializing IMU...");
+  }
+
+  bool lisReady = lis.begin_I2C();
+  bool lsmReady = lsm6dsox.begin_I2C();
+
+  imuConnected = lisReady && lsmReady;
+
+  if (!imuConnected)
+  {
+    if (announce)
+    {
+      if (!lisReady)
+      {
+        radioPrintln("LIS3MDL magnetometer not detected");
+      }
+      if (!lsmReady)
+      {
+        radioPrintln("LSM6DSOX accelerometer/gyro not detected");
+      }
+    }
+    return;
+  }
+
+  if (announce)
+  {
+    radioPrintln("IMU connected");
+  }
+}
+
+void serviceGPS()
+{
+  char c = GPS.read();
+  if (c)
+  {
+    gpsConnected = true;
+  }
+
+  if (GPS.newNMEAreceived())
+  {
+    GPS.parse(GPS.lastNMEA());
+  }
+}
+
+void printGPSData()
+{
+  radioPrintln("--- GPS DATA ---");
+
+  if (!gpsConnected)
+  {
+    radioPrintln("GPS not connected");
+    return;
+  }
+
+  if (!GPS.fix)
+  {
+    radioPrintln("No GPS fix - searching for satellites...");
+    radioPrint("Satellites visible: ");
+    radioPrintln(String((int)GPS.satellites));
+    return;
+  }
+
+  radioPrint("Time (UTC): ");
+  radioPrintln(twoDigit(GPS.hour) + ":" + twoDigit(GPS.minute) + ":" + twoDigit(GPS.seconds));
+
+  radioPrint("Date: ");
+  radioPrintln(String(GPS.day) + "/" + String(GPS.month) + "/20" + String(GPS.year));
+
+  radioPrint("Location (DDMM.MMMM format): ");
+  radioPrint(String(GPS.latitude, 4));
+  radioPrint(String(GPS.lat));
+  radioPrint(", ");
+  radioPrint(String(GPS.longitude, 4));
+  radioPrintln(String(GPS.lon));
+
+  float lat = GPS.latitude / 100.0;
+  int lat_deg = (int)lat;
+  float lat_min = (lat - lat_deg) * 100.0;
+  float lat_decimal = lat_deg + (lat_min / 60.0);
+  if (GPS.lat == 'S')
+  {
+    lat_decimal = -lat_decimal;
+  }
+
+  float lon = GPS.longitude / 100.0;
+  int lon_deg = (int)lon;
+  float lon_min = (lon - lon_deg) * 100.0;
+  float lon_decimal = lon_deg + (lon_min / 60.0);
+  if (GPS.lon == 'W')
+  {
+    lon_decimal = -lon_decimal;
+  }
+
+  radioPrint("Decimal: ");
+  radioPrint(String(lat_decimal, 6));
+  radioPrint(", ");
+  radioPrintln(String(lon_decimal, 6));
+
+  radioPrint("Altitude: ");
+  radioPrint(String(GPS.altitude));
+  radioPrintln(" m");
+
+  radioPrint("Speed: ");
+  radioPrint(String(GPS.speed));
+  radioPrintln(" knots");
+
+  radioPrint("Satellites: ");
+  radioPrintln(String((int)GPS.satellites));
+
+  radioPrint("Fix quality: ");
+  radioPrintln(String((int)GPS.fixquality));
+}
+
+void printIMUData()
+{
+  radioPrintln("--- IMU DATA ---");
+
+  if (!imuConnected)
+  {
+    radioPrintln("IMU not connected");
+    return;
+  }
+
+  sensors_event_t accel, gyro, temp, mag;
+  lsm6dsox.getEvent(&accel, &gyro, &temp);
+  lis.getEvent(&mag);
+
+  radioPrint("Acceleration (m/s^2): x = ");
+  radioPrint(String(accel.acceleration.x, 2));
+  radioPrint(", y = ");
+  radioPrint(String(accel.acceleration.y, 2));
+  radioPrint(", z = ");
+  radioPrintln(String(accel.acceleration.z, 2));
+
+  radioPrint("Gyro (dps): x = ");
+  radioPrint(String(gyro.gyro.x, 2));
+  radioPrint(", y = ");
+  radioPrint(String(gyro.gyro.y, 2));
+  radioPrint(", z = ");
+  radioPrintln(String(gyro.gyro.z, 2));
+
+  radioPrint("Temperature: ");
+  radioPrint(String(temp.temperature, 1));
+  radioPrintln(" C");
+
+  radioPrint("Magnetic field (uT): x = ");
+  radioPrint(String(mag.magnetic.x, 2));
+  radioPrint(", y = ");
+  radioPrint(String(mag.magnetic.y, 2));
+  radioPrint(", z = ");
+  radioPrintln(String(mag.magnetic.z, 2));
+}
+
+void handleSensorCommand(uint8_t *buf, uint8_t len)
+{
+  if (len < 2)
+  {
+    radioPrintln("Sensor commands: sg(si/sb) print data, sG reinit GPS, sI reinit IMU");
+    return;
+  }
+
+  char sub = (char)buf[1];
+
+  switch (sub)
+  {
+  case 'g':
+    radioPrintln("========== GPS DATA ==========");
+    printGPSData();
+    radioPrintln("==============================");
+    break;
+  case 'i':
+    radioPrintln("========== IMU DATA ==========");
+    printIMUData();
+    radioPrintln("==============================");
+    break;
+  case 'b':
+  case 'B':
+    radioPrintln("========== SENSOR DATA ==========");
+    printGPSData();
+    radioPrintln("");
+    printIMUData();
+    radioPrintln("=================================");
+    break;
+  case 'G':
+    initGPS();
+    break;
+  case 'I':
+    initIMU();
+    break;
+  default:
+    radioPrintln("Unknown sensor subcommand. Use sg, si, sb, sG, or sI");
+    break;
+  }
+}
+
 void initRPI()
 {
   // Initialize Raspberry Pi control pin and make sure its off.
@@ -867,6 +1158,8 @@ void initRadio()
  */
 void loop()
 {
+  serviceGPS();
+
   pollPIUartStatus();
 
   // Handle commands from ground station via radio
@@ -912,11 +1205,35 @@ void loop()
     case 'D':
       dumpRf23PendingPackets();
       break;
+    case 'g':
+      radioPrintln("========== GPS DATA ==========");
+      printGPSData();
+      radioPrintln("==============================");
+      break;
+    case 'i':
+      radioPrintln("========== IMU DATA ==========");
+      printIMUData();
+      radioPrintln("==============================");
+      break;
+    case 'b':
+    case 'B':
+      radioPrintln("========== SENSOR DATA ==========");
+      printGPSData();
+      radioPrintln("");
+      printIMUData();
+      radioPrintln("=================================");
+      break;
+    case 'G':
+      initGPS();
+      break;
+    case 'I':
+      initIMU();
+      break;
     case '~':
       SCB_AIRCR = 0x05FA0004;
       break;
     default:
-      radioPrintln("Unknown command. Use 'z' pong, 'u' capture thermal, 'r' transmit thermal, 't' temps sensors, 'c' currents sensors, 'd' dump RF23 FIFO");
+      radioPrintln("Unknown command. Use 'z','u','r','t','c','d','g','i','b','G','I','~'");
     }
   }
 #endif
@@ -1245,6 +1562,12 @@ void captureThermalImageUART()
 
   // Drain any post-capture status messages immediately
   pollPIUartStatus();
+
+  /* Once we finished the thermal capture, immediately send the GPS and IMU data
+  / to store with the ground station.
+  */
+  printGPSData();
+  printIMUData();
 }
 
 /**
