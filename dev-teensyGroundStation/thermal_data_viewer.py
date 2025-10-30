@@ -75,6 +75,26 @@ def format_gps_location_ddmm_to_dms(raw_value):
     return dms_text
 
 
+def parse_decimal_coordinate_pair(raw_value):
+    """Return list of decimal degree floats parsed from comma-separated string."""
+    if not raw_value:
+        return None
+
+    decimal_values = []
+    for part in raw_value.split(","):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        try:
+            decimal_values.append(float(stripped))
+        except ValueError:
+            return None
+
+    if len(decimal_values) < 2:
+        return None
+    return decimal_values
+
+
 def load_thermal_file(filename):
     """
     Load thermal CSV data and associated metadata comments.
@@ -168,16 +188,38 @@ def main():
         if metadata.get("captured_at"):
             subtitle_parts.append(f'Captured: {metadata["captured_at"]}')
 
-        gps_location_raw = metadata["gps"].get("gs_sat_location")
         gps_location_display = None
         gps_location_decimal = None
         maps_link = None
+
+        gps_decimal_raw = metadata["gps"].get("gs_sat_decimal")
+        gps_location_decimal = parse_decimal_coordinate_pair(gps_decimal_raw)
+
+        gps_location_raw = (
+            metadata["gps"].get("gs_sat_location")
+            or metadata["gps"].get("gs_sat_location_ddmm_mmmm_format")
+        )
+
         if gps_location_raw:
-            gps_location_display, gps_location_decimal = parse_gps_location_ddmm(gps_location_raw)
-            if gps_location_display:
-                subtitle_parts.append(f"GPS: {gps_location_display}")
-            if gps_location_decimal and len(gps_location_decimal) >= 2:
-                maps_link = f"https://maps.google.com/maps?q={gps_location_decimal[0]:.6f},{gps_location_decimal[1]:.6f}"
+            ddmm_display, ddmm_decimal = parse_gps_location_ddmm(gps_location_raw)
+            if ddmm_display:
+                gps_location_display = ddmm_display
+            if not gps_location_decimal and ddmm_decimal:
+                gps_location_decimal = ddmm_decimal
+
+        if not gps_location_display and gps_location_decimal:
+            gps_location_display = (
+                f"{gps_location_decimal[0]:.6f}°, {gps_location_decimal[1]:.6f}°"
+            )
+
+        if gps_location_display:
+            subtitle_parts.append(f"GPS: {gps_location_display}")
+
+        if gps_location_decimal and len(gps_location_decimal) >= 2:
+            maps_link = (
+                f"https://maps.google.com/maps?q="
+                f"{gps_location_decimal[0]:.6f},{gps_location_decimal[1]:.6f}"
+            )
         
         subtitle = '\n'.join(subtitle_parts)
         
@@ -205,11 +247,11 @@ def main():
         if metadata.get("captured_at"):
             print(f"Captured at (UTC): {metadata['captured_at']}")
         if gps_location_display:
-            print(f"GPS location (gs_sat_location): {gps_location_display}")
+            print(f"GPS location: {gps_location_display}")
             if maps_link:
                 print(f"Google Maps: {maps_link}")
         elif gps_location_raw:
-            print(f"GPS location (gs_sat_location) unparsed: {gps_location_raw}")
+            print(f"GPS location unparsed: {gps_location_raw}")
         
         print("GS> ")
     except Exception as e:
