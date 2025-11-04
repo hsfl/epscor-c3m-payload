@@ -52,6 +52,7 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 // note that hardware_spi1 uses the RHHardwareSPI1.h library (same as using SPI1 bus but more explicit for the RH_RF22 library driver)
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
+const int RADIO_WAIT_PACKET_SENT_MS = 500;
 
 const uint8_t LED_PIN = 13;
 
@@ -99,12 +100,12 @@ const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial 
 
 // Packet retry protocol
 const uint8_t RETRY_REQUEST_TYPE = 0xBB;          // Message type for requesting missing packets
-const uint8_t MAX_RETRY_ATTEMPTS = 5;             // Maximum number of retry rounds
+const uint8_t MAX_RETRY_ATTEMPTS = 2;             // Maximum number of retry rounds
 
 // Retry timeout tracking
 unsigned long lastRetryRequestTime = 0;      // When we last sent a retry request
-const unsigned long RETRY_TIMEOUT_MS = 20000; // Wait 20 seconds before re-requesting
-const unsigned long RETRY_GRACE_PERIOD_MS = 5000; // Wait 5 seconds after end packet before requesting retries
+const unsigned long RETRY_TIMEOUT_MS = 5000; // Wait 20 seconds before re-requesting
+const unsigned long RETRY_GRACE_PERIOD_MS = 2500; // Wait 5 seconds after end packet before requesting retries
 uint8_t retryAttemptCount = 0;               // How many times we've requested retries
 bool waitingForRetry = false;                // Flag: are we currently waiting for retry packets?
 unsigned long endPacketReceivedTime;         // When we received the end packet
@@ -446,14 +447,14 @@ void initRadio()
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125);    // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
-  rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  //rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb4_8Fd45);     // 4.8 kbps, 45 kHz deviation
   // rf23.setModemConfig(RH_RF22::GFSK_Rb2_4Fd36);     // 2.4 kbps, 36 kHz deviation
-  // rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
+   rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
 
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
   rf23.setModeIdle();                          // Set radio to idle mode
@@ -1155,7 +1156,7 @@ void forwardToSatellite(char cmd)
   }
   else
   {
-    if (!rf23.waitPacketSent(500))
+    if (!rf23.waitPacketSent(RADIO_WAIT_PACKET_SENT_MS))
     {
       Serial.print("Failed to send command: ");
       Serial.println(cmd);
@@ -1874,7 +1875,7 @@ void requestMissingPackets()
       Serial.println("Failed to queue retry packet for transmission");
     }
     else {
-      if (!rf23.waitPacketSent(500)) {
+      if (!rf23.waitPacketSent(RADIO_WAIT_PACKET_SENT_MS)) {
         Serial.println("Failed to send retry packet");
       }
       else {

@@ -72,6 +72,7 @@ const int RADIO_CS = 38;  // Chip select pin for RF22 module
 const int RADIO_INT = 40; // Interrupt pin for RF22 module
 // note that hardware_spi1 uses the RHHardwareSPI1.h library (same as using SPI1 bus but more explicit for the RH_RF22 library driver)
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
+const int RADIO_WAIT_PACKET_SENT_MS = 500;
 
 // === UART / Framing constants ===
 #define UART_BAUD 115200 // <-- set this to match the Pi; 921600 is fine on Teensy 4.1
@@ -1201,14 +1202,14 @@ void initRadio()
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
-  rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  //rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb4_8Fd45);     // 4.8 kbps, 45 kHz deviation
   // rf23.setModemConfig(RH_RF22::GFSK_Rb2_4Fd36);     // 2.4 kbps, 36 kHz deviation
-  // rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
+   rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
 
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
   rf23.setModeIdle();                          // Set radio to idle mode
@@ -1797,7 +1798,7 @@ bool sendPacketReliable(uint8_t *data, uint8_t len)
   {
     if (rf23.send(data, len))
     {
-      if (rf23.waitPacketSent(50))
+      if (rf23.waitPacketSent(RADIO_WAIT_PACKET_SENT_MS))
       {
         digitalWrite(LED_PIN, LOW); // Turn off LED
         return true;
