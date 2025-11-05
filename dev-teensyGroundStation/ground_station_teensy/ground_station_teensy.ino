@@ -48,8 +48,14 @@ struct Command
 };
 
 // Radio configuration pins and object
-const int RADIO_CS = 38;  // Chip select pin for RF22 module
-const int RADIO_INT = 40; // Interrupt pin for RF22 module
+/** Chip select pin for RF22 module */
+const uint8_t RADIO_CS = 38;
+/** Interrupt pin for RF22 module  */
+const uint8_t RADIO_INT = 40;
+/** Pin 30 from Arduino to RFM23BP RX_ON PIN */
+const uint8_t RADIO_RX_ON_PIN = 30;
+/** Pin 31 from Arduino to RFM23BP RX_ON PIN */
+const uint8_t RADIO_TX_ON_PIN = 31;
 // note that hardware_spi1 uses the RHHardwareSPI1.h library (same as using SPI1 bus but more explicit for the RH_RF22 library driver)
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 const int RADIO_WAIT_PACKET_SENT_MS = 500;
@@ -95,20 +101,20 @@ uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + THERMAL_PACKET_OVERHEAD];
 // Serial message radio reception parameters
 const uint8_t SERIAL_MSG_TYPE = 0xAA; // Message type identifier for serial output
 // const uint16_t SERIAL_MSG_TYPE = 0xAAAA;       // Message type identifier for serial output
-const uint8_t SERIAL_CONTINUATION_FLAG = 0x80; // High bit indicates additional chunks follow
+const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indicates additional chunks follow
 const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
 
 // Packet retry protocol
-const uint8_t RETRY_REQUEST_TYPE = 0xBB;          // Message type for requesting missing packets
-const uint8_t MAX_RETRY_ATTEMPTS = 2;             // Maximum number of retry rounds
+const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing packets
+const uint8_t MAX_RETRY_ATTEMPTS = 2;    // Maximum number of retry rounds
 
 // Retry timeout tracking
-unsigned long lastRetryRequestTime = 0;      // When we last sent a retry request
-const unsigned long RETRY_TIMEOUT_MS = 5000; // Wait 20 seconds before re-requesting
+unsigned long lastRetryRequestTime = 0;           // When we last sent a retry request
+const unsigned long RETRY_TIMEOUT_MS = 5000;      // Wait 20 seconds before re-requesting
 const unsigned long RETRY_GRACE_PERIOD_MS = 2500; // Wait 5 seconds after end packet before requesting retries
-uint8_t retryAttemptCount = 0;               // How many times we've requested retries
-bool waitingForRetry = false;                // Flag: are we currently waiting for retry packets?
-unsigned long endPacketReceivedTime;         // When we received the end packet
+uint8_t retryAttemptCount = 0;                    // How many times we've requested retries
+bool waitingForRetry = false;                     // Flag: are we currently waiting for retry packets?
+unsigned long endPacketReceivedTime;              // When we received the end packet
 
 // === Packet Structure Definitions (Must match satellite!) ===
 
@@ -133,9 +139,9 @@ struct PACKED ThermalHeaderPacket
  */
 struct PACKED ThermalDataPacket
 {
-  uint16_t packetIndex; // Packet sequence number
+  uint16_t packetIndex;           // Packet sequence number
   uint8_t data[PACKET_DATA_SIZE]; // Image data chunk (45 bytes max)
-  uint16_t crc16; // CRC16 of the data field only
+  uint16_t crc16;                 // CRC16 of the data field only
 };
 
 /**
@@ -145,10 +151,10 @@ struct PACKED ThermalDataPacket
  */
 struct PACKED ThermalEndPacket
 {
-  uint8_t marker1;       // 0xEE
-  uint8_t marker2;       // 0xEE
-  uint16_t packetCount;  // Total packets sent
-  uint16_t imageCrc;     // CRC16 of entire image
+  uint8_t marker1;      // 0xEE
+  uint8_t marker2;      // 0xEE
+  uint16_t packetCount; // Total packets sent
+  uint16_t imageCrc;    // CRC16 of entire image
 };
 
 /**
@@ -158,8 +164,8 @@ struct PACKED ThermalEndPacket
  */
 struct PACKED SerialMessagePacket
 {
-  uint8_t messageType; // SERIAL_MSG_TYPE (0xAA)
-  uint8_t length;      // Length with optional continuation flag (bit 7)
+  uint8_t messageType;              // SERIAL_MSG_TYPE (0xAA)
+  uint8_t length;                   // Length with optional continuation flag (bit 7)
   uint8_t data[MAX_SERIAL_MSG_LEN]; // Message text (variable size)
 };
 
@@ -170,10 +176,10 @@ struct PACKED SerialMessagePacket
  */
 struct PACKED RetryRequestPacket
 {
-  uint8_t  type;         // RETRY_REQUEST_TYPE (0xBB)
-  uint16_t packetCount;  // Number of missing packets in this request i.e. number of '1' bits in bitmap
-  uint16_t offset;       // Starting packet index of the range this bitmap covers 
-  uint8_t bitmap[45];    // 360 bits = 45 bytes, bit=1 means packet is missing
+  uint8_t type;         // RETRY_REQUEST_TYPE (0xBB)
+  uint16_t packetCount; // Number of missing packets in this request i.e. number of '1' bits in bitmap
+  uint16_t offset;      // Starting packet index of the range this bitmap covers
+  uint8_t bitmap[45];   // 360 bits = 45 bytes, bit=1 means packet is missing
 };
 
 // Global variables
@@ -232,6 +238,7 @@ void cmdHistory(const char *args);
 void cmdClear(const char *args);
 void cmdRPIControl(const char *args);
 void cmdTestInterrupt(const char *args);
+void cmdTestLoopPing(const char *args);
 void cmdRadio(const char *args);
 void cmdExport(const char *args);
 void cmdCapture(const char *args);
@@ -256,6 +263,7 @@ const Command commands[] = {
     {"clear", "Clear screen", cmdClear},
     {"rpi", "Control Raspberry Pi (rpi <on|off|status>)", cmdRPIControl},
     {"testint", "Test interrupt functionality (testint <seconds>)", cmdTestInterrupt},
+    {"pingloop", "Continuously ping satellite and report RSSI (pingloop [interval_ms])", cmdTestLoopPing},
     {"radio", "Radio control (radio <init|status|tx|rx|dump>)", cmdRadio},
     {"export", "Export thermal data as CSV", cmdExport},
     {"capture", "Command satellite to capture thermal data", cmdCapture},
@@ -270,7 +278,7 @@ bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeou
 {
   digitalWrite(LED_PIN, HIGH);
   bool ok = false;
-
+  setRadioAmpTransmit();
   if (!rf23.send((uint8_t *)data, len))
   {
     Serial.println("Failed to queue radio packet");
@@ -284,7 +292,7 @@ bool sendBytesToSatellite(const uint8_t *data, uint8_t len, unsigned long timeou
   }
 
   digitalWrite(LED_PIN, LOW);
-  // rf23.setModeIdle();
+  setRadioAmpReceive();
   return ok;
 }
 
@@ -410,17 +418,54 @@ void resetInterrupt()
 {
   interruptRequested = false;
 }
-
+void setRadioAmpTransmit()
+{
+  /**
+   * Transmit burst: TXON high, RXON low.
+   * Receive window: RXON high, TXON low.
+   * Idle/standby: both low (saves current, keeps switch centered).
+   */
+  digitalWrite(RADIO_RX_ON_PIN, LOW);
+  digitalWrite(RADIO_TX_ON_PIN, HIGH);
+}
+void setRadioAmpReceive()
+{
+  /**
+   * Transmit burst: TXON high, RXON low.
+   * Receive window: RXON high, TXON low.
+   * Idle/standby: both low (saves current, keeps switch centered).
+   */
+  digitalWrite(RADIO_RX_ON_PIN, HIGH);
+  digitalWrite(RADIO_TX_ON_PIN, LOW);
+}
+void setRadioAmpIdle()
+{
+  /**
+   * NOTE Shouldn't need to use this for the drone test but will
+   * be useful later on for satellite deployment to conserve battery.
+   * Transmit burst: TXON high, RXON low.
+   * Receive window: RXON high, TXON low.
+   * Idle/standby: both low (saves current, keeps switch centered).
+   */
+  digitalWrite(RADIO_RX_ON_PIN, LOW);
+  digitalWrite(RADIO_TX_ON_PIN, LOW);
+}
 // Radio function implementations
 void initRadio()
 {
   Serial.println("Initializing radio...");
 
   // Configure RX/TX control pins
-  pinMode(30, OUTPUT);    // RX_ON pin
-  pinMode(31, OUTPUT);    // TX_ON pin
-  digitalWrite(30, HIGH); // RX_ON = HIGH for receive mode
-  digitalWrite(31, LOW);  // TX_ON = LOW for receive mode
+  pinMode(RADIO_RX_ON_PIN, OUTPUT); // RX_ON pin
+  pinMode(RADIO_TX_ON_PIN, OUTPUT); // TX_ON pin
+  /**
+   * Transmit burst: TXON high, RXON low.
+   * Receive window: RXON high, TXON low.
+   * Idle/standby: both low (saves current, keeps switch centered).
+   */
+  // default to listening
+  digitalWrite(RADIO_RX_ON_PIN, HIGH);
+  digitalWrite(RADIO_TX_ON_PIN, LOW);
   delay(10);
 
   // Configure SPI1 interface for radio communication
@@ -447,14 +492,14 @@ void initRadio()
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125);    // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
-  //rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
-  // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
+  rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb4_8Fd45);     // 4.8 kbps, 45 kHz deviation
   // rf23.setModemConfig(RH_RF22::GFSK_Rb2_4Fd36);     // 2.4 kbps, 36 kHz deviation
-   rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
 
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
   rf23.setModeIdle();                          // Set radio to idle mode
@@ -535,7 +580,7 @@ void processPacket(uint8_t *buf, uint8_t len)
 void handleThermalHeaderPacket(uint8_t *buf)
 {
   // Parse header packet
-  ThermalHeaderPacket* headerPacket = (ThermalHeaderPacket*)buf;
+  ThermalHeaderPacket *headerPacket = (ThermalHeaderPacket *)buf;
 
   expectedLength = headerPacket->imageLength;
   expectedPackets = headerPacket->totalPackets;
@@ -583,7 +628,7 @@ void handleThermalHeaderPacket(uint8_t *buf)
 void handleThermalEndPacket(uint8_t *buf)
 {
   // Parse end packet
-  ThermalEndPacket* endPacket = (ThermalEndPacket*)buf;
+  ThermalEndPacket *endPacket = (ThermalEndPacket *)buf;
 
   uint16_t pktCount = endPacket->packetCount;
   expectedImageCrc = endPacket->imageCrc;
@@ -657,7 +702,8 @@ void handleThermalEndPacket(uint8_t *buf)
   }
 
   // case where all packets were sent out, but not all were received
-  if (receivedPackets < expectedPackets) {
+  if (receivedPackets < expectedPackets)
+  {
     Serial.print("⚠️ Only ");
     Serial.print(receivedPackets);
     Serial.print(" of ");
@@ -692,8 +738,8 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
   }
 
   // Parse data packet using struct for packet index and data
-  ThermalDataPacket* dataPacket = (ThermalDataPacket*)buf;
-  uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD; 
+  ThermalDataPacket *dataPacket = (ThermalDataPacket *)buf;
+  uint8_t dataLen = len - THERMAL_PACKET_OVERHEAD;
   uint16_t packetNum = dataPacket->packetIndex;
 
   // Verify CRC
@@ -915,7 +961,7 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
     return false; // Minimum packet size check
 
   // Parse serial message
-  SerialMessagePacket* serialPacket = (SerialMessagePacket*)buf;
+  SerialMessagePacket *serialPacket = (SerialMessagePacket *)buf;
 
   bool hasMore = (serialPacket->length & SERIAL_CONTINUATION_FLAG) != 0;
   uint8_t msgLen = serialPacket->length & 0x7F; // Lower 7 bits carry the actual length
@@ -1138,7 +1184,7 @@ void forwardToSatellite(char cmd)
   {
     Serial.println("\n--- REQUESTING THERMAL DATA DOWNLINK ---");
     thermalDataDownloadDuration = millis(); // Start measuring user latency from request
-    thermalDataTransferDuration = 0; // Reset transfer timer (will be set when header arrives)
+    thermalDataTransferDuration = 0;        // Reset transfer timer (will be set when header arrives)
   }
   else
   {
@@ -1147,7 +1193,7 @@ void forwardToSatellite(char cmd)
 
   Serial.println("Forwarding command to satellite...");
   digitalWrite(LED_PIN, HIGH); // Turn on LED during transmission
-
+  setRadioAmpTransmit();
   // Send the command
   if (!rf23.send((uint8_t *)&cmd, 1))
   { // a command should be a single byte
@@ -1169,7 +1215,7 @@ void forwardToSatellite(char cmd)
   }
 
   digitalWrite(LED_PIN, LOW); // Turn off LED
-  // rf23.setModeIdle();             // Return to idle mode
+  setRadioAmpReceive();
   return;
 }
 
@@ -1605,6 +1651,113 @@ void cmdTestInterrupt(const char *args)
   Serial.println("Test completed successfully!");
 }
 
+void cmdTestLoopPing(const char *args)
+{
+  unsigned long intervalMs = 2000; // Default loop delay between pings
+  const unsigned long minInterval = 250;
+  const unsigned long responseWaitMs = 1000;
+
+  if (strlen(args) > 0)
+  {
+    long parsed = atol(args);
+    if (parsed >= (long)minInterval)
+    {
+      intervalMs = (unsigned long)parsed;
+    }
+    else
+    {
+      Serial.print("Ignoring interval below ");
+      Serial.print(minInterval);
+      Serial.println(" ms; using default 2000 ms.");
+    }
+  }
+
+  Serial.println("\nStarting ping test loop. Press 'Q' to interrupt.");
+  Serial.print("Loop interval: ");
+  Serial.print(intervalMs);
+  Serial.println(" ms");
+
+  resetInterrupt();
+
+  unsigned long iteration = 1;
+  while (true)
+  {
+    if (isInterruptRequested())
+    {
+      Serial.println("\nPing loop interrupted by user.");
+      resetInterrupt();
+      return;
+    }
+
+    Serial.print("\n[Ping ");
+    Serial.print(iteration);
+    Serial.println("] Sending ping to satellite...");
+
+    uint8_t ping = 'g';
+    if (!sendBytesToSatellite(&ping, 1, 500))
+    {
+      Serial.println("Failed to send ping to satellite");
+    }
+    else
+    {
+      rf23.setModeRx();
+    }
+
+    unsigned long responseStart = millis();
+    unsigned long initialPackets = packetsReceived;
+    bool sawNewPacket = false;
+
+    while (millis() - responseStart < responseWaitMs)
+    {
+      if (rf23.available())
+      {
+        handlePacket();
+        if (packetsReceived > initialPackets)
+        {
+          sawNewPacket = true;
+        }
+      }
+
+      if (isInterruptRequested())
+      {
+        Serial.println("\nPing loop interrupted by user.");
+        resetInterrupt();
+        return;
+      }
+
+      delay(10);
+    }
+
+    Serial.print("Last RSSI: ");
+    Serial.print(lastRSSI);
+    Serial.println(" dBm");
+    if (!sawNewPacket)
+    {
+      Serial.println("(No new response detected during this interval; reporting most recent RSSI)");
+    }
+
+    unsigned long intervalStart = millis();
+    while (millis() - intervalStart < intervalMs)
+    {
+      if (rf23.available())
+      {
+        handlePacket();
+      }
+
+      if (isInterruptRequested())
+      {
+        Serial.println("\nPing loop interrupted by user.");
+        resetInterrupt();
+        return;
+      }
+
+      delay(10);
+    }
+
+    iteration++;
+  }
+}
+
 // Radio command implementations
 void cmdRadio(const char *args)
 {
@@ -1829,31 +1982,39 @@ void requestMissingPackets()
 
   // Find the index of the first missing packet
   int firstMissingIndex = -1;
-  for (int i = 0; i < expectedPackets; i++) {
-    if (!packetReceived[i]) {
+  for (int i = 0; i < expectedPackets; i++)
+  {
+    if (!packetReceived[i])
+    {
       firstMissingIndex = i;
       break;
     }
   }
   // in theory, would never reach here since we check for missing packets before calling this function but just in case
-  if (firstMissingIndex == -1) return; // No missing packets
+  if (firstMissingIndex == -1)
+    return; // No missing packets
 
   /* Send up to 3 requests at a time, each covering a chunk of 360 packets */
-  for (int retryPacketNum = 0; retryPacketNum < 3; retryPacketNum++) {
+  for (int retryPacketNum = 0; retryPacketNum < 3; retryPacketNum++)
+  {
     uint16_t offset = firstMissingIndex + (retryPacketNum * 360);
-    if (offset >= expectedPackets) break;
+    if (offset >= expectedPackets)
+      break;
 
     /* Build bitmap for this chunk */
     uint8_t bitmap[45]; // 45 bytes * 8 bits = 360 max packets per request
     memset(bitmap, 0, sizeof(bitmap));
     uint16_t packetCount = 0;
-    
-    for (int i = 0; i < 360; i++) {
+
+    for (int i = 0; i < 360; i++)
+    {
       uint16_t packetIndex = offset + i;
-      if (packetIndex >= expectedPackets) break; // No more packets to process
+      if (packetIndex >= expectedPackets)
+        break; // No more packets to process
 
       // check PacketReceived to build bitmap
-      if (!packetReceived[packetIndex]) {
+      if (!packetReceived[packetIndex])
+      {
         uint16_t byteIndex = i / 8;
         uint8_t bitIndex = i % 8;
         bitmap[byteIndex] |= (1 << bitIndex);
@@ -1861,7 +2022,8 @@ void requestMissingPackets()
       }
     }
     // if bitmap has no missing packets, skip sending
-    if (packetCount == 0) continue;
+    if (packetCount == 0)
+      continue;
 
     /* Construct retry request packet */
     RetryRequestPacket retryPacket;
@@ -1869,19 +2031,24 @@ void requestMissingPackets()
     retryPacket.offset = offset;
     retryPacket.packetCount = packetCount;
     memcpy(retryPacket.bitmap, bitmap, sizeof(bitmap));
-
+    setRadioAmpTransmit();
     /* Send retry request packet */
-    if (!rf23.send((uint8_t *) &retryPacket, sizeof(retryPacket))) {
+    if (!rf23.send((uint8_t *)&retryPacket, sizeof(retryPacket)))
+    {
       Serial.println("Failed to queue retry packet for transmission");
     }
-    else {
-      if (!rf23.waitPacketSent(RADIO_WAIT_PACKET_SENT_MS)) {
+    else
+    {
+      if (!rf23.waitPacketSent(RADIO_WAIT_PACKET_SENT_MS))
+      {
         Serial.println("Failed to send retry packet");
       }
-      else {
+      else
+      {
         Serial.println("Retry packet sent successfully");
       }
     }
+    setRadioAmpReceive();
   }
 }
 

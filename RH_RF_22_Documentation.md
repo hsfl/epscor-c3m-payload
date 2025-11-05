@@ -2,6 +2,8 @@
 
 **Use this when the agent doesn’t have the library files.** This summarizes the real `RH_RF22.h` surface area and the Si443x/RFM22B quirks.
 
+For this project we USE the RFM23BP Radio.
+
 ---
 
 ## What it wraps
