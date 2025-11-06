@@ -107,6 +107,7 @@ const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial 
 // Packet retry protocol
 const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing packets
 const uint8_t MAX_RETRY_ATTEMPTS = 2;    // Maximum number of retry rounds
+const uint16_t RETRY_MISSING_PACKET_THRESHOLD = 10; // Only trigger retries when more than this many packets are missing
 
 // Retry timeout tracking
 unsigned long lastRetryRequestTime = 0;           // When we last sent a retry request
@@ -220,7 +221,7 @@ void exportThermalData();
 void forwardToSatellite(char cmd);
 void dumpRf23PendingPacketsToSerial();
 void printRf23HexLines(const uint8_t *data, uint8_t length);
-void requestMissingPackets();
+bool requestMissingPackets();
 
 // Command function prototypes
 void cmdHelp(const char *args);
@@ -490,9 +491,9 @@ void initRadio()
   // GFSK Modem Configurations - Ordered from fastest to slowest
   // Uncomment ONE line to select your desired configuration
 
-  rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
-  // rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
@@ -503,7 +504,7 @@ void initRadio()
 
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
   rf23.setModeIdle();                          // Set radio to idle mode
-  Serial.println("GS Radio hardcoded config: 433MHz, GFSK_Rb125Fd125 125 kbps, 19.6 kHz deviation, 30dBm tx power.");
+  Serial.println("GS Radio hardcoded config: 433MHz, GFSK_Rb38_4Fd19_6 38.4 kbps, 19.6 kHz deviation, 30dBm tx power.");
   delay(10);
   Serial.println("GS Radio ready");
 }
@@ -704,11 +705,29 @@ void handleThermalEndPacket(uint8_t *buf)
   // case where all packets were sent out, but not all were received
   if (receivedPackets < expectedPackets)
   {
+    uint16_t missingPackets = expectedPackets - receivedPackets;
     Serial.print("⚠️ Only ");
     Serial.print(receivedPackets);
     Serial.print(" of ");
     Serial.print(expectedPackets);
     Serial.println(" packets were received");
+
+    if (missingPackets <= RETRY_MISSING_PACKET_THRESHOLD)
+    {
+      Serial.print("Missing only ");
+      Serial.print(missingPackets);
+      Serial.print(" packets (<= ");
+      Serial.print(RETRY_MISSING_PACKET_THRESHOLD);
+      Serial.println(") - skipping automatic retry to allow manual inspection.");
+
+      imageComplete = false;
+      waitingForRetry = false;
+      downloadingThermalData = false;
+      autoMode = false;
+      showReceptionSummary();
+      printPrompt();
+      return;
+    }
 
     imageComplete = false;
     waitingForRetry = true;
@@ -1826,7 +1845,7 @@ void cmdRadio(const char *args)
     // Modem configuration details
     Serial.print("Modem config: ");
     // You'll need to track which config you set, or just print what you know
-    Serial.println("GFSK_Rb125Fd125 125kbps");
+    Serial.println("GFSK_Rb38_4Fd19_6 38kbps");
 
     // Temperature (if supported by RF22/23)
     Serial.print("Radio temp: ");
@@ -1973,12 +1992,20 @@ void setup()
 /**
  * Requests retransmission of missing packets from satellite using a bitmap
  */
-void requestMissingPackets()
+bool requestMissingPackets()
 {
+  if (expectedPackets == 0 || receivedPackets >= expectedPackets)
+  {
+    Serial.println("No missing packets to request.");
+    return false;
+  }
+
   uint16_t missingPacketCount = expectedPackets - receivedPackets;
   Serial.print("Requesting retransmission of ");
   Serial.print(missingPacketCount);
   Serial.println(" missing packets...");
+
+  bool anyQueued = false;
 
   // Find the index of the first missing packet
   int firstMissingIndex = -1;
@@ -1992,7 +2019,7 @@ void requestMissingPackets()
   }
   // in theory, would never reach here since we check for missing packets before calling this function but just in case
   if (firstMissingIndex == -1)
-    return; // No missing packets
+    return false; // No missing packets
 
   /* Send up to 3 requests at a time, each covering a chunk of 360 packets */
   for (int retryPacketNum = 0; retryPacketNum < 3; retryPacketNum++)
@@ -2046,10 +2073,16 @@ void requestMissingPackets()
       else
       {
         Serial.println("Retry packet sent successfully");
+        anyQueued = true;
       }
     }
     setRadioAmpReceive();
   }
+  if (!anyQueued)
+  {
+    Serial.println("No retry packets were sent successfully.");
+  }
+  return anyQueued;
 }
 
 void loop()
@@ -2100,9 +2133,19 @@ void loop()
         Serial.print(" of ");
         Serial.println(MAX_RETRY_ATTEMPTS);
 
-        requestMissingPackets();
+        bool retryQueued = requestMissingPackets();
         lastRetryRequestTime = currentTime;
         retryAttemptCount++;
+
+        if (!retryQueued)
+        {
+          Serial.println("Retry request failed to send - exiting retry loop so commands remain responsive.");
+          waitingForRetry = false;
+          downloadingThermalData = false;
+          autoMode = false;
+          showReceptionSummary();
+          printPrompt();
+        }
       }
       else if (retryAttemptCount >= MAX_RETRY_ATTEMPTS)
       {
