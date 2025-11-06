@@ -1178,7 +1178,7 @@ void initRadio()
    * Receive window: RXON high, TXON low.
    * Idle/standby: both low (saves current, keeps switch centered).
    */
-  //default to listening
+  // default to listening
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
   delay(10);
@@ -1211,12 +1211,12 @@ void initRadio()
   // GFSK Modem Configurations - Ordered from fastest to slowest
   // Uncomment ONE line to select your desired configuration
 
-  // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
+  rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
   // rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
-  rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb4_8Fd45);     // 4.8 kbps, 45 kHz deviation
   // rf23.setModemConfig(RH_RF22::GFSK_Rb2_4Fd36);     // 2.4 kbps, 36 kHz deviation
@@ -1232,22 +1232,22 @@ void initRadio()
 void setRadioAmpTransmit()
 {
   /**
-   * Transmit burst: TXON high, RXON low.
-   * Receive window: RXON high, TXON low.
-   * Idle/standby: both low (saves current, keeps switch centered).
-   */
-  digitalWrite(RADIO_RX_ON_PIN, LOW);
-  digitalWrite(RADIO_TX_ON_PIN, HIGH);
-}
-void setRadioAmpReceive()
-{
-  /**
-   * Transmit burst: TXON high, RXON low.
+   * Transmit burst: TXON low, RXON high PER THE DATASHEET.
    * Receive window: RXON high, TXON low.
    * Idle/standby: both low (saves current, keeps switch centered).
    */
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+}
+void setRadioAmpReceive()
+{
+  /**
+   * Transmit burst: TXON low, RXON high PER THE DATASHEET.
+   * Receive window: RXON low, TXON high.
+   * Idle/standby: both low (saves current, keeps switch centered).
+   */
+  digitalWrite(RADIO_RX_ON_PIN, LOW);
+  digitalWrite(RADIO_TX_ON_PIN, HIGH);
 }
 void setRadioAmpIdle()
 {
