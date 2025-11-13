@@ -245,6 +245,7 @@ void cmdCapture(const char *args);
 void cmdRequest(const char *args);
 void cmdRadioStatus(const char *args);
 void cmdSensor(const char *args);
+void cmdAuto(const char *args);
 
 // Command table - easily extensible
 const Command commands[] = {
@@ -269,7 +270,8 @@ const Command commands[] = {
     {"capture", "Command satellite to capture thermal data", cmdCapture},
     {"request", "Request thermal data downlink from satellite", cmdRequest},
     {"rstatus", "Show radio reception status", cmdRadioStatus},
-    {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor}};
+    {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor},
+    {"auto", "Automates capture+request+export command sequence", cmdAuto}};
 
 const int numCommands = sizeof(commands) / sizeof(commands[0]);
 
@@ -1186,6 +1188,11 @@ void forwardToSatellite(char cmd)
     thermalDataDownloadDuration = millis(); // Start measuring user latency from request
     thermalDataTransferDuration = 0;        // Reset transfer timer (will be set when header arrives)
   }
+  else if (cmd == 'a')
+  {
+    thermalDataDownloadDuration = millis(); // Start measuring user latency from request
+    thermalDataTransferDuration = 0;        // Reset transfer timer (will be set when header arrives)
+  }
   else
   {
     return; // Ignore unknown commands
@@ -1915,6 +1922,14 @@ void cmdRadioStatus(const char *args)
   showReceptionSummary();
 }
 
+void cmdAuto(const char *args)
+{
+  Serial.println("\n=== STARTING AUTO CAPTURE+REQUEST ===");
+  // clearReception(); // ensure variables are reset for new reception
+
+  forwardToSatellite('a');
+}
+
 void setup()
 {
 
@@ -1979,6 +1994,7 @@ void requestMissingPackets()
   Serial.print("Requesting retransmission of ");
   Serial.print(missingPacketCount);
   Serial.println(" missing packets...");
+  // TODO: getting stuck after this message, not sending packet?
 
   // Find the index of the first missing packet
   int firstMissingIndex = -1;
@@ -2046,6 +2062,7 @@ void requestMissingPackets()
       else
       {
         Serial.println("Retry packet sent successfully");
+        // TODO: this message is not being printed?
       }
     }
     setRadioAmpReceive();

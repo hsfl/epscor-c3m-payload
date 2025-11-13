@@ -497,10 +497,12 @@ void listenForCommands()
 
     char cmd = (char)radioRxBuffer[0];
 
+    // capture
     if (cmd == 'u' || cmd == 'U')
     {
       captureThermalImageUART();
     }
+    // request
     else if (cmd == 'r' || cmd == 'R')
     {
       sendThermalDataViaRadio();
@@ -509,6 +511,7 @@ void listenForCommands()
     {
       dumpRf23PendingPackets();
     }
+    // rpi control
     else if (cmd == 'p' || cmd == 'P')
     {
       // Power control: ['p','1'] on, ['p','0'] off, ['p','s'] status
@@ -541,18 +544,28 @@ void listenForCommands()
         radioPrintln("RPI POWER: missing arg");
       }
     }
+    // sensor
     else if (cmd == 's' || cmd == 'S')
     {
       handleSensorCommand(radioRxBuffer, len);
     }
+    // ping
     else if (cmd == 'g' || cmd == 'G')
     {
       radioPrintln("pong from satellite"); // reply back to GS
     }
+    // satellite reset
     else if (cmd == '~')
     {
       // Software reset for Teensy 4.1 (ARM Cortex-M7)
       SCB_AIRCR = 0x05FA0004;
+    }
+   // automatically capture and send thermal image
+    else if (cmd == 'a' || cmd == 'A') {
+      radioPrint("received auto capture+request command: ");
+      radioPrint(cmd);
+      radioPrintln("");
+      autoCaptureRequest();
     }
     else
       radioPrintln("Unknown command received via radio");
@@ -1587,12 +1600,12 @@ void pollPIUartStatus()
  * validates the transmission, and stores the image in the buffer.
  * Provides real-time progress updates and data quality assessment.
  */
-void captureThermalImageUART()
+int captureThermalImageUART()
 {
   if (!RPI_IDLE_READY)
   {
     radioPrintln("Raspberry Pi is not ready yet, retry once in RPI STATUS: IDLE");
-    return;
+    return 0;
   }
 
   radioPrintln("--- UART THERMAL CAPTURE ---");
@@ -1624,7 +1637,7 @@ void captureThermalImageUART()
     {
       radioPrintln("ERROR: Failed to receive framed message");
       piCaptureInProgress = false;
-      return;
+      return 0;
     }
 
     if (isStatus)
@@ -1638,6 +1651,12 @@ void captureThermalImageUART()
   }
 
   piCaptureInProgress = false;
+
+  if (capturedImageLength == 0)
+  {
+    radioPrintln("ERROR: Captured image length is zero");
+    return 0;
+  }
 
   radioPrintln("--- UART IMAGE RECEPTION COMPLETE ---");
   radioPrint("Received ");
@@ -1680,6 +1699,8 @@ void captureThermalImageUART()
   */
   printGPSData();
   printIMUData();
+
+  return 1;
 }
 
 /**
@@ -2034,4 +2055,14 @@ void sendThermalDataViaRadio()
     radioPrintln("⚠️ SAT Some packets lost");
   }
 #endif
+}
+
+void autoCaptureRequest() {
+  // do not proceed if capture failed
+  if (!captureThermalImageUART()) {
+    radioPrintln("Error occured, auto capture+request was cancelled.");
+    return;
+  }
+  // if successful, try to send thermal data to ground station
+  sendThermalDataViaRadio();
 }
