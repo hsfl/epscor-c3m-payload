@@ -116,6 +116,37 @@ if (rf22.waitAvailableTimeout(50)) { uint8_t n=sizeof(buf); if (rf22.recv(buf,&n
 
 ---
 
+## Hardware & wiring notes
+- **Default SPI wiring**: MOSI/MISO/SCK are shared, but each RH_RF22 instance needs its own SS and interrupt line. RF22/RFM22/RFM23 modules expect GND, 3V3 (use a 5V rail for RFM23BP/ shields with regulators), optional SDN, and GPIO0/1 tied to TX_ANT/RX_ANT (or reversed boards discussed below). When moving SS away from the default (e.g., D10 on Uno/Due or D53 on Mega), force the unused default pin to `OUTPUT` so the hardware SPI master stays active as noted in the library warnings.
+- **Supported boards**: the RadioHead docs list working pinouts for
+  - Sparkfun RFM22 shield / Arduino Uno & Duemilanove (D10 SS, D2 NIRQ),
+  - Mega 2560 (D50–D53 for SPI, D10 SS, D2 NIRQ; bend or jumper the shield if plugging it in directly),
+  - ChipKit Uno32 (D10 SS, D38 NIRQ with JP4=RD4),
+  - Teensy 3.1 (D10 SS, D2 NIRQ),
+  - Due (SPI header pins for SCK/MOSI/MISO with D10 SS and D2 NIRQ),
+  - STM32 F4 Discovery (PB0 SS, PB1 NIRQ, PB3/5/4 SPI),
+  - ESP32 (GPIO13 SS, GPIO15 NIRQ),
+  - ESP8266 ESP-12 (D5 SS, D4 NIRQ—watch for broken D4/D5 silks), and
+  - AtTiny x16 series (PC0 SS, PA6 NIRQ, PA3/1/2 for SPI).
+  These are just reference connections; you can override the default pins by passing them to the `RH_RF22` constructor.
+- **RFM23BP high-power caution**: RF23BPs require a firm 5V rail and draw several hundred milliamps at 28‑30 dBm. Ensure GPIO0→RXON and GPIO1→TXON (or call `setGpioReversed(true)` for reversed modules) and keep the RF bias pins wired to the helper functions (`setRadioAmpTransmit/Receive/Idle`). Avoid starving the regulator or USB port—symptoms include hanging, mystery resets, incorrect power, or RF PA overheating.
+- **Multiple radios & interrupts**: up to three radios can coexist (the driver tracks `_deviceForInterrupt[]`), but each still needs a unique SS and interrupt. Keep other SPI devices from sharing interrupts by wrapping their transfers with `cli()/sei()` or temporarily disabling the RF22 interrupt handler (see `RHSPIDriver::spiUsingInterrupt()`).
+- **Power & antenna pins**: RF22 modules can pull >80 mA at full transmit power; the Arduino 3.3V line only gives ~50 mA. Use level shifters, a dedicated 3.3V regulator, or the Sparkfun shield. If you buy bare RFM22 boards note the 3.3V IO—they do not tolerate 5V logic unless you add level shifting. Some RFM23BP boards have their TX_ANT/RX_ANT wires flipped; `setGpioReversed(true)` fixes this once you identify the symptom (TX stuck or RX silent). Some RFM23BP units also have unreliable NIRQ outputs when powered above ~3.3V—voltage dividers or running at 3.3V can help.
+- **Packet format compatibility**: RH_RF22 packets use the RadioHead header/CRC (TO/FROM/ID/FLAGS + CRC16 IBM). This format is **not** compatible with the older RF22 or VirtualWire libraries, so migrating code requires constructing both an `RH_RF22` driver and a manager (`RHReliableDatagram`, `RHMesh`, etc.) and switching from `RF22_MAX_MESSAGE_LEN` to `RH_RF22_MAX_MESSAGE_LEN`.
+
+## Memory & platform limits
+- Program size: most RH_RF22 examples compile to 9–14 kB, so flash is usually fine.
+- RAM: the Duemilanova’s 2 kB RAM is nearly exhausted when using this driver; Diecimila usually lacks enough. The Mega (8 kB SRAM) gives substantially more headroom, and the RHRouter/RHMesh samples still require it. Symptoms of RAM pressure include mysterious restarts, hanging, missing `Serial` output, and changes in timing when inserting unrelated `Serial.print()` calls.
+- ESP8266/ESP32: the ESP8266 port overrides `waitPacketSent()` and introduces `loopIsr()` so that SPI transfers happen in `loop()` rather than in the interrupt, avoiding long ISR execution.
+
+## Compatibility with RF22
+- The constructor changed (now `RH_RF22 driver; RHReliableDatagram manager(driver, CLIENT_ADDRESS);`) and you now need both a driver and a manager object for addressed/reliable packets.
+- Modem configuration indexes have shifted; use the symbolic `ModemConfigChoice` names instead of literal numbers.
+- RadioHead 1.6 changed how interrupt pins are specified on Arduino/Uno32 platforms—pass the **actual GPIO pin number**, not the legacy “interrupt number.” Example differences appear in the RadioHead docs.
+- Replace `RF22_MAX_MESSAGE_LEN` references with `RH_RF22_MAX_MESSAGE_LEN` when sharing buffers or defining array sizes.
+
+---
+
 ## FIFO & interrupt hygiene
 **Read both** `INT_STATUS1/2` to clear. If things wedge:
 ```cpp
@@ -135,6 +166,12 @@ Some boards wire **GPIO0↔RX_ANT** and **GPIO1↔TX_ANT** reversed. Call `setGp
 
 ---
 
+## TX/RX amplifier gating
+- The Teensy ground station firmware drives the RFM23BP `RX_ON` and `TX_ON` inputs from `RADIO_RX_ON_PIN` (Arduino pin 30) and `RADIO_TX_ON_PIN` (pin 31). `initRadio()` configures those pins as outputs, defaults to listenable mode (RX high / TX low), and helper routines like `setRadioAmpTransmit()`, `setRadioAmpReceive()`, and `setRadioAmpIdle()` toggle them per the datasheet so the amplifier bias and antenna switch stay in the expected state.
+- Mirror that wiring in your setup and keep both signals low for idle to avoid inadvertently biasing the PA; the Teensy helpers show the settled logic levels (transmit = `RX_ON` high / `TX_ON` low, receive = `RX_ON` low / `TX_ON` high, idle = both low).
+
+---
+
 ## Reliability tips
 - Match **frequency, modem preset, preamble, sync, CRC** across nodes.
 - Keep messages **≤ `maxMessageLength()`** (consider your build‑time override of 50).
@@ -149,4 +186,3 @@ Some boards wire **GPIO0↔RX_ANT** and **GPIO1↔TX_ANT** reversed. Call `setGp
 - **Sleep?** `sleep()` lowers power; wake by entering Idle/Tx/Rx (adds wake latency).
 
 *That’s the RH_RF22 essentials. Keep this short; defer fine register math to the header or datasheet when needed.*
-
