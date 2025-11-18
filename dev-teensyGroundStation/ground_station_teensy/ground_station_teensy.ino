@@ -105,8 +105,8 @@ const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indica
 const uint8_t MAX_SERIAL_MSG_LEN = RADIO_PACKET_MAX_SIZE - 2; // Maximum serial message length per packet payload
 
 // Packet retry protocol
-const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing packets
-const uint8_t MAX_RETRY_ATTEMPTS = 2;    // Maximum number of retry rounds
+const uint8_t RETRY_REQUEST_TYPE = 0xBB;            // Message type for requesting missing packets
+const uint8_t MAX_RETRY_ATTEMPTS = 2;               // Maximum number of retry rounds
 const uint16_t RETRY_MISSING_PACKET_THRESHOLD = 10; // Only trigger retries when more than this many packets are missing
 
 // Retry timeout tracking
@@ -426,8 +426,13 @@ void setRadioAmpTransmit()
    * Receive window: RXON high, TXON low.
    * Idle/standby: both low (saves current, keeps switch centered).
    */
+  // Serial.println("Setting radio amp to TRANSMIT");
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
+  // Serial.print("RX_ON: HIGH");
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+  // Serial.println("   | TX_ON: LOW");
+  delayMicroseconds(300); // ensure the amp is settled before transmitting
+  // Serial.println("RADIO AMP SET TO TRANSMIT");
 }
 void setRadioAmpReceive()
 {
@@ -436,8 +441,13 @@ void setRadioAmpReceive()
    * Receive window: RXON low, TXON high.
    * Idle/standby: both low (saves current, keeps switch centered).
    */
+  // Serial.println("Setting radio amp to RX");
   digitalWrite(RADIO_RX_ON_PIN, LOW);
+  // Serial.print("RX_ON: LOW");
   digitalWrite(RADIO_TX_ON_PIN, HIGH);
+  // Serial.println("   | TX_ON: HIGH");
+  delayMicroseconds(300); // ensure the amp is settled before receiving
+  // Serial.println("RADIO AMP SET TO RX");
 }
 void setRadioAmpIdle()
 {
@@ -467,7 +477,7 @@ void initRadio()
   // default to listening
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
-  delay(10);
+  delayMicroseconds(500);
 
   // Configure SPI1 interface for radio communication
   SPI1.setMISO(39); // Master In, Slave Out
@@ -494,6 +504,7 @@ void initRadio()
   // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
   rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
@@ -502,6 +513,7 @@ void initRadio()
   // rf23.setModemConfig(RH_RF22::GFSK_Rb2_4Fd36);     // 2.4 kbps, 36 kHz deviation
   // rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
 
+  // rf23.setTxPower(RH_RF22_RF23BP_TXPOW_28DBM); // 28dBm lowest available power for RFM23BP
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
   rf23.setModeIdle();                          // Set radio to idle mode
   Serial.println("GS Radio hardcoded config: 433MHz, GFSK_Rb38_4Fd19_6 38.4 kbps, 19.6 kHz deviation, 30dBm tx power.");
@@ -1777,6 +1789,31 @@ void cmdTestLoopPing(const char *args)
   }
 }
 
+/**
+ * Converts the raw ADC value from RFM23BP/RF22 to Celsius.
+ * Based on Section 8.4 of the RFM23BP Datasheet.
+ * Assumes default TSRANGE: -64C to +64C.
+ *
+ * @param adc_raw The 0-255 value returned by radio.adcRead()
+ * @param cal_offset (Optional) User calibration correction (default 0.0)
+ * @return Temperature in Degrees Celsius
+ */
+float convertRadioTemp(uint8_t adc_raw, float cal_offset = 0.0)
+{
+  // 1. Define the slope based on the range (-64 to +64 = 128 degree span)
+  // Span (128) / ADC_Resolution (256) = 0.5 degrees per bit
+  const float slope = 0.5;
+
+  // 2. Define the base offset (Value at ADC = 0)
+  const float range_floor = -64.0;
+
+  // 3. Calculate
+  float temp_c = ((float)adc_raw * slope) + range_floor;
+
+  // 4. Apply user calibration (if any)
+  return temp_c + cal_offset;
+}
+
 // Radio command implementations
 void cmdRadio(const char *args)
 {
@@ -1849,7 +1886,7 @@ void cmdRadio(const char *args)
 
     // Temperature (if supported by RF22/23)
     Serial.print("Radio temp: ");
-    Serial.print(rf23.temperatureRead());
+    Serial.print(convertRadioTemp(rf23.temperatureRead()));
     Serial.println(" °C");
 
     // Header settings

@@ -1181,7 +1181,7 @@ void initRadio()
   // default to listening
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
-  delay(10);
+  delayMicroseconds(500);
 
   // Configure SPI1 interface for radio communication
   SPI1.setMISO(39); // Master In, Slave Out
@@ -1238,6 +1238,7 @@ void setRadioAmpTransmit()
    */
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+  delayMicroseconds(300); // ensure the amp is settled before transmitting
 }
 void setRadioAmpReceive()
 {
@@ -1248,6 +1249,7 @@ void setRadioAmpReceive()
    */
   digitalWrite(RADIO_RX_ON_PIN, LOW);
   digitalWrite(RADIO_TX_ON_PIN, HIGH);
+  delayMicroseconds(300); // ensure the amp is settled before receiving
 }
 void setRadioAmpIdle()
 {
