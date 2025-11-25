@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source .venv/bin/activate)",
+      "Bash(python -m pytest:*)",
+      "Bash(python test_thermal_camera_controller.py:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

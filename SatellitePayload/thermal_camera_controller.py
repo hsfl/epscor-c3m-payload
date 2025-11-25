@@ -31,8 +31,8 @@ Communication Protocol:
 @version 1.0.0
 """
 
-__version__ = "1.0.0"
-__build_date__ = "2025-10-14"
+__version__ = "1.1.0"
+__build_date__ = "2025-11-25"
 
 import numpy as np
 import time
@@ -47,6 +47,14 @@ import ctypes
 UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
 UART_BAUD = 115200         # High-speed UART to match Teensy baud rate
 TRIGGER_COMMAND = b'TRIGGER\n'  # UART command from Teensy to initiate capture
+STREAM_START_COMMAND = b'STREAM_START\n'  # Command to start livestream mode
+STREAM_STOP_COMMAND = b'STREAM_STOP\n'    # Command to stop livestream mode
+
+# Livestream protocol constants
+STREAM_MAGIC = bytes([0xCA, 0xFE, 0xBA, 0xBE])  # Magic header for livestream frames
+STREAM_FRAME_WIDTH = 80   # Downsampled width (160/2)
+STREAM_FRAME_HEIGHT = 60  # Downsampled height (120/2)
+STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4,800 bytes per frame
 
 # Camera Configuration
 MAX_FRAMES = 10           # Number of frames to capture and average
@@ -181,6 +189,45 @@ def is_valid_frame(frame):
     zero_count = np.sum(frame < 1000)
     return zero_count < (frame.size * 0.8)
 
+
+def downsample_frame(frame_16bit):
+    """
+    Downsample 160x120 16-bit thermal frame to 80x60 8-bit for streaming.
+
+    Uses 2x2 block averaging and scales 16-bit values to 8-bit range.
+    The 16-bit thermal values are in Kelvin*100 (e.g., 29315 = 20°C).
+    We map a reasonable temperature range (0-100°C = 27315-37315) to 0-255.
+
+    Args:
+        frame_16bit: numpy array of shape (120, 160) with uint16 values
+
+    Returns:
+        numpy array of shape (60, 80) with uint8 values
+    """
+    if frame_16bit is None:
+        return None
+
+    # Ensure correct input shape
+    if frame_16bit.shape != (120, 160):
+        print(f"Warning: unexpected frame shape {frame_16bit.shape}, expected (120, 160)")
+        return None
+
+    # Reshape to (60, 2, 80, 2) to get 2x2 blocks, then average
+    # This groups pixels into 2x2 blocks for averaging
+    reshaped = frame_16bit.reshape(60, 2, 80, 2)
+    averaged = reshaped.mean(axis=(1, 3)).astype(np.float32)
+
+    # Map from Kelvin*100 to 0-255 range
+    # Temperature range: 0°C (27315) to 100°C (37315)
+    min_kelvin = 27315.0  # 0°C in Kelvin*100
+    max_kelvin = 37315.0  # 100°C in Kelvin*100
+
+    # Clip to valid range and scale to 0-255
+    clipped = np.clip(averaged, min_kelvin, max_kelvin)
+    scaled = ((clipped - min_kelvin) / (max_kelvin - min_kelvin) * 255.0)
+
+    return scaled.astype(np.uint8)
+
 def capture_and_average(timeout_s=2.0):
     """
     Capture and average multiple thermal frames for noise reduction
@@ -238,6 +285,55 @@ def capture_and_average(timeout_s=2.0):
     # print(f"  Mean: {(mean_val - 27315) / 100.0:.1f}°C")
     
     return averaged.tobytes()  # Return as raw bytes for UART transmission
+
+def send_stream_frame_uart(frame_8bit, frame_seq, uart_port):
+    """
+    Send a downsampled stream frame via UART with livestream header.
+
+    Uses STREAM_MAGIC header (0xCA 0xFE 0xBA 0xBE) to distinguish from
+    regular thermal captures. The Teensy forwards these frames to the
+    ground station for live viewing (not saving).
+
+    Args:
+        frame_8bit: numpy array of shape (60, 80) with uint8 values
+        frame_seq: frame sequence number (0-255, wrapping)
+        uart_port: Serial port object for UART communication
+
+    Returns:
+        bool: True if transmission successful, False otherwise
+    """
+    if frame_8bit is None:
+        return False
+
+    try:
+        data = frame_8bit.tobytes()
+        if len(data) != STREAM_FRAME_SIZE:
+            print(f"Warning: stream frame size {len(data)}, expected {STREAM_FRAME_SIZE}")
+            return False
+
+        # Build stream frame packet:
+        # [STREAM_MAGIC 4B][Frame Seq 1B][Frame Size 2B][Frame Data 4800B][End 2B]
+        header = bytearray()
+        header.extend(STREAM_MAGIC)
+        header.append(frame_seq & 0xFF)  # 1-byte sequence number
+        header.extend([STREAM_FRAME_SIZE & 0xFF, (STREAM_FRAME_SIZE >> 8) & 0xFF])
+
+        # Send header
+        uart_port.write(header)
+
+        # Send frame data
+        uart_port.write(data)
+
+        # Send end markers
+        uart_port.write(bytearray([0xFF, 0xFF]))
+        uart_port.flush()
+
+        return True
+
+    except Exception as e:
+        print(f"Stream frame UART error: {e}")
+        return False
+
 
 def send_status_uart(message: str, uart_port):
     """
@@ -330,18 +426,18 @@ def send_data_uart(data, uart_port):
         print(f"UART transmission error: {e}")
         return False
 
-def wait_for_uart_trigger(uart_port, timeout=None):
+def wait_for_uart_command(uart_port, timeout=None):
     """
-    Wait for UART trigger command from Teensy
+    Wait for UART command from Teensy (TRIGGER or STREAM_START/STOP)
 
-    Reads UART data line by line and returns True when trigger command is received.
+    Reads UART data and returns the command type when recognized.
 
     Args:
         uart_port: Serial port object for UART communication
         timeout: Optional timeout in seconds (None for blocking)
 
     Returns:
-        bool: True if trigger received, False on timeout
+        str: 'trigger', 'stream_start', 'stream_stop', or None on timeout
     """
     start_time = time.time()
     buffer = b''
@@ -350,21 +446,108 @@ def wait_for_uart_trigger(uart_port, timeout=None):
         if timeout is not None:
             elapsed = time.time() - start_time
             if elapsed > timeout:
-                return False
+                return None
 
         if uart_port.in_waiting > 0:
             chunk = uart_port.read(uart_port.in_waiting)
             buffer += chunk
 
-            # Check for trigger command
+            # Check for commands
             if TRIGGER_COMMAND in buffer:
-                return True
+                return 'trigger'
+            if STREAM_START_COMMAND in buffer:
+                return 'stream_start'
+            if STREAM_STOP_COMMAND in buffer:
+                return 'stream_stop'
 
             # Keep buffer size manageable (only last 100 bytes)
             if len(buffer) > 100:
                 buffer = buffer[-100:]
         else:
             time.sleep(0.01)  # Small delay to avoid busy-waiting
+
+
+def wait_for_uart_trigger(uart_port, timeout=None):
+    """
+    Wait for UART trigger command from Teensy (legacy wrapper)
+
+    Returns:
+        bool: True if trigger received, False on timeout
+    """
+    result = wait_for_uart_command(uart_port, timeout)
+    return result == 'trigger'
+
+
+def run_stream_loop(uart_port, frame_timeout_s=0.5):
+    """
+    Run continuous streaming loop: capture → downsample → send stream frames.
+
+    Captures frames from the thermal camera, downsamples them to 80x60 8-bit,
+    and sends via UART using the livestream protocol. Exits when STREAM_STOP
+    is received or on timeout/error.
+
+    Args:
+        uart_port: Serial port object for UART communication
+        frame_timeout_s: Timeout for capturing each frame
+
+    Returns:
+        str: Reason for exit ('stop_command', 'timeout', 'error')
+    """
+    print("Starting stream mode...")
+    send_status_uart("STREAM_START", uart_port)
+
+    frame_seq = 0
+    frames_sent = 0
+    start_time = time.time()
+
+    try:
+        while True:
+            # Check for stop command (non-blocking)
+            if uart_port.in_waiting > 0:
+                incoming = uart_port.read(uart_port.in_waiting)
+                if STREAM_STOP_COMMAND in incoming or b'STREAM_STOP' in incoming:
+                    print("Stream stop command received")
+                    send_status_uart("STREAM_STOP", uart_port)
+                    return 'stop_command'
+
+            # Try to get a frame from the queue
+            try:
+                frame = thermal_queue.get(timeout=frame_timeout_s)
+            except Empty:
+                # No frame available, continue waiting
+                continue
+
+            # Skip invalid frames (FFC calibration frames)
+            if not is_valid_frame(frame):
+                continue
+
+            # Downsample to 80x60 8-bit
+            frame_8bit = downsample_frame(frame)
+            if frame_8bit is None:
+                continue
+
+            # Send via UART
+            if send_stream_frame_uart(frame_8bit, frame_seq, uart_port):
+                frames_sent += 1
+                frame_seq = (frame_seq + 1) & 0xFF  # Wrap at 255
+
+                # Progress update every 10 frames
+                if frames_sent % 10 == 0:
+                    elapsed = time.time() - start_time
+                    fps = frames_sent / elapsed if elapsed > 0 else 0
+                    print(f"Streaming: {frames_sent} frames, {fps:.1f} fps")
+            else:
+                print("Failed to send stream frame")
+
+    except KeyboardInterrupt:
+        print("Stream interrupted by user")
+        send_status_uart("STREAM_STOP", uart_port)
+        return 'interrupted'
+
+    except Exception as e:
+        print(f"Stream error: {e}")
+        send_status_uart("STREAM_ERROR", uart_port)
+        return 'error'
 
 def main():
     print("RPi Thermal Camera - UART Output")
@@ -397,13 +580,18 @@ def main():
             # Clean exit so systemd can retry later
             return
 
-        print(f"\nSystem ready. Waiting for UART trigger command: {TRIGGER_COMMAND.decode('ascii').strip()}")
+        print(f"\nSystem ready. Waiting for UART commands:")
+        print(f"  - {TRIGGER_COMMAND.decode('ascii').strip()}: Single capture")
+        print(f"  - {STREAM_START_COMMAND.decode('ascii').strip()}: Start livestream")
+        print(f"  - {STREAM_STOP_COMMAND.decode('ascii').strip()}: Stop livestream")
         print(f"Data will be sent via UART: {UART_PORT} at {UART_BAUD} baud")
         send_status_uart("IDLE", uart)
 
         while True:
-            # Wait for trigger command from Teensy via UART
-            if wait_for_uart_trigger(uart):
+            # Wait for command from Teensy via UART
+            command = wait_for_uart_command(uart)
+
+            if command == 'trigger':
                 timestamp = time.strftime("%H:%M:%S")
                 print(f"\n[{timestamp}] Capture triggered via UART!")
                 print("="*40)
@@ -425,8 +613,25 @@ def main():
                         print("✗ Data transmission failed!")
                         send_status_uart("TX_FAIL", uart)
 
-                print("\nReady for next trigger...")
+                print("\nReady for next command...")
                 print("="*40)
+                send_status_uart("IDLE", uart)
+
+            elif command == 'stream_start':
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"\n[{timestamp}] Stream mode started via UART!")
+                print("="*40)
+
+                exit_reason = run_stream_loop(uart)
+                print(f"Stream ended: {exit_reason}")
+
+                print("\nReady for next command...")
+                print("="*40)
+                send_status_uart("IDLE", uart)
+
+            elif command == 'stream_stop':
+                # Stop command received outside of stream mode - just acknowledge
+                print("Stream stop received (not in stream mode)")
                 send_status_uart("IDLE", uart)
 
     except KeyboardInterrupt:

@@ -109,6 +109,11 @@ const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing 
 const uint8_t MAX_RETRY_ATTEMPTS = 2;    // Maximum number of retry rounds
 const uint16_t RETRY_MISSING_PACKET_THRESHOLD = 10; // Only trigger retries when more than this many packets are missing
 
+// Livestream protocol constants
+const uint8_t STREAM_FRAME_TYPE = 0xCC;       // Message type for livestream frame packets
+const uint16_t STREAM_FRAME_SIZE = 4800;      // 80x60 8-bit = 4800 bytes per frame
+const uint8_t STREAM_PACKETS_PER_FRAME = 107; // ~107 packets per frame (4800/45)
+
 // Retry timeout tracking
 unsigned long lastRetryRequestTime = 0;           // When we last sent a retry request
 const unsigned long RETRY_TIMEOUT_MS = 5000;      // Wait 20 seconds before re-requesting
@@ -183,6 +188,32 @@ struct PACKED RetryRequestPacket
   uint8_t bitmap[45];   // 360 bits = 45 bytes, bit=1 means packet is missing
 };
 
+/**
+ * Stream frame header packet structure for livestream reception
+ * Received from satellite to indicate start of a new frame
+ * Total size: 6 bytes
+ */
+struct PACKED StreamFrameHeaderPacket
+{
+  uint8_t type;         // STREAM_FRAME_TYPE (0xCC)
+  uint8_t frameSeq;     // Frame sequence number (0-255, wrapping)
+  uint16_t frameSize;   // Frame size in bytes (4800)
+  uint16_t totalPackets; // Number of data packets for this frame
+};
+
+/**
+ * Stream frame data packet structure
+ * Contains chunk of stream frame data
+ * Size: 3 + data length bytes
+ */
+struct PACKED StreamDataPacket
+{
+  uint8_t type;           // STREAM_FRAME_TYPE (0xCC)
+  uint8_t frameSeq;       // Frame sequence number to associate with header
+  uint8_t packetIndex;    // Packet index within frame (0-106)
+  uint8_t data[PACKET_DATA_SIZE]; // Frame data chunk
+};
+
 // Global variables
 String inputBuffer = "";
 String commandHistory[10];
@@ -194,6 +225,15 @@ const int RASPBERRY_PI_GPIO_PIN = 36;
 const String THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---";
 const String THERMAL_CSV_START = "=== START CSV ===";
 const String THERMAL_CSV_END = "=== END CSV ===";
+
+// Livestream state
+bool streamModeActive = false;
+uint8_t currentStreamFrameSeq = 0;
+uint8_t streamFrameBuffer[STREAM_FRAME_SIZE];  // Buffer for assembling current frame
+uint8_t streamPacketsReceived[STREAM_PACKETS_PER_FRAME];  // Track which packets received
+uint8_t streamPacketCount = 0;  // Number of packets received for current frame
+const String STREAM_FRAME_START = "=== STREAM_FRAME_START ===";
+const String STREAM_FRAME_END = "=== STREAM_FRAME_END ===";
 
 // Forward declarations
 void parseCommand(const String &input);
@@ -222,6 +262,13 @@ void forwardToSatellite(char cmd);
 void dumpRf23PendingPacketsToSerial();
 void printRf23HexLines(const uint8_t *data, uint8_t length);
 bool requestMissingPackets();
+
+// Stream mode function declarations
+void handleStreamFrameHeader(uint8_t *buf, uint8_t len);
+void handleStreamFrameData(uint8_t *buf, uint8_t len);
+void outputStreamFrame();
+void resetStreamFrame();
+void cmdStream(const char *args);
 
 // Command function prototypes
 void cmdHelp(const char *args);
@@ -270,7 +317,8 @@ const Command commands[] = {
     {"capture", "Command satellite to capture thermal data", cmdCapture},
     {"request", "Request thermal data downlink from satellite", cmdRequest},
     {"rstatus", "Show radio reception status", cmdRadioStatus},
-    {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor}};
+    {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor},
+    {"stream", "Control livestream mode (stream <start|stop>)", cmdStream}};
 
 const int numCommands = sizeof(commands) / sizeof(commands[0]);
 
@@ -547,6 +595,21 @@ void handlePacket()
 
 void processPacket(uint8_t *buf, uint8_t len)
 {
+  // Check for stream frame packets first (type 0xCC)
+  if (buf[0] == STREAM_FRAME_TYPE && len >= 3)
+  {
+    // Stream header packet is 6 bytes, data packets are 3+ bytes
+    if (len == sizeof(StreamFrameHeaderPacket))
+    {
+      handleStreamFrameHeader(buf, len);
+    }
+    else
+    {
+      handleStreamFrameData(buf, len);
+    }
+    return;
+  }
+
   //  Check for serial message packet (MSG_TYPE + LENGTH + MESSAGE_DATA)
   if (buf[0] == SERIAL_MSG_TYPE && !downloadingThermalData && len >= 2)
   {
@@ -2173,5 +2236,202 @@ void loop()
       // addToHistory(input);
       printPrompt();
     }
+  }
+}
+
+// ============================================================================
+// LIVESTREAM MODE FUNCTIONS
+// ============================================================================
+
+/**
+ * Reset stream frame buffer for a new frame
+ */
+void resetStreamFrame()
+{
+  memset(streamFrameBuffer, 0, STREAM_FRAME_SIZE);
+  memset(streamPacketsReceived, 0, STREAM_PACKETS_PER_FRAME);
+  streamPacketCount = 0;
+}
+
+/**
+ * Handle stream frame header packet from satellite
+ * Indicates a new frame is starting
+ */
+void handleStreamFrameHeader(uint8_t *buf, uint8_t len)
+{
+  StreamFrameHeaderPacket *header = (StreamFrameHeaderPacket *)buf;
+
+  // If we have a partial frame from previous seq, output it anyway
+  if (streamPacketCount > 0 && header->frameSeq != currentStreamFrameSeq)
+  {
+    outputStreamFrame();
+  }
+
+  // Start new frame
+  currentStreamFrameSeq = header->frameSeq;
+  resetStreamFrame();
+  streamModeActive = true;
+}
+
+/**
+ * Handle stream frame data packet from satellite
+ * Assembles frame data from multiple packets
+ */
+void handleStreamFrameData(uint8_t *buf, uint8_t len)
+{
+  StreamDataPacket *pkt = (StreamDataPacket *)buf;
+
+  // Verify this packet belongs to current frame
+  if (pkt->frameSeq != currentStreamFrameSeq)
+  {
+    // Different frame - might have missed header
+    // Output any existing frame data first
+    if (streamPacketCount > 0)
+    {
+      outputStreamFrame();
+    }
+    currentStreamFrameSeq = pkt->frameSeq;
+    resetStreamFrame();
+  }
+
+  // Validate packet index
+  if (pkt->packetIndex >= STREAM_PACKETS_PER_FRAME)
+  {
+    return; // Invalid index
+  }
+
+  // Check if already received
+  if (streamPacketsReceived[pkt->packetIndex])
+  {
+    return; // Duplicate
+  }
+
+  // Calculate data size (packet len - 3 byte header)
+  uint8_t dataLen = len - 3;
+  if (dataLen > PACKET_DATA_SIZE)
+  {
+    dataLen = PACKET_DATA_SIZE;
+  }
+
+  // Copy data to buffer
+  uint16_t bufferOffset = (uint16_t)pkt->packetIndex * PACKET_DATA_SIZE;
+  if (bufferOffset + dataLen <= STREAM_FRAME_SIZE)
+  {
+    memcpy(&streamFrameBuffer[bufferOffset], pkt->data, dataLen);
+    streamPacketsReceived[pkt->packetIndex] = 1;
+    streamPacketCount++;
+  }
+
+  // Check if frame is complete (or mostly complete)
+  // Output when we have received enough packets (best-effort)
+  if (streamPacketCount >= STREAM_PACKETS_PER_FRAME - 5)
+  {
+    outputStreamFrame();
+  }
+}
+
+/**
+ * Output assembled stream frame to serial for Python CLI to capture
+ * Format: special markers with raw binary data in hex
+ */
+void outputStreamFrame()
+{
+  if (streamPacketCount == 0)
+  {
+    return; // Nothing to output
+  }
+
+  // Output frame with markers that Python CLI can detect
+  Serial.println(STREAM_FRAME_START);
+
+  // Output frame sequence and packet stats
+  Serial.print("SEQ:");
+  Serial.print(currentStreamFrameSeq);
+  Serial.print(",PKTS:");
+  Serial.print(streamPacketCount);
+  Serial.print("/");
+  Serial.println(STREAM_PACKETS_PER_FRAME);
+
+  // Output raw frame data as comma-separated decimal values
+  // This is more efficient than hex and easier to parse
+  Serial.print("DATA:");
+  for (uint16_t i = 0; i < STREAM_FRAME_SIZE; i++)
+  {
+    Serial.print(streamFrameBuffer[i]);
+    if (i < STREAM_FRAME_SIZE - 1)
+    {
+      Serial.print(",");
+    }
+    // Add newline every 80 bytes to prevent buffer overflow
+    if ((i + 1) % 80 == 0)
+    {
+      Serial.println();
+      Serial.print("DATA:");
+    }
+  }
+  Serial.println();
+
+  Serial.println(STREAM_FRAME_END);
+
+  // Reset for next frame
+  resetStreamFrame();
+}
+
+/**
+ * Command handler for stream control
+ * Usage: stream start | stream stop
+ */
+void cmdStream(const char *args)
+{
+  String argStr = String(args);
+  argStr.trim();
+  argStr.toLowerCase();
+
+  if (argStr == "start" || argStr == "1")
+  {
+    Serial.println("Starting livestream mode...");
+    Serial.println("Sending stream start command to satellite...");
+
+    memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
+    radioTxBuffer[0] = 'v';
+    radioTxBuffer[1] = '1';
+
+    if (sendBytesToSatellite(radioTxBuffer, 2))
+    {
+      Serial.println("Stream start command sent");
+      streamModeActive = true;
+      resetStreamFrame();
+      rf23.setModeRx();
+    }
+    else
+    {
+      Serial.println("Failed to send stream start command");
+    }
+  }
+  else if (argStr == "stop" || argStr == "0")
+  {
+    Serial.println("Stopping livestream mode...");
+    Serial.println("Sending stream stop command to satellite...");
+
+    memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
+    radioTxBuffer[0] = 'v';
+    radioTxBuffer[1] = '0';
+
+    if (sendBytesToSatellite(radioTxBuffer, 2))
+    {
+      Serial.println("Stream stop command sent");
+      streamModeActive = false;
+      rf23.setModeRx();
+    }
+    else
+    {
+      Serial.println("Failed to send stream stop command");
+    }
+  }
+  else
+  {
+    Serial.println("Usage: stream <start|stop>");
+    Serial.println("  start - Begin livestream from satellite thermal camera");
+    Serial.println("  stop  - End livestream mode");
   }
 }

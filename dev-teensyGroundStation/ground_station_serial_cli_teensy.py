@@ -11,8 +11,8 @@ Enhanced with CSV export detection and thermal data visualization
 @version 1.0.0
 """
 
-__version__ = "1.0.0"
-__build_date__ = "2025-10-14"
+__version__ = "1.1.0"
+__build_date__ = "2025-11-25"
 
 import serial
 import threading
@@ -33,6 +33,17 @@ THERMAL_CSV_START = "=== START CSV ==="
 THERMAL_CSV_END = "=== END CSV ==="
 THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---"
 ThermalCaptureTimestamp = datetime.now()
+
+# Livestream protocol constants
+STREAM_FRAME_START = "=== STREAM_FRAME_START ==="
+STREAM_FRAME_END = "=== STREAM_FRAME_END ==="
+STREAM_FRAME_WIDTH = 80
+STREAM_FRAME_HEIGHT = 60
+STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4800 bytes
+
+# Stream frame queue for viewer
+from queue import Queue
+stream_frame_queue = Queue(maxsize=10)  # Buffer up to 10 frames
 
 # Sensor telemetry cache
 sensor_cache = {"gps": {}, "imu": {}}
@@ -348,11 +359,11 @@ def run_thermal_viewer(filename):
         # Get the directory of the current script
         script_dir = os.path.dirname(os.path.abspath(__file__))
         viewer_script = os.path.join(script_dir, "thermal_data_viewer.py")
-        
+
         if not os.path.exists(viewer_script):
             print(f"❌ Thermal viewer script not found: {viewer_script}")
             return False
-        
+
         # Run the thermal viewer with the filename as argument
         print(f"🖼️  Opening thermal data viewer for: {filename}")
         subprocess.Popen([sys.executable, viewer_script, filename])
@@ -361,23 +372,87 @@ def run_thermal_viewer(filename):
         print(f"❌ Error running thermal viewer: {e}")
         return False
 
+
+def run_stream_viewer():
+    """Run the thermal data viewer in livestream mode"""
+    try:
+        # Get the directory of the current script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        viewer_script = os.path.join(script_dir, "thermal_data_viewer.py")
+
+        if not os.path.exists(viewer_script):
+            print(f"❌ Thermal viewer script not found: {viewer_script}")
+            return False
+
+        # Run the thermal viewer with --stream flag
+        print(f"🎬 Opening livestream viewer...")
+        subprocess.Popen([sys.executable, viewer_script, "--stream"])
+        return True
+    except Exception as e:
+        print(f"❌ Error running stream viewer: {e}")
+        return False
+
 def read_serial(ser, stop_event):
     """Read data from serial port in a separate thread"""
     global ThermalCaptureTimestamp
     csv_capture_mode = False
     csv_data = []
-    
+    stream_capture_mode = False
+    stream_data = []
+    stream_frame_seq = 0
+    stream_packets_info = ""
+
     while not stop_event.is_set():
         try:
             if ser.in_waiting > 0:
                 data = ser.readline().decode('utf-8', errors='ignore')
                 if data:
-                    # Print the data as-is, preserving original newlines
+                    # Check for stream frame markers FIRST (don't print stream data normally)
+                    if STREAM_FRAME_START in data:
+                        stream_capture_mode = True
+                        stream_data = []
+                        continue
+
+                    if STREAM_FRAME_END in data:
+                        if stream_capture_mode:
+                            stream_capture_mode = False
+                            # Parse and queue the stream frame
+                            frame_bytes = parse_stream_frame_data(stream_data)
+                            if frame_bytes is not None:
+                                try:
+                                    stream_frame_queue.put_nowait({
+                                        'seq': stream_frame_seq,
+                                        'data': frame_bytes,
+                                        'info': stream_packets_info
+                                    })
+                                except:
+                                    pass  # Queue full, drop frame
+                            stream_data = []
+                        continue
+
+                    # If in stream capture mode, collect the data silently
+                    if stream_capture_mode:
+                        clean_line = data.strip()
+                        if clean_line.startswith("SEQ:"):
+                            # Parse sequence info: SEQ:0,PKTS:102/107
+                            try:
+                                parts = clean_line.split(",")
+                                stream_frame_seq = int(parts[0].split(":")[1])
+                                stream_packets_info = parts[1] if len(parts) > 1 else ""
+                            except:
+                                pass
+                        elif clean_line.startswith("DATA:"):
+                            # Collect data values
+                            data_part = clean_line[5:]  # Remove "DATA:" prefix
+                            stream_data.append(data_part)
+                        continue
+
+                    # Print non-stream data as-is, preserving original newlines
                     print(f"{data}", end='', flush=True)
 
                     # Update sensor telemetry cache with incoming line
                     update_sensor_cache(data)
-                    
+
                     # Check for thermal data capture command time and save it for the csv.
                     if THERMAL_CAPTURE_TIMESTAMP_FLAG in data:
                         ThermalCaptureTimestamp = datetime.now()
@@ -391,13 +466,13 @@ def read_serial(ser, stop_event):
                         if THERMAL_CAPTURE_TIMESTAMP_FLAG not in data:
                             ThermalCaptureTimestamp = datetime.now()
                         continue
-                    
+
                     # Check for CSV end marker
                     if THERMAL_CSV_END in data:
                         if csv_capture_mode:
                             print(f"\n🏁 CSV export complete! Processing data...")
                             csv_capture_mode = False
-                            
+
                             # Save the captured data
                             metadata_lines = build_sensor_metadata_lines(ThermalCaptureTimestamp)
                             if metadata_lines:
@@ -405,14 +480,14 @@ def read_serial(ser, stop_event):
                             else:
                                 csv_content = '\n'.join(csv_data)
                             filename = get_next_thermal_filename()
-                            
+
                             if save_thermal_data(csv_content, filename):
                                 # Run the thermal viewer
                                 run_thermal_viewer(filename)
-                            
+
                             csv_data = []  # Clear for next capture
                         continue
-                    
+
                     # If in CSV capture mode, collect the data
                     if csv_capture_mode:
                         # Remove the "Teensy: " prefix and store clean data
@@ -423,7 +498,7 @@ def read_serial(ser, stop_event):
                         )
                         if clean_data:  # Only add non-empty lines
                             csv_data.append(clean_data)
-                    
+
                     # Check for reset message
                     if "Resetting system..." in data:
                         print("\nDetected system reset. Press 'Enter' twice to exit.")
@@ -431,13 +506,43 @@ def read_serial(ser, stop_event):
                         # Send SIGINT to interrupt the main thread
                         signal.raise_signal(signal.SIGINT)
                         break  # Exit the read thread immediately
-                        
+
             else:
                 # Small sleep to prevent busy waiting
                 time.sleep(0.01)
         except Exception as e:
             print(f"Read error: {e}")
             break
+
+
+def parse_stream_frame_data(data_lines):
+    """
+    Parse stream frame data from collected DATA: lines.
+
+    Args:
+        data_lines: List of strings containing comma-separated decimal values
+
+    Returns:
+        bytes: Frame data as bytes, or None if parsing fails
+    """
+    try:
+        # Join all data lines and split by comma
+        all_values = []
+        for line in data_lines:
+            values = [int(v.strip()) for v in line.split(",") if v.strip()]
+            all_values.extend(values)
+
+        if len(all_values) < STREAM_FRAME_SIZE:
+            # Pad with zeros if incomplete
+            all_values.extend([0] * (STREAM_FRAME_SIZE - len(all_values)))
+
+        # Truncate if too long
+        all_values = all_values[:STREAM_FRAME_SIZE]
+
+        return bytes(all_values)
+    except Exception as e:
+        print(f"Stream frame parse error: {e}")
+        return None
 
 def main():
     # Find and connect to serial port

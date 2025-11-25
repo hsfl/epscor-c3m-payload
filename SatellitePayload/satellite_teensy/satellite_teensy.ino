@@ -122,6 +122,18 @@ const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indica
 // Packet retry protocol
 const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing packets
 
+// Livestream protocol constants
+const uint8_t STREAM_FRAME_TYPE = 0xCC;                                 // Message type for livestream frame packets
+const uint8_t STREAM_MAGIC[4] = {0xCA, 0xFE, 0xBA, 0xBE};               // Magic header for livestream frames from Pi
+const uint16_t STREAM_FRAME_SIZE = 4800;                                // 80x60 8-bit = 4800 bytes per frame
+const uint8_t STREAM_PACKETS_PER_FRAME = (STREAM_FRAME_SIZE + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;  // ~107 packets
+const char STREAM_START_CMD[] = "STREAM_START\n";                       // Command to RPi to start streaming
+const char STREAM_STOP_CMD[] = "STREAM_STOP\n";                         // Command to RPi to stop streaming
+
+// Stream mode state
+bool streamModeActive = false;
+uint8_t streamFrameBuffer[STREAM_FRAME_SIZE];  // Buffer for one stream frame
+
 // === Packet Structure Definitions ===
 
 /**
@@ -189,6 +201,32 @@ struct PACKED RetryRequestPacket
   uint8_t bitmap[45];   // 360 bits = 45 bytes, bit=1 means packet is missing
 };
 
+/**
+ * Stream frame header packet structure for livestream transmission
+ * Sent before each frame to inform ground station of frame data
+ * Total size: 6 bytes
+ */
+struct PACKED StreamFrameHeaderPacket
+{
+  uint8_t type;         // STREAM_FRAME_TYPE (0xCC)
+  uint8_t frameSeq;     // Frame sequence number (0-255, wrapping)
+  uint16_t frameSize;   // Frame size in bytes (4800)
+  uint16_t totalPackets; // Number of data packets for this frame
+};
+
+/**
+ * Stream frame data packet structure
+ * Contains chunk of stream frame data (no CRC for speed - best-effort delivery)
+ * Size: 3 + data length bytes
+ */
+struct PACKED StreamDataPacket
+{
+  uint8_t type;           // STREAM_FRAME_TYPE (0xCC)
+  uint8_t frameSeq;       // Frame sequence number to associate with header
+  uint8_t packetIndex;    // Packet index within frame (0-106)
+  uint8_t data[PACKET_DATA_SIZE]; // Frame data chunk
+};
+
 // Shared radio buffers to avoid stack allocations inside hot paths
 uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
 uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
@@ -251,6 +289,13 @@ void serviceGPS();
 void printGPSData();
 void printIMUData();
 void handleSensorCommand(uint8_t *buf, uint8_t len);
+
+// Forward declarations for stream mode
+void startStreamMode();
+void stopStreamMode();
+void handleStreamMode();
+bool recvStreamFrameFromPi(uint8_t &frameSeq);
+void sendStreamFrameViaRadio(uint8_t frameSeq);
 
 /**
  * Sends a serial message via radio to ground station
@@ -549,6 +594,30 @@ void listenForCommands()
     {
       radioPrintln("pong from satellite"); // reply back to GS
     }
+    else if (cmd == 'v' || cmd == 'V')
+    {
+      // Stream command: 'v' + '1' = start, 'v' + '0' = stop
+      if (len >= 2)
+      {
+        char sub = (char)radioRxBuffer[1];
+        if (sub == '1')
+        {
+          startStreamMode();
+        }
+        else if (sub == '0')
+        {
+          stopStreamMode();
+        }
+        else
+        {
+          radioPrintln("STREAM: Unknown subcommand (use v1 to start, v0 to stop)");
+        }
+      }
+      else
+      {
+        radioPrintln("STREAM: missing arg (use v1 to start, v0 to stop)");
+      }
+    }
     else if (cmd == '~')
     {
       // Software reset for Teensy 4.1 (ARM Cortex-M7)
@@ -603,6 +672,7 @@ void setup()
   radioPrintln("Commands:");
   radioPrintln(" 'u' - UART thermal capture (fast!)");
   radioPrintln(" 'r' - Send captured image via radio");
+  radioPrintln(" 'v1'/'v0' - Start/stop livestream mode");
   radioPrintln(" 't' - Check temperature sensors");
   radioPrintln(" 'c' - Check current sensors");
   radioPrintln(" 'd' - Dump RF23 RX FIFO contents");
@@ -1271,6 +1341,13 @@ void setRadioAmpIdle()
 void loop()
 {
   serviceGPS();
+
+  // Handle stream mode if active
+  if (streamModeActive)
+  {
+    handleStreamMode();
+    return; // Skip normal processing during stream mode
+  }
 
   pollPIUartStatus();
 
@@ -2034,4 +2111,235 @@ void sendThermalDataViaRadio()
     radioPrintln("⚠️ SAT Some packets lost");
   }
 #endif
+}
+
+// ============================================================================
+// LIVESTREAM MODE FUNCTIONS
+// ============================================================================
+
+/**
+ * Check if the buffer starts with stream magic header
+ */
+bool isStreamMagic(const uint8_t *buf)
+{
+  return buf[0] == STREAM_MAGIC[0] && buf[1] == STREAM_MAGIC[1] &&
+         buf[2] == STREAM_MAGIC[2] && buf[3] == STREAM_MAGIC[3];
+}
+
+/**
+ * Start livestream mode - send command to Pi and enter stream state
+ */
+void startStreamMode()
+{
+  if (!RPI_IDLE_READY)
+  {
+    radioPrintln("STREAM: RPi not ready, wait for RPI STATUS: IDLE");
+    return;
+  }
+
+  radioPrintln("STREAM: Starting livestream mode...");
+
+  // Clear any pending UART data
+  while (Serial2.available())
+    Serial2.read();
+
+  // Send stream start command to Pi
+  Serial2.print(STREAM_START_CMD);
+  Serial2.flush();
+
+  streamModeActive = true;
+  radioPrintln("STREAM: Mode active - forwarding frames to GS");
+}
+
+/**
+ * Stop livestream mode - send command to Pi and exit stream state
+ */
+void stopStreamMode()
+{
+  if (!streamModeActive)
+  {
+    radioPrintln("STREAM: Not in stream mode");
+    return;
+  }
+
+  radioPrintln("STREAM: Stopping livestream mode...");
+
+  // Send stream stop command to Pi
+  Serial2.print(STREAM_STOP_CMD);
+  Serial2.flush();
+
+  streamModeActive = false;
+  radioPrintln("STREAM: Mode stopped");
+}
+
+/**
+ * Receive one stream frame from Pi via UART
+ * Stream frame format: [STREAM_MAGIC 4B][Frame Seq 1B][Size 2B][Data 4800B][End 2B]
+ *
+ * @param frameSeq Output parameter for frame sequence number
+ * @return true if frame received successfully
+ */
+bool recvStreamFrameFromPi(uint8_t &frameSeq)
+{
+  // Read header: 4 magic + 1 seq + 2 size = 7 bytes
+  uint8_t header[7];
+  const uint32_t STREAM_HEADER_TIMEOUT_MS = 500; // 500ms timeout for streaming
+
+  if (!readExact(Serial2, header, 7, STREAM_HEADER_TIMEOUT_MS))
+  {
+    return false; // Timeout or error
+  }
+
+  // Validate stream magic
+  if (!isStreamMagic(header))
+  {
+    // Not a stream frame - might be a status message, let normal handling deal with it
+    return false;
+  }
+
+  frameSeq = header[4];
+  uint16_t frameSize = (uint16_t)header[5] | ((uint16_t)header[6] << 8);
+
+  if (frameSize != STREAM_FRAME_SIZE)
+  {
+    radioPrint("STREAM: Bad frame size ");
+    radioPrintln(String(frameSize));
+    return false;
+  }
+
+  // Read frame data
+  if (!readExact(Serial2, streamFrameBuffer, STREAM_FRAME_SIZE, STREAM_HEADER_TIMEOUT_MS))
+  {
+    radioPrintln("STREAM: Frame data timeout");
+    return false;
+  }
+
+  // Read end markers
+  uint8_t ender[2];
+  if (!readExact(Serial2, ender, 2, 100))
+  {
+    radioPrintln("STREAM: End marker timeout");
+    return false;
+  }
+
+  if (ender[0] != 0xFF || ender[1] != 0xFF)
+  {
+    radioPrintln("STREAM: Bad end markers");
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Send a stream frame via radio to ground station
+ * Uses STREAM_FRAME_TYPE packets for identification
+ *
+ * @param frameSeq Frame sequence number to include in packets
+ */
+void sendStreamFrameViaRadio(uint8_t frameSeq)
+{
+  // Send header packet first
+  StreamFrameHeaderPacket headerPkt;
+  headerPkt.type = STREAM_FRAME_TYPE;
+  headerPkt.frameSeq = frameSeq;
+  headerPkt.frameSize = STREAM_FRAME_SIZE;
+  headerPkt.totalPackets = STREAM_PACKETS_PER_FRAME;
+
+  setRadioAmpTransmit();
+
+  if (!rf23.send((uint8_t *)&headerPkt, sizeof(headerPkt)))
+  {
+    setRadioAmpReceive();
+    return;
+  }
+  rf23.waitPacketSent(100); // Short timeout for streaming
+
+  // Send data packets (best-effort, no retries for speed)
+  uint16_t bytesSent = 0;
+  uint8_t packetNum = 0;
+
+  while (bytesSent < STREAM_FRAME_SIZE)
+  {
+    uint16_t remaining = STREAM_FRAME_SIZE - bytesSent;
+    uint8_t chunkSize = (remaining < PACKET_DATA_SIZE) ? remaining : PACKET_DATA_SIZE;
+
+    // Build stream data packet
+    StreamDataPacket *dataPkt = (StreamDataPacket *)radioTxBuffer;
+    dataPkt->type = STREAM_FRAME_TYPE;
+    dataPkt->frameSeq = frameSeq;
+    dataPkt->packetIndex = packetNum;
+    memcpy(dataPkt->data, &streamFrameBuffer[bytesSent], chunkSize);
+
+    // Actual packet size: type(1) + frameSeq(1) + packetIndex(1) + data(chunkSize)
+    uint8_t packetSize = 3 + chunkSize;
+
+    rf23.send(radioTxBuffer, packetSize);
+    rf23.waitPacketSent(50); // Very short timeout
+
+    bytesSent += chunkSize;
+    packetNum++;
+  }
+
+  setRadioAmpReceive();
+}
+
+/**
+ * Handle stream mode - called from main loop when streaming is active
+ * Receives frames from Pi and forwards to GS, checks for stop commands
+ */
+void handleStreamMode()
+{
+  // Check for stop command from GS via radio
+  if (rf23.available())
+  {
+    uint8_t len = sizeof(radioRxBuffer);
+    if (rf23.recv(radioRxBuffer, &len))
+    {
+      // Check for stream stop command
+      if (len >= 2 && (radioRxBuffer[0] == 'v' || radioRxBuffer[0] == 'V') && radioRxBuffer[1] == '0')
+      {
+        stopStreamMode();
+        return;
+      }
+    }
+  }
+
+  // Check for stream frames from Pi
+  uint8_t frameSeq;
+  if (recvStreamFrameFromPi(frameSeq))
+  {
+    // Forward frame to GS via radio
+    sendStreamFrameViaRadio(frameSeq);
+  }
+
+  // Also check for Pi status messages (stream stop, errors)
+  if (Serial2.available() >= 6)
+  {
+    // Peek at data to see if it's a status message (regular UART_MAGIC)
+    // If stream stopped by Pi, it will send STATUS:STREAM_STOP
+    uint16_t rxLen = 0;
+    bool isStatus = false;
+
+    // Use small buffer for status check
+    if (recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus))
+    {
+      if (isStatus)
+      {
+        handleStatusPayload(piStatusBuf, rxLen);
+
+        // Check if Pi stopped streaming
+        String statusStr = "";
+        for (uint16_t i = 7; i < rxLen; i++)
+        {
+          statusStr += (char)piStatusBuf[i];
+        }
+        if (statusStr.indexOf("STREAM_STOP") >= 0 || statusStr.indexOf("STREAM_ERROR") >= 0)
+        {
+          streamModeActive = false;
+          radioPrintln("STREAM: Pi ended stream mode");
+        }
+      }
+    }
+  }
 }
