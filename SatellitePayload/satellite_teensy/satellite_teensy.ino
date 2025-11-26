@@ -571,13 +571,16 @@ void listenForCommands()
         else if (sub == '0')
         {
           digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
+          RPI_IDLE_READY = false;        // Reset idle state
           radioPrintln("RPI POWER: OFF");
         }
         else if (sub == 's' || sub == 'S')
         {
           int state = digitalRead(RPI_ENABLE);
-          radioPrint("RPI POWER STATE: ");
-          radioPrintln(state ? "ON" : "OFF");
+          radioPrint("RPI POWER: ");
+          radioPrint(state ? "ON" : "OFF");
+          radioPrint(" | MODE: ");
+          radioPrintln(RPI_IDLE_READY ? "IDLE" : "NOT READY");
         }
         else
         {
@@ -2336,6 +2339,26 @@ void sendStreamFrameViaRadio(uint8_t frameSeq)
 
   while (bytesSent < STREAM_FRAME_SIZE)
   {
+    // Check for stop command every 20 packets (allows faster response to stop)
+    if (packetNum > 0 && (packetNum % 20) == 0)
+    {
+      setRadioAmpReceive();
+      delay(2); // Brief pause to check for incoming packets
+      if (rf23.available())
+      {
+        uint8_t len = sizeof(radioRxBuffer);
+        if (rf23.recv(radioRxBuffer, &len))
+        {
+          if (len >= 2 && (radioRxBuffer[0] == 'v' || radioRxBuffer[0] == 'V') && radioRxBuffer[1] == '0')
+          {
+            stopStreamMode();
+            return; // Exit immediately
+          }
+        }
+      }
+      setRadioAmpTransmit();
+    }
+
     uint16_t remaining = STREAM_FRAME_SIZE - bytesSent;
     uint8_t chunkSize = (remaining < PACKET_DATA_SIZE) ? remaining : PACKET_DATA_SIZE;
 
@@ -2350,7 +2373,7 @@ void sendStreamFrameViaRadio(uint8_t frameSeq)
     uint8_t packetSize = 3 + chunkSize;
 
     rf23.send(radioTxBuffer, packetSize);
-    rf23.waitPacketSent(50); // Very short timeout
+    rf23.waitPacketSent(50);
 
     bytesSent += chunkSize;
     packetNum++;

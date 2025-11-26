@@ -228,12 +228,12 @@ const String THERMAL_CSV_END = "=== END CSV ===";
 
 // Livestream state
 bool streamModeActive = false;
+uint32_t streamPacketsReceivedTotal = 0;  // Debug: total stream packets received
 uint8_t currentStreamFrameSeq = 0;
 uint8_t streamFrameBuffer[STREAM_FRAME_SIZE];  // Buffer for assembling current frame
 uint8_t streamPacketsReceived[STREAM_PACKETS_PER_FRAME];  // Track which packets received
 uint8_t streamPacketCount = 0;  // Number of packets received for current frame
-const String STREAM_FRAME_START = "=== STREAM_FRAME_START ===";
-const String STREAM_FRAME_END = "=== STREAM_FRAME_END ===";
+// Binary stream protocol uses magic header 0xCAFEBABE and end marker 0xEDED
 
 // Forward declarations
 void parseCommand(const String &input);
@@ -400,6 +400,8 @@ void executeCommand(const char *cmd, const char *args)
 
 void printPrompt()
 {
+  // Don't print prompt during streaming - clutters output
+  if (streamModeActive) return;
   Serial.print("GS> ");
 }
 
@@ -595,9 +597,23 @@ void handlePacket()
 
 void processPacket(uint8_t *buf, uint8_t len)
 {
-  // Check for stream frame packets first (type 0xCC)
-  if (buf[0] == STREAM_FRAME_TYPE && len >= 3)
+  // Check for stream frame packets first (type 0xCC) - ONLY when streaming is active
+  // This prevents 0xCC bytes in thermal data from being misinterpreted as stream packets
+  if (streamModeActive && buf[0] == STREAM_FRAME_TYPE && len >= 3)
   {
+    streamPacketsReceivedTotal++;
+
+    // Debug: print every 100th stream packet received
+    if (streamPacketsReceivedTotal % 100 == 1)
+    {
+      Serial.print("STREAM_DBG: pkt#");
+      Serial.print(streamPacketsReceivedTotal);
+      Serial.print(" len=");
+      Serial.print(len);
+      Serial.print(" cnt=");
+      Serial.println(streamPacketCount);
+    }
+
     // Stream header packet is 6 bytes, data packets are 3+ bytes
     if (len == sizeof(StreamFrameHeaderPacket))
     {
@@ -2270,7 +2286,6 @@ void handleStreamFrameHeader(uint8_t *buf, uint8_t len)
   // Start new frame
   currentStreamFrameSeq = header->frameSeq;
   resetStreamFrame();
-  streamModeActive = true;
 }
 
 /**
@@ -2332,46 +2347,59 @@ void handleStreamFrameData(uint8_t *buf, uint8_t len)
 
 /**
  * Output assembled stream frame to serial for Python CLI to capture
- * Format: special markers with raw binary data in hex
+ * Format: Binary with magic header and checksum for validation
+ *
+ * Protocol:
+ *   [0x57 0x52 0x4D 0x21] - 4 byte magic "WRM!"
+ *   [SEQ]                 - 1 byte frame sequence
+ *   [PKTS]                - 1 byte packet count received
+ *   [CHECKSUM_LO]         - 1 byte checksum low byte
+ *   [CHECKSUM_HI]         - 1 byte checksum high byte
+ *   [4800 bytes]          - raw frame data
+ *
+ * Total: 4 + 1 + 1 + 2 + 4800 = 4808 bytes per frame
  */
 void outputStreamFrame()
 {
-  if (streamPacketCount == 0)
+  // Only output frames with enough packets to be useful (at least 50%)
+  if (streamPacketCount < 50)
   {
-    return; // Nothing to output
+    resetStreamFrame();
+    return;
   }
 
-  // Output frame with markers that Python CLI can detect
-  Serial.println(STREAM_FRAME_START);
-
-  // Output frame sequence and packet stats
-  Serial.print("SEQ:");
-  Serial.print(currentStreamFrameSeq);
-  Serial.print(",PKTS:");
-  Serial.print(streamPacketCount);
-  Serial.print("/");
-  Serial.println(STREAM_PACKETS_PER_FRAME);
-
-  // Output raw frame data as comma-separated decimal values
-  // This is more efficient than hex and easier to parse
-  Serial.print("DATA:");
+  // Compute simple checksum of frame data
+  uint16_t checksum = 0;
   for (uint16_t i = 0; i < STREAM_FRAME_SIZE; i++)
   {
-    Serial.print(streamFrameBuffer[i]);
-    if (i < STREAM_FRAME_SIZE - 1)
-    {
-      Serial.print(",");
-    }
-    // Add newline every 80 bytes to prevent buffer overflow
-    if ((i + 1) % 80 == 0)
-    {
-      Serial.println();
-      Serial.print("DATA:");
-    }
+    checksum += streamFrameBuffer[i];
   }
-  Serial.println();
 
-  Serial.println(STREAM_FRAME_END);
+  // Debug marker (text, so it shows in terminal)
+  Serial.print("FRAME_OUT: seq=");
+  Serial.print(currentStreamFrameSeq);
+  Serial.print(" pkts=");
+  Serial.print(streamPacketCount);
+  Serial.print(" chk=");
+  Serial.println(checksum);
+
+  // Binary magic header "WRM!" - less likely to appear in thermal data
+  const uint8_t magic[4] = {0x57, 0x52, 0x4D, 0x21};
+  Serial.write(magic, 4);
+
+  // Frame metadata
+  Serial.write(currentStreamFrameSeq);
+  Serial.write(streamPacketCount);
+
+  // Checksum (little-endian)
+  Serial.write((uint8_t)(checksum & 0xFF));
+  Serial.write((uint8_t)(checksum >> 8));
+
+  // Raw frame data - 4800 bytes
+  Serial.write(streamFrameBuffer, STREAM_FRAME_SIZE);
+
+  // Flush to ensure data is sent
+  Serial.flush();
 
   // Reset for next frame
   resetStreamFrame();
@@ -2417,9 +2445,23 @@ void cmdStream(const char *args)
     radioTxBuffer[0] = 'v';
     radioTxBuffer[1] = '0';
 
-    if (sendBytesToSatellite(radioTxBuffer, 2))
+    // Send stop command multiple times to ensure delivery
+    // (satellite may be in transmit mode and miss single command)
+    int sendCount = 0;
+    for (int i = 0; i < 5; i++)
     {
-      Serial.println("Stream stop command sent");
+      if (sendBytesToSatellite(radioTxBuffer, 2))
+      {
+        sendCount++;
+      }
+      delay(50); // Small delay between sends
+    }
+
+    if (sendCount > 0)
+    {
+      Serial.print("Stream stop command sent (");
+      Serial.print(sendCount);
+      Serial.println("x)");
       streamModeActive = false;
       rf23.setModeRx();
     }
