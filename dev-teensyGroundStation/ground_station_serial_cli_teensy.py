@@ -447,6 +447,7 @@ def read_serial(ser, stop_event):
     global ThermalCaptureTimestamp
     csv_capture_mode = False
     csv_data = []
+    partial_line_buffer = ""  # Buffer for incomplete lines during CSV capture
 
     # Buffer for handling mixed text/binary data
     raw_buffer = bytearray()
@@ -469,7 +470,7 @@ def read_serial(ser, stop_event):
                         # First, process any text data BEFORE the magic
                         if magic_pos > 0:
                             text_chunk = raw_buffer[:magic_pos]
-                            process_text_data(text_chunk, csv_capture_mode, csv_data)
+                            csv_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, partial_line_buffer)
                             raw_buffer = raw_buffer[magic_pos:]
                             magic_pos = 0
 
@@ -518,12 +519,12 @@ def read_serial(ser, stop_event):
                         if len(raw_buffer) > 3:
                             text_chunk = raw_buffer[:-3]
                             raw_buffer = raw_buffer[-3:]
-                            csv_capture_mode = process_text_data(text_chunk, csv_capture_mode, csv_data)
+                            csv_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, partial_line_buffer)
                         break
             else:
                 # No data waiting - flush any remaining text in buffer
                 if len(raw_buffer) > 0 and raw_buffer.find(STREAM_FRAME_MAGIC) < 0:
-                    csv_capture_mode = process_text_data(raw_buffer, csv_capture_mode, csv_data)
+                    csv_capture_mode, partial_line_buffer = process_text_data(raw_buffer, csv_capture_mode, csv_data, partial_line_buffer)
                     raw_buffer.clear()
                 time.sleep(0.01)
         except Exception as e:
@@ -531,31 +532,38 @@ def read_serial(ser, stop_event):
             break
 
 
-def process_text_data(data_bytes, csv_capture_mode, csv_data):
+def process_text_data(data_bytes, csv_capture_mode, csv_data, partial_line_buffer):
     """Process text data from serial, handling CSV capture and display.
 
-    Returns updated csv_capture_mode state.
+    Returns updated (csv_capture_mode, partial_line_buffer) tuple.
+    partial_line_buffer holds incomplete lines that don't end with newline.
     """
     global ThermalCaptureTimestamp
 
     try:
         text = data_bytes.decode('utf-8', errors='ignore')
     except:
-        return csv_capture_mode
+        return csv_capture_mode, partial_line_buffer
 
-    # Split into lines but preserve partial lines
+    # Prepend any buffered partial line from previous call
+    if partial_line_buffer:
+        text = partial_line_buffer + text
+        partial_line_buffer = ""
+
+    # Split into lines
     lines = text.split('\n')
 
-    for i, line in enumerate(lines):
-        # Add newline back except for last partial line
-        if i < len(lines) - 1:
-            line = line + '\n'
+    # If data doesn't end with newline, last element is a partial line - buffer it
+    if not text.endswith('\n') and len(lines) > 0:
+        partial_line_buffer = lines[-1]
+        lines = lines[:-1]
 
+    for line in lines:
         if not line:
             continue
 
-        # Print text data
-        print(line, end='', flush=True)
+        # Print text data with newline
+        print(line, flush=True)
 
         # Update sensor telemetry cache
         update_sensor_cache(line)
@@ -608,7 +616,7 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data):
         if "Resetting system..." in line:
             print("\nDetected system reset. Press 'Enter' twice to exit.")
 
-    return csv_capture_mode
+    return csv_capture_mode, partial_line_buffer
 
 
 
