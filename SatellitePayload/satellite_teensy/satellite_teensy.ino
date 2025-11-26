@@ -129,6 +129,7 @@ const uint16_t STREAM_FRAME_SIZE = 4800;                                // 80x60
 const uint8_t STREAM_PACKETS_PER_FRAME = (STREAM_FRAME_SIZE + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;  // ~107 packets
 const char STREAM_START_CMD[] = "STREAM_START\n";                       // Command to RPi to start streaming
 const char STREAM_STOP_CMD[] = "STREAM_STOP\n";                         // Command to RPi to stop streaming
+const char FRAME_REQUEST_CMD[] = "FRAME\n";                             // Command to RPi to send one frame
 
 // Stream mode state
 bool streamModeActive = false;
@@ -294,6 +295,8 @@ void handleSensorCommand(uint8_t *buf, uint8_t len);
 void startStreamMode();
 void stopStreamMode();
 void handleStreamMode();
+void requestFrameFromPi();
+bool waitForStreamMagic(uint32_t timeout_ms);
 bool recvStreamFrameFromPi(uint8_t &frameSeq);
 void sendStreamFrameViaRadio(uint8_t frameSeq);
 
@@ -1281,9 +1284,9 @@ void initRadio()
   // GFSK Modem Configurations - Ordered from fastest to slowest
   // Uncomment ONE line to select your desired configuration
 
-  // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
+  rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
-  rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
@@ -2173,58 +2176,130 @@ void stopStreamMode()
 }
 
 /**
+ * Scan UART byte-by-byte looking for STREAM_MAGIC header
+ * This allows recovery from partial data or misalignment
+ *
+ * @param timeout_ms Maximum time to wait for magic header
+ * @return true if stream magic was found
+ */
+bool waitForStreamMagic(uint32_t timeout_ms)
+{
+  uint32_t start = millis();
+  uint8_t matchIndex = 0;
+
+  while (millis() - start < timeout_ms)
+  {
+    if (Serial2.available())
+    {
+      uint8_t b = Serial2.read();
+      if (b == STREAM_MAGIC[matchIndex])
+      {
+        matchIndex++;
+        if (matchIndex == 4)
+        {
+          return true; // Found complete magic header
+        }
+      }
+      else
+      {
+        // Mismatch - check if this byte could be start of new magic
+        matchIndex = (b == STREAM_MAGIC[0]) ? 1 : 0;
+      }
+    }
+    else
+    {
+      delay(1);
+    }
+  }
+  return false; // Timeout
+}
+
+/**
  * Receive one stream frame from Pi via UART
  * Stream frame format: [STREAM_MAGIC 4B][Frame Seq 1B][Size 2B][Data 4800B][End 2B]
+ * Uses byte-by-byte scanning to find magic header (handles misalignment)
  *
  * @param frameSeq Output parameter for frame sequence number
  * @return true if frame received successfully
  */
 bool recvStreamFrameFromPi(uint8_t &frameSeq)
 {
-  // Read header: 4 magic + 1 seq + 2 size = 7 bytes
-  uint8_t header[7];
-  const uint32_t STREAM_HEADER_TIMEOUT_MS = 500; // 500ms timeout for streaming
+  const uint32_t STREAM_HEADER_TIMEOUT_MS = 1000; // 1s timeout for streaming
+  const uint32_t STREAM_DATA_TIMEOUT_MS = 2000;   // 2s for frame data (4800 bytes)
 
-  if (!readExact(Serial2, header, 7, STREAM_HEADER_TIMEOUT_MS))
+  // Don't even try if no data available
+  if (!Serial2.available())
   {
-    return false; // Timeout or error
-  }
-
-  // Validate stream magic
-  if (!isStreamMagic(header))
-  {
-    // Not a stream frame - might be a status message, let normal handling deal with it
     return false;
   }
 
-  frameSeq = header[4];
-  uint16_t frameSize = (uint16_t)header[5] | ((uint16_t)header[6] << 8);
+  // Scan for stream magic byte-by-byte
+  if (!waitForStreamMagic(STREAM_HEADER_TIMEOUT_MS))
+  {
+    return false; // Timeout or no magic found
+  }
+
+  // Magic found, now read rest of header: 1 seq + 2 size = 3 bytes
+  uint8_t headerRest[3];
+  if (!readExact(Serial2, headerRest, 3, STREAM_HEADER_TIMEOUT_MS))
+  {
+    radioPrintln("STREAM: Header rest timeout");
+    return false;
+  }
+
+  frameSeq = headerRest[0];
+  uint16_t frameSize = (uint16_t)headerRest[1] | ((uint16_t)headerRest[2] << 8);
+
+#ifdef DEBUG
+  radioPrint("STREAM: seq=");
+  radioPrint(String(frameSeq));
+  radioPrint(" size=");
+  radioPrintln(String(frameSize));
+#endif
 
   if (frameSize != STREAM_FRAME_SIZE)
   {
     radioPrint("STREAM: Bad frame size ");
-    radioPrintln(String(frameSize));
+    radioPrint(String(frameSize));
+    radioPrint(" (expected ");
+    radioPrint(String(STREAM_FRAME_SIZE));
+    radioPrint(", got bytes 0x");
+    radioPrint(String(headerRest[1], HEX));
+    radioPrint(" 0x");
+    radioPrint(String(headerRest[2], HEX));
+    radioPrintln(")");
+    // Drain remaining data to resync
+    while (Serial2.available()) Serial2.read();
     return false;
   }
 
   // Read frame data
-  if (!readExact(Serial2, streamFrameBuffer, STREAM_FRAME_SIZE, STREAM_HEADER_TIMEOUT_MS))
+  if (!readExact(Serial2, streamFrameBuffer, STREAM_FRAME_SIZE, STREAM_DATA_TIMEOUT_MS))
   {
     radioPrintln("STREAM: Frame data timeout");
+    // Drain buffer to resync
+    while (Serial2.available()) Serial2.read();
     return false;
   }
 
   // Read end markers
   uint8_t ender[2];
-  if (!readExact(Serial2, ender, 2, 100))
+  if (!readExact(Serial2, ender, 2, 500))
   {
     radioPrintln("STREAM: End marker timeout");
+    // Drain buffer to resync
+    while (Serial2.available()) Serial2.read();
     return false;
   }
 
   if (ender[0] != 0xFF || ender[1] != 0xFF)
   {
-    radioPrintln("STREAM: Bad end markers");
+    radioPrint("STREAM: Bad end markers 0x");
+    radioPrint(String(ender[0], HEX));
+    radioPrint(" 0x");
+    radioPrintln(String(ender[1], HEX));
+    // Drain buffer to resync for next frame
+    while (Serial2.available()) Serial2.read();
     return false;
   }
 
@@ -2285,12 +2360,33 @@ void sendStreamFrameViaRadio(uint8_t frameSeq)
 }
 
 /**
+ * Request a single frame from the Raspberry Pi
+ * Sends FRAME command over UART and clears any stale buffer data
+ */
+void requestFrameFromPi()
+{
+  // Clear any stale UART data before requesting
+  while (Serial2.available()) Serial2.read();
+
+  // Send frame request command
+  Serial2.print(FRAME_REQUEST_CMD);
+  Serial2.flush();
+}
+
+/**
  * Handle stream mode - called from main loop when streaming is active
- * Receives frames from Pi and forwards to GS, checks for stop commands
+ * Uses request-response flow control: request frame → receive → transmit → repeat
+ *
+ * Flow:
+ * 1. Request frame from Pi (FRAME command)
+ * 2. Wait for and receive frame with STREAM_MAGIC header
+ * 3. Transmit frame over radio to ground station
+ * 4. Check for stop command from GS
+ * 5. Request next frame
  */
 void handleStreamMode()
 {
-  // Check for stop command from GS via radio
+  // Check for stop command from GS via radio first
   if (rf23.available())
   {
     uint8_t len = sizeof(radioRxBuffer);
@@ -2305,41 +2401,26 @@ void handleStreamMode()
     }
   }
 
-  // Check for stream frames from Pi
+  // Request a frame from Pi
+  requestFrameFromPi();
+
+  // Wait for and receive the frame
   uint8_t frameSeq;
   if (recvStreamFrameFromPi(frameSeq))
   {
-    // Forward frame to GS via radio
+    // Successfully received frame - transmit over radio to GS
     sendStreamFrameViaRadio(frameSeq);
-  }
 
-  // Also check for Pi status messages (stream stop, errors)
-  if (Serial2.available() >= 6)
-  {
-    // Peek at data to see if it's a status message (regular UART_MAGIC)
-    // If stream stopped by Pi, it will send STATUS:STREAM_STOP
-    uint16_t rxLen = 0;
-    bool isStatus = false;
-
-    // Use small buffer for status check
-    if (recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus))
+    // Brief message every 10 frames (frameSeq wraps at 255)
+    if ((frameSeq % 10) == 0)
     {
-      if (isStatus)
-      {
-        handleStatusPayload(piStatusBuf, rxLen);
-
-        // Check if Pi stopped streaming
-        String statusStr = "";
-        for (uint16_t i = 7; i < rxLen; i++)
-        {
-          statusStr += (char)piStatusBuf[i];
-        }
-        if (statusStr.indexOf("STREAM_STOP") >= 0 || statusStr.indexOf("STREAM_ERROR") >= 0)
-        {
-          streamModeActive = false;
-          radioPrintln("STREAM: Pi ended stream mode");
-        }
-      }
+      radioPrint("STREAM: Frame ");
+      radioPrintln(String(frameSeq));
     }
+  }
+  else
+  {
+    // Failed to receive frame - will retry on next loop iteration
+    // The receive function already drains buffer on errors
   }
 }

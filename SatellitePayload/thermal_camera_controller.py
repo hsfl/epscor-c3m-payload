@@ -42,6 +42,7 @@ from uvctypes import *
 import cv2
 from queue import Queue, Empty, Full
 import ctypes
+import threading
 
 # UART Configuration for Teensy communication
 UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
@@ -49,6 +50,7 @@ UART_BAUD = 115200         # High-speed UART to match Teensy baud rate
 TRIGGER_COMMAND = b'TRIGGER\n'  # UART command from Teensy to initiate capture
 STREAM_START_COMMAND = b'STREAM_START\n'  # Command to start livestream mode
 STREAM_STOP_COMMAND = b'STREAM_STOP\n'    # Command to stop livestream mode
+FRAME_REQUEST_COMMAND = b'FRAME\n'        # Command to request a single stream frame
 
 # Livestream protocol constants
 STREAM_MAGIC = bytes([0xCA, 0xFE, 0xBA, 0xBE])  # Magic header for livestream frames
@@ -58,8 +60,14 @@ STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4,800 bytes per 
 
 # Camera Configuration
 MAX_FRAMES = 10           # Number of frames to capture and average
-THERMAL_QUEUE_SIZE = 20     # Size of frame queue for thermal data (2x the avg capture frame needs)
-thermal_queue = Queue(THERMAL_QUEUE_SIZE)  # Queue for thermal frame data
+THERMAL_QUEUE_SIZE = 20   # Size of frame queue for thermal data (2x the avg capture frame needs)
+thermal_queue = Queue(THERMAL_QUEUE_SIZE)  # Queue for thermal frame data (used for averaging)
+
+# Latest frame buffer for streaming (always holds the most recent frame)
+# This avoids queue overhead and ensures we always send the freshest frame
+_latest_frame = None
+_latest_frame_lock = threading.Lock()
+_latest_frame_timestamp = 0
 
 FRAME_CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.POINTER(uvc_frame), ctypes.c_void_p)
 
@@ -76,6 +84,8 @@ class ThermalCamera:
         self.streaming = False
 
     def _frame_callback(self, frame_ptr, userptr):
+        global _latest_frame, _latest_frame_timestamp
+
         if not frame_ptr:
             return
 
@@ -95,6 +105,12 @@ class ThermalCamera:
                 frame.height, frame.width
             ).copy()
 
+            # Update latest frame buffer (for streaming - always the freshest frame)
+            with _latest_frame_lock:
+                _latest_frame = thermal
+                _latest_frame_timestamp = time.time()
+
+            # Also put in queue (for frame averaging in single captures)
             try:
                 thermal_queue.put_nowait(thermal)
             except Full:
@@ -108,7 +124,7 @@ class ThermalCamera:
                     thermal_queue.put_nowait(thermal)
                 except Full:
                     pass
-                
+
         except Exception:
             # Never propagate exceptions across the C callback boundary.
             return
@@ -188,6 +204,36 @@ def is_valid_frame(frame):
     """Skip FFC frames"""
     zero_count = np.sum(frame < 1000)
     return zero_count < (frame.size * 0.8)
+
+
+def get_latest_frame(max_age_s=1.0):
+    """
+    Get the most recent frame from the camera (for streaming).
+
+    This is more efficient than using the queue for streaming because:
+    1. No queue overhead (put/get operations)
+    2. Always returns the freshest frame, not a stale queued one
+    3. Simple lock-based access
+
+    Args:
+        max_age_s: Maximum age of frame in seconds (default 1.0s)
+
+    Returns:
+        numpy array of frame data, or None if no recent frame available
+    """
+    global _latest_frame, _latest_frame_timestamp
+
+    with _latest_frame_lock:
+        if _latest_frame is None:
+            return None
+
+        # Check if frame is too old
+        age = time.time() - _latest_frame_timestamp
+        if age > max_age_s:
+            return None
+
+        # Return a copy to avoid race conditions
+        return _latest_frame.copy()
 
 
 def downsample_frame(frame_16bit):
@@ -478,75 +524,115 @@ def wait_for_uart_trigger(uart_port, timeout=None):
     return result == 'trigger'
 
 
-def run_stream_loop(uart_port, frame_timeout_s=0.5):
+def run_stream_loop(uart_port):
     """
-    Run continuous streaming loop: capture → downsample → send stream frames.
+    Run request-response streaming loop: wait for FRAME request → send latest frame.
 
-    Captures frames from the thermal camera, downsamples them to 80x60 8-bit,
-    and sends via UART using the livestream protocol. Exits when STREAM_STOP
-    is received or on timeout/error.
+    Uses explicit flow control - the Teensy requests each frame when ready.
+    This prevents serial buffer overflow since Pi only sends when Teensy asks.
+
+    Optimized for performance:
+    - Uses latest frame buffer instead of queue (no flushing needed)
+    - Always sends the freshest available frame
+    - Minimal latency between request and response
+
+    Protocol:
+    1. Teensy sends STREAM_START to enter stream mode
+    2. Teensy sends FRAME to request each frame
+    3. Pi grabs latest frame, downsamples, and sends it
+    4. Teensy receives frame, transmits over radio, then requests next
+    5. Teensy sends STREAM_STOP to exit
 
     Args:
         uart_port: Serial port object for UART communication
-        frame_timeout_s: Timeout for capturing each frame
 
     Returns:
         str: Reason for exit ('stop_command', 'timeout', 'error')
     """
-    print("Starting stream mode...")
-    send_status_uart("STREAM_START", uart_port)
+    print("Stream mode: waiting for frame requests from Teensy...")
 
     frame_seq = 0
     frames_sent = 0
     start_time = time.time()
+    rx_buffer = b''  # Buffer for accumulating incoming UART data
 
     try:
         while True:
-            # Check for stop command (non-blocking)
+            # Read any available UART data into buffer
             if uart_port.in_waiting > 0:
-                incoming = uart_port.read(uart_port.in_waiting)
-                if STREAM_STOP_COMMAND in incoming or b'STREAM_STOP' in incoming:
-                    print("Stream stop command received")
-                    send_status_uart("STREAM_STOP", uart_port)
-                    return 'stop_command'
+                rx_buffer += uart_port.read(uart_port.in_waiting)
 
-            # Try to get a frame from the queue
-            try:
-                frame = thermal_queue.get(timeout=frame_timeout_s)
-            except Empty:
-                # No frame available, continue waiting
-                continue
+            # Check for stop command
+            if STREAM_STOP_COMMAND in rx_buffer or b'STREAM_STOP' in rx_buffer:
+                print("Stream stop command received")
+                return 'stop_command'
 
-            # Skip invalid frames (FFC calibration frames)
-            if not is_valid_frame(frame):
-                continue
+            # Check for frame request
+            if FRAME_REQUEST_COMMAND in rx_buffer or b'FRAME' in rx_buffer:
+                # Remove the request from buffer
+                if FRAME_REQUEST_COMMAND in rx_buffer:
+                    rx_buffer = rx_buffer.replace(FRAME_REQUEST_COMMAND, b'', 1)
+                elif b'FRAME\n' in rx_buffer:
+                    rx_buffer = rx_buffer.replace(b'FRAME\n', b'', 1)
+                else:
+                    # Just 'FRAME' without newline
+                    idx = rx_buffer.find(b'FRAME')
+                    rx_buffer = rx_buffer[idx+5:]
 
-            # Downsample to 80x60 8-bit
-            frame_8bit = downsample_frame(frame)
-            if frame_8bit is None:
-                continue
+                # Get the latest frame (much faster than queue - no flushing needed)
+                frame = get_latest_frame(max_age_s=2.0)
 
-            # Send via UART
-            if send_stream_frame_uart(frame_8bit, frame_seq, uart_port):
-                frames_sent += 1
-                frame_seq = (frame_seq + 1) & 0xFF  # Wrap at 255
+                # If no recent frame, wait briefly for one
+                if frame is None:
+                    time.sleep(0.1)  # Brief wait for camera callback
+                    frame = get_latest_frame(max_age_s=2.0)
 
-                # Progress update every 10 frames
-                if frames_sent % 10 == 0:
-                    elapsed = time.time() - start_time
-                    fps = frames_sent / elapsed if elapsed > 0 else 0
-                    print(f"Streaming: {frames_sent} frames, {fps:.1f} fps")
+                if frame is None:
+                    print("No frame available from camera")
+                    continue
+
+                # Skip invalid frames (FFC calibration)
+                if not is_valid_frame(frame):
+                    # Wait for next frame
+                    time.sleep(0.15)
+                    frame = get_latest_frame(max_age_s=2.0)
+                    if frame is None or not is_valid_frame(frame):
+                        continue
+
+                # Downsample to 80x60 8-bit
+                frame_8bit = downsample_frame(frame)
+                if frame_8bit is None:
+                    print("Downsample failed")
+                    continue
+
+                # Send the frame
+                if send_stream_frame_uart(frame_8bit, frame_seq, uart_port):
+                    frames_sent += 1
+                    frame_seq = (frame_seq + 1) & 0xFF
+
+                    # Progress update every 10 frames
+                    if frames_sent % 10 == 0:
+                        elapsed = time.time() - start_time
+                        fps = frames_sent / elapsed if elapsed > 0 else 0
+                        print(f"Streaming: {frames_sent} frames, {fps:.1f} fps")
+                else:
+                    print("Failed to send stream frame")
             else:
-                print("Failed to send stream frame")
+                # No request yet, brief sleep to avoid busy-waiting
+                time.sleep(0.01)
+
+            # Keep buffer from growing too large (trim old data)
+            if len(rx_buffer) > 256:
+                rx_buffer = rx_buffer[-128:]
 
     except KeyboardInterrupt:
         print("Stream interrupted by user")
-        send_status_uart("STREAM_STOP", uart_port)
         return 'interrupted'
 
     except Exception as e:
         print(f"Stream error: {e}")
-        send_status_uart("STREAM_ERROR", uart_port)
+        import traceback
+        traceback.print_exc()
         return 'error'
 
 def main():
