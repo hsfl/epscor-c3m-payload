@@ -226,9 +226,26 @@ epscor-c3m-payload/
 
 ### Manual Thermal Data Visualization
 
+The thermal data viewer allows you to visualize any saved thermal CSV file:
+
 ```bash
+# Navigate to ground station directory
+cd dev-teensyGroundStation
+
+# View a specific thermal data file
 python thermal_data_viewer.py thermal_data_001.csv
+
+# Or use any other numbered CSV file
+python thermal_data_viewer.py thermal_data_042.csv
 ```
+
+**How it works:**
+- The viewer reads CSV files containing 120×160 pixel thermal data
+- Displays a color-mapped visualization using matplotlib
+- Shows temperature distribution across the thermal image
+- Files are auto-numbered incrementally (001, 002, 003, etc.)
+
+**Note:** The `export` command in the ground station CLI automatically runs the viewer, but you can use this for reviewing previously captured data.
 
 ### Check Reception Statistics
 
