@@ -25,8 +25,8 @@
  * - Radio: Transmits packetized data with header/data/end packets
  *
  * @author EPSCOR C3M Team
- * @date 2025-10-14
- * @version 1.0.0
+ * @date 2025-12-08
+ * @version 2.0.0
  */
 
 // Simplified Transmitter with UART (Essential Functions Only)

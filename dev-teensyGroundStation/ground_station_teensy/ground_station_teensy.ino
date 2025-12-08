@@ -10,8 +10,8 @@
  * - Extensible command structure
  * - Version management
  *
- * Version: 1.0.0
- * Build Date: 2025-10-14
+ * Version: 2.0.0
+ * Build Date: 2025-12-08
  * Author: Artemis CubeSat Team
  */
 
@@ -29,11 +29,11 @@
 #include <RHHardwareSPI1.h>
 
 // Version information
-#define VERSION_MAJOR 1
+#define VERSION_MAJOR 2
 #define VERSION_MINOR 0
 #define VERSION_PATCH 0
-#define VERSION_BUILD "2025-10-14"
-#define VERSION_STRING "1.0.0"
+#define VERSION_BUILD "2025-12-08"
+#define VERSION_STRING "2.0.0"
 #define BUILD_INFO "Arduino Teensy 4.1 Ground Station Command Interpreter"
 
 // Packed struct attribute for ensuring no padding bytes

@@ -27,12 +27,12 @@ Communication Protocol:
 - End: Magic bytes (0xFF 0xFF)
 
 @author EPSCOR C3M Team
-@date 2025-10-14
-@version 1.0.0
+@date 2025-12-08
+@version 2.0.0
 """
 
-__version__ = "1.1.0"
-__build_date__ = "2025-11-25"
+__version__ = "2.0.0"
+__build_date__ = "2025-12-08"
 
 import numpy as np
 import time
