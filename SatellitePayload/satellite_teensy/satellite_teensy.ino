@@ -1369,68 +1369,165 @@ void loop()
 #ifdef DEBUG
   if (Serial.available())
   {
-    char cmd = Serial.read();
+    static String serialLine = "";
+
     while (Serial.available())
-      Serial.read(); // Clear input buffer
-
-    radioPrint("Command: ");
-    radioPrintln(String(cmd));
-
-    switch (cmd)
     {
-    case 'z':
-    case 'Z':
-      radioPrintln("command Z pong from satellite"); // reply back to GS
-      break;
-    case 'u':
-    case 'U':
-      captureThermalImageUART();
-      break;
-    case 'r':
-    case 'R':
-      sendThermalDataViaRadio();
-      break;
-    case 't':
-    case 'T':
-      checkTemperatureSensors();
-      break;
-    case 'c':
-    case 'C':
-      checkCurrentSensors();
-      break;
-    case 'd':
-    case 'D':
-      dumpRf23PendingPackets();
-      break;
-    case 'g':
-      radioPrintln("========== GPS DATA ==========");
-      printGPSData();
-      radioPrintln("==============================");
-      break;
-    case 'i':
-      radioPrintln("========== IMU DATA ==========");
-      printIMUData();
-      radioPrintln("==============================");
-      break;
-    case 'b':
-    case 'B':
-      radioPrintln("========== SENSOR DATA ==========");
-      printGPSData();
-      radioPrintln("");
-      printIMUData();
-      radioPrintln("=================================");
-      break;
-    case 'G':
-      initGPS();
-      break;
-    case 'I':
-      initIMU();
-      break;
-    case '~':
-      SCB_AIRCR = 0x05FA0004;
-      break;
-    default:
-      radioPrintln("Unknown command. Use 'z','u','r','t','c','d','g','i','b','G','I','~'");
+      char c = Serial.read();
+      if (c == '\n' || c == '\r')
+      {
+        serialLine.trim();
+        if (serialLine.length() == 0)
+          continue;
+
+        radioPrint("command: ");
+        radioPrintln(serialLine);
+
+        // Build a 2-byte buffer matching the radio packet format so handlers
+        // can be called with the same interface as listenForCommands().
+        uint8_t buf[2] = {0, 0};
+        buf[0] = (uint8_t)serialLine[0];
+        uint8_t len = 1;
+        if (serialLine.length() >= 2)
+        {
+          buf[1] = (uint8_t)serialLine[1];
+          len = 2;
+        }
+
+        char cmd = (char)buf[0];
+
+        switch (cmd)
+        {
+        case 'u':
+        case 'U':
+          captureThermalImageUART();
+          break;
+
+        case 'r':
+        case 'R':
+          sendThermalDataViaRadio();
+          break;
+
+        case 'p':
+        case 'P':
+          if (len >= 2)
+          {
+            switch ((char)buf[1])
+            {
+            case '1':
+              digitalWrite(RPI_ENABLE, HIGH);
+              radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
+              break;
+            case '0':
+              digitalWrite(RPI_ENABLE, LOW);
+              RPI_IDLE_READY = false;
+              radioPrintln("RPI POWER: OFF");
+              break;
+            case 's':
+            case 'S':
+            {
+              int state = digitalRead(RPI_ENABLE);
+              radioPrint("RPI POWER: ");
+              radioPrint(state ? "ON" : "OFF");
+              radioPrint(" | MODE: ");
+              radioPrintln(RPI_IDLE_READY ? "IDLE" : "NOT READY");
+              break;
+            }
+            default:
+              radioPrintln("RPI POWER: Unknown subcommand. Use: p1 / p0 / ps");
+              break;
+            }
+          }
+          else
+          {
+            radioPrintln("RPI POWER: missing arg. Use: p1 / p0 / ps");
+          }
+          break;
+
+        case 's':
+        case 'S':
+          handleSensorCommand(buf, len);
+          break;
+
+        case 'v':
+        case 'V':
+          if (len >= 2)
+          {
+            switch ((char)buf[1])
+            {
+            case '1':
+              startStreamMode();
+              break;
+            case '0':
+              stopStreamMode();
+              break;
+            default:
+              radioPrintln("STREAM: Unknown subcommand. Use: v1 / v0");
+              break;
+            }
+          }
+          else
+          {
+            radioPrintln("STREAM: missing arg. Use: v1 / v0");
+          }
+          break;
+
+        case 'g':
+          radioPrintln("pong from satellite");
+          break;
+
+        case 't':
+        case 'T':
+          checkTemperatureSensors();
+          break;
+
+        case 'c':
+        case 'C':
+          checkCurrentSensors();
+          break;
+
+        case 'd':
+        case 'D':
+          dumpRf23PendingPackets();
+          break;
+
+        case '~':
+          SCB_AIRCR = 0x05FA0004;
+          break;
+
+        default:
+          radioPrintln("Unknown command.");
+          radioPrintln("GS cmds : u / r / p1 / p0 / ps / sg / si / sb / sG / sI / v1 / v0 / g / ~");
+          radioPrintln("DBG only: t / c / d");
+
+          Serial.println("  u       - Capture thermal image (UART trigger to RPi)");
+          Serial.println("  r       - Transmit captured thermal data via radio");
+          Serial.println("  p1      - RPI power ON");
+          Serial.println("  p0      - RPI power OFF");
+          Serial.println("  ps      - RPI power status");
+          Serial.println("  sg      - Request GPS data");
+          Serial.println("  si      - Request IMU data");
+          Serial.println("  sb      - Request GPS + IMU data");
+          Serial.println("  sG      - Reinitialize GPS");
+          Serial.println("  sI      - Reinitialize IMU");
+          Serial.println("  v1      - Start livestream mode");
+          Serial.println("  v0      - Stop livestream mode");
+          Serial.println("  g       - Ping (pong reply)");
+          Serial.println("  ~       - Software reset");
+          Serial.println("  t       - [DBG] Read temperature sensors");
+          Serial.println("  c       - [DBG] Read current sensors");
+          Serial.println("  d       - [DBG] Dump pending RF23 packets");
+          break;
+        }
+
+        serialLine = "";
+      }
+      else
+      {
+        serialLine += c;
+        if (serialLine.length() > 16)
+          serialLine = serialLine.substring(serialLine.length() - 16);
+      }
     }
   }
 #endif
