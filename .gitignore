@@ -1,5 +1,11 @@
+# misc
 dev-teensyGroundStation/.DS_Store
 .vscode/
 .vscode/extensions.json
 
+# python
+__pycache__
+.venv
+
+# data
 thermal_data_*.csv
