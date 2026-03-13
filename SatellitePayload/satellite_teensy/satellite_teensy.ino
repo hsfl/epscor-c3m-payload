@@ -1309,35 +1309,35 @@ void setRadioAmpTransmit()
 {
   /**
    * Transmit burst: TXON low, RXON high PER THE DATASHEET.
-   * Receive window: RXON high, TXON low.
-   * Idle/standby: both low (saves current, keeps switch centered).
    */
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+  // rf23.setModeTx(); // Put radio in transmit mode (set registers accordingly)
   delayMicroseconds(300); // ensure the amp is settled before transmitting
 }
+
 void setRadioAmpReceive()
 {
   /**
-   * Transmit burst: TXON low, RXON high PER THE DATASHEET.
    * Receive window: RXON low, TXON high.
-   * Idle/standby: both low (saves current, keeps switch centered).
    */
   digitalWrite(RADIO_RX_ON_PIN, LOW);
   digitalWrite(RADIO_TX_ON_PIN, HIGH);
+  // rf23.setModeRx(); 
   delayMicroseconds(300); // ensure the amp is settled before receiving
 }
+
 void setRadioAmpIdle()
 {
   /**
    * NOTE Shouldn't need to use this for the drone test but will
    * be useful later on for satellite deployment to conserve battery.
-   * Transmit burst: TXON high, RXON low.
-   * Receive window: RXON high, TXON low.
    * Idle/standby: both low (saves current, keeps switch centered).
    */
   digitalWrite(RADIO_RX_ON_PIN, LOW);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+  // rf23.setModeIdle();
+  delayMicroseconds(300); // ensure the amp is settled before next operation
 }
 
 /**
