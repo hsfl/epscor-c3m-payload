@@ -376,13 +376,13 @@ def save_testcomms_results(tc_state):
                 f.write(f"# link_rtt_ms,{rtt}\n")
 
             # Header row
-            f.write("cycle,throughput_bps,goodput_bps,integrity_first_pct,integrity_final_pct,recovery_rate_pct,avg_rssi_dbm,rssi_samples,packets_received,packets_expected,crc_ok\n")
+            f.write("cycle,throughput_Bps,goodput_Bps,integrity_first_pct,integrity_final_pct,recovery_rate_pct,avg_rssi_dbm,rssi_samples,packets_received,packets_expected,crc_ok\n")
 
             for cyc in tc_state["cycles"]:
                 f.write(",".join([
                     str(cyc.get("cycle", "")),
-                    str(cyc.get("throughput_bps", "")),
-                    str(cyc.get("goodput_bps", "")),
+                    str(cyc.get("throughput_Bps", "")),
+                    str(cyc.get("goodput_Bps", "")),
                     str(cyc.get("integrity_first_pct", "")),
                     str(cyc.get("integrity_pct", "")),
                     str(cyc.get("recovery_rate_pct", "")),
@@ -397,8 +397,8 @@ def save_testcomms_results(tc_state):
             s = tc_state["summary"]
             f.write(",".join([
                 "AVERAGE",
-                str(s.get("avg_throughput_bps", "")),
-                str(s.get("avg_goodput_bps", "")),
+                str(s.get("avg_throughput_Bps", "")),
+                str(s.get("avg_goodput_Bps", "")),
                 str(s.get("avg_integrity_first_pct", "")),
                 str(s.get("avg_integrity_final_pct", "")),
                 str(s.get("avg_recovery_rate_pct", "")),
@@ -451,11 +451,11 @@ def _parse_testcomms_line(line):
     if _tc["current"] is not None and not _tc["in_summary"]:
         m = re.search(r"Throughput\s*:\s*([\d.]+)", stripped)
         if m:
-            _tc["current"]["throughput_bps"] = float(m.group(1))
+            _tc["current"]["throughput_Bps"] = float(m.group(1))
             return
         m = re.search(r"Goodput\s*:\s*([\d.]+)", stripped)
         if m:
-            _tc["current"]["goodput_bps"] = float(m.group(1))
+            _tc["current"]["goodput_Bps"] = float(m.group(1))
             return
         # With retries: "X% first-pass → Y% after retry (A→B/C pkts, CRC OK)"
         m = re.search(r"Integrity\s*:\s*([\d.]+)%\s*first-pass\s*→\s*([\d.]+)%\s*after retry\s*\((\d+)→(\d+)/(\d+)\s*pkts,\s*CRC\s*(\w+)", stripped)
@@ -502,11 +502,11 @@ def _parse_testcomms_line(line):
             return
         m = re.search(r"Avg Throughput\s*:\s*([\d.]+)", stripped)
         if m:
-            _tc["summary"]["avg_throughput_bps"] = float(m.group(1))
+            _tc["summary"]["avg_throughput_Bps"] = float(m.group(1))
             return
         m = re.search(r"Avg Goodput\s*:\s*([\d.]+)", stripped)
         if m:
-            _tc["summary"]["avg_goodput_bps"] = float(m.group(1))
+            _tc["summary"]["avg_goodput_Bps"] = float(m.group(1))
             return
         m = re.search(r"Avg Integrity \(1st\)\s*:\s*([\d.]+)", stripped)
         if m:
