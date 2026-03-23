@@ -1,7 +1,7 @@
 # misc
-dev-teensyGroundStation/.DS_Store
 .vscode/
 .vscode/extensions.json
+.DS_Store
 
 # python
 __pycache__
@@ -9,3 +9,4 @@ __pycache__
 
 # data
 thermal_data_*.csv
+testcomms_results_*.csv
