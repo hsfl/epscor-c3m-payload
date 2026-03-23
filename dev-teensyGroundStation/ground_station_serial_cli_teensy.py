@@ -34,6 +34,22 @@ THERMAL_CSV_END = "=== END CSV ==="
 THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---"
 ThermalCaptureTimestamp = datetime.now()
 
+# Testcomms result detection constants
+TESTCOMMS_START_MARKER   = "=== Test Comms:"
+TESTCOMMS_SUMMARY_MARKER = "=== TEST COMMS RESULTS ==="
+TESTCOMMS_RTT_MARKER     = "Link RTT"        # Last line of summary — triggers CSV save
+
+# Testcomms parsing state (reset each run)
+_tc = {
+    "active":        False,   # True while a testcomms run is in progress
+    "run_start":     None,    # datetime when run started
+    "num_cycles":    0,       # N from "=== Test Comms: N cycle(s) ==="
+    "cycles":        [],      # list of per-cycle dicts
+    "current":       None,    # dict being filled for the active cycle
+    "in_summary":    False,   # True after TESTCOMMS_SUMMARY_MARKER
+    "summary":       {},      # final averaged values
+}
+
 # Livestream protocol constants (binary protocol)
 STREAM_FRAME_MAGIC = b'WRM!'  # 4-byte magic header "WRM!" = 0x57 0x52 0x4D 0x21
 STREAM_FRAME_WIDTH = 80
@@ -342,6 +358,181 @@ def get_next_thermal_filename():
     next_num = max_num + 1
     return f"thermal_data_{next_num:03d}.csv"
 
+def get_testcomms_filename():
+    """Return a testcomms CSV filename stamped with the current date and time."""
+    return datetime.now().strftime("testcomms_results_%Y%m%d_%H%M%S.csv")
+
+
+def save_testcomms_results(tc_state):
+    """Write testcomms run data to a CSV file."""
+    filename = get_testcomms_filename()
+    try:
+        with open(filename, 'w') as f:
+            run_start = tc_state["run_start"].isoformat(timespec="seconds") if tc_state["run_start"] else "unknown"
+            f.write(f"# testcomms run started {run_start}\n")
+            f.write(f"# requested_cycles,{tc_state['num_cycles']}\n")
+            rtt = tc_state["summary"].get("rtt_ms", "")
+            if rtt:
+                f.write(f"# link_rtt_ms,{rtt}\n")
+
+            # Header row
+            f.write("cycle,throughput_bps,goodput_bps,integrity_first_pct,integrity_final_pct,recovery_rate_pct,avg_rssi_dbm,rssi_samples,packets_received,packets_expected,crc_ok\n")
+
+            for cyc in tc_state["cycles"]:
+                f.write(",".join([
+                    str(cyc.get("cycle", "")),
+                    str(cyc.get("throughput_bps", "")),
+                    str(cyc.get("goodput_bps", "")),
+                    str(cyc.get("integrity_first_pct", "")),
+                    str(cyc.get("integrity_pct", "")),
+                    str(cyc.get("recovery_rate_pct", "")),
+                    str(cyc.get("avg_rssi_dbm", "")),
+                    str(cyc.get("rssi_samples", "")),
+                    str(cyc.get("packets_received", "")),
+                    str(cyc.get("packets_expected", "")),
+                    str(cyc.get("crc_ok", "")),
+                ]) + "\n")
+
+            # Averages row
+            s = tc_state["summary"]
+            f.write(",".join([
+                "AVERAGE",
+                str(s.get("avg_throughput_bps", "")),
+                str(s.get("avg_goodput_bps", "")),
+                str(s.get("avg_integrity_first_pct", "")),
+                str(s.get("avg_integrity_final_pct", "")),
+                str(s.get("avg_recovery_rate_pct", "")),
+                str(s.get("avg_rssi_dbm", "")),
+                "",
+                str(s.get("cycles_completed", "")),
+                str(tc_state["num_cycles"]),
+                "",
+            ]) + "\n")
+
+        print(f"\nTestcomms results saved to: {filename}")
+        return filename
+    except Exception as e:
+        print(f"\nError saving testcomms results: {e}")
+        return None
+
+
+def _parse_testcomms_line(line):
+    """Update testcomms parse state from a single serial line."""
+    stripped = line.strip()
+
+    # Start of a new run
+    if TESTCOMMS_START_MARKER in stripped:
+        _tc["active"]     = True
+        _tc["run_start"]  = datetime.now()
+        _tc["cycles"]     = []
+        _tc["current"]    = None
+        _tc["in_summary"] = False
+        _tc["summary"]    = {}
+        try:
+            m_cycles = re.search(r"(\d+)\s+cycle", stripped)
+            _tc["num_cycles"] = int(m_cycles.group(1)) if m_cycles else 0
+        except (AttributeError, ValueError):
+            _tc["num_cycles"] = 0
+        return
+
+    if not _tc["active"]:
+        return
+
+    # New cycle heading  "--- Cycle N / M"
+    m = re.match(r"---\s+Cycle\s+(\d+)\s*/\s*(\d+)", stripped)
+    if m:
+        if _tc["current"] is not None:
+            _tc["cycles"].append(_tc["current"])
+        _tc["current"] = {"cycle": int(m.group(1))}
+        _tc["in_summary"] = False
+        return
+
+    # Per-cycle metric lines
+    if _tc["current"] is not None and not _tc["in_summary"]:
+        m = re.search(r"Throughput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["current"]["throughput_bps"] = float(m.group(1))
+            return
+        m = re.search(r"Goodput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["current"]["goodput_bps"] = float(m.group(1))
+            return
+        # With retries: "X% first-pass → Y% after retry (A→B/C pkts, CRC OK)"
+        m = re.search(r"Integrity\s*:\s*([\d.]+)%\s*first-pass\s*→\s*([\d.]+)%\s*after retry\s*\((\d+)→(\d+)/(\d+)\s*pkts,\s*CRC\s*(\w+)", stripped)
+        if m:
+            _tc["current"]["integrity_first_pct"] = float(m.group(1))
+            _tc["current"]["integrity_pct"]        = float(m.group(2))
+            _tc["current"]["packets_received"]     = int(m.group(4))
+            _tc["current"]["packets_expected"]     = int(m.group(5))
+            _tc["current"]["crc_ok"]               = m.group(6).upper() == "OK"
+            return
+        # No retries: "X% (A/B pkts, CRC OK)"
+        m = re.search(r"Integrity\s*:\s*([\d.]+)%\s*\((\d+)/(\d+)\s*pkts,\s*CRC\s*(\w+)", stripped)
+        if m:
+            _tc["current"]["integrity_first_pct"] = float(m.group(1))
+            _tc["current"]["integrity_pct"]        = float(m.group(1))
+            _tc["current"]["packets_received"]     = int(m.group(2))
+            _tc["current"]["packets_expected"]     = int(m.group(3))
+            _tc["current"]["crc_ok"]               = m.group(4).upper() == "OK"
+            return
+        m = re.search(r"Recovery\s*:\s*([\d.]+)%\s*\((\d+)/(\d+)\s*lost", stripped)
+        if m:
+            _tc["current"]["recovery_rate_pct"]    = float(m.group(1))
+            _tc["current"]["packets_recovered"]    = int(m.group(2))
+            _tc["current"]["packets_lost_initial"] = int(m.group(3))
+            return
+        m = re.search(r"Avg RSSI\s*:\s*([-\d.]+)\s*dBm.*\((\d+)\s*sample", stripped)
+        if m:
+            _tc["current"]["avg_rssi_dbm"] = float(m.group(1))
+            _tc["current"]["rssi_samples"] = int(m.group(2))
+            return
+
+    # Summary section
+    if TESTCOMMS_SUMMARY_MARKER in stripped:
+        if _tc["current"] is not None:
+            _tc["cycles"].append(_tc["current"])
+            _tc["current"] = None
+        _tc["in_summary"] = True
+        return
+
+    if _tc["in_summary"]:
+        m = re.search(r"Cycles completed\s*:\s*(\d+)", stripped)
+        if m:
+            _tc["summary"]["cycles_completed"] = int(m.group(1))
+            return
+        m = re.search(r"Avg Throughput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_throughput_bps"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Goodput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_goodput_bps"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Integrity \(1st\)\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_integrity_first_pct"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Integrity \(final\)\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_integrity_final_pct"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Recovery Rate\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_recovery_rate_pct"] = float(m.group(1))
+            return
+        m = re.search(r"Avg RSSI\s*:\s*([-\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_rssi_dbm"] = float(m.group(1))
+            return
+        m = re.search(r"Link RTT\s*:\s*(\d+)", stripped)
+        if m:
+            _tc["summary"]["rtt_ms"] = int(m.group(1))
+            # RTT is the last summary line — save results now
+            _tc["active"] = False
+            save_testcomms_results(_tc)
+            return
+
+
 def save_thermal_data(csv_data, filename):
     """Save CSV data to file"""
     try:
@@ -567,6 +758,9 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, partial_line_buffe
 
         # Update sensor telemetry cache
         update_sensor_cache(line)
+
+        # Parse testcomms results
+        _parse_testcomms_line(line)
 
         # Check for thermal data capture timestamp
         if THERMAL_CAPTURE_TIMESTAMP_FLAG in line:

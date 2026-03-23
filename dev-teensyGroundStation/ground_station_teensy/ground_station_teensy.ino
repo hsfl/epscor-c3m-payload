@@ -84,8 +84,24 @@ uint16_t maxPacketNum = 0; // Highest packet number received
 unsigned long packetsReceived = 0;             // Total packets received (including duplicates)
 unsigned long lastPacketTime = 0;              // Timestamp of last packet reception
 int lastRSSI = 0;                              // Signal strength of last received packet
+long rssiAccum = 0;                            // Running sum of RSSI samples (for average)
+uint32_t rssiCount = 0;                        // Number of RSSI samples accumulated
 unsigned long thermalDataDownloadDuration = 0; // Track total time from request to completion
 unsigned long thermalDataTransferDuration = 0; // Track pure data transfer time (first packet to last packet)
+unsigned long lastCycleDownloadDuration = 0;   // Preserved after showReceptionSummary resets — read by testcomms
+unsigned long lastCycleTransferDuration = 0;   // Preserved after showReceptionSummary resets — read by testcomms
+unsigned long lastCycleActiveRadioTime = 0;    // Transfer duration minus grace periods — accurate denominator for throughput/goodput
+uint16_t lastCycleInitialPackets = 0;          // Packets received before first retry — for pre-retry integrity
+uint16_t lastCycleTotalRetryPackets = 0;       // Total retry packets sent by satellite across all retry rounds
+bool captureCompleteFlag = false;              // Set when satellite reports RPI STATUS: CAPTURE_DONE (image received, data ready)
+
+// Per-cycle retry accounting (reset each cycle)
+uint16_t initialReceivedPackets = 0;           // Snapshot of receivedPackets when first end packet triggers retry
+uint16_t totalRetryPacketsSent = 0;            // Accumulated retry packets satellite sent (from retry end packets)
+unsigned long totalGracePeriodMs = 0;          // Grace period time excluded from active radio time
+unsigned long graceStartTime = 0;              // When the current grace period began
+bool retryOccurred = false;                    // True if at least one retry round was triggered this cycle
+bool cycleStatsReady = false;                  // True after showReceptionSummary() has been called this cycle
 
 // Auto mode flag for continuous reception
 bool autoMode = false;
@@ -226,6 +242,7 @@ const String THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---";
 const String THERMAL_CSV_START = "=== START CSV ===";
 const String THERMAL_CSV_END = "=== END CSV ===";
 
+
 // Livestream state
 bool streamModeActive = false;
 uint32_t streamPacketsReceivedTotal = 0;  // Debug: total stream packets received
@@ -293,6 +310,7 @@ void cmdCapture(const char *args);
 void cmdRequest(const char *args);
 void cmdRadioStatus(const char *args);
 void cmdSensor(const char *args);
+void cmdTestComms(const char *args);
 
 // Command table - easily extensible
 const Command commands[] = {
@@ -318,7 +336,8 @@ const Command commands[] = {
     {"request", "Request thermal data downlink from satellite", cmdRequest},
     {"rstatus", "Show radio reception status", cmdRadioStatus},
     {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor},
-    {"stream", "Control livestream mode (stream <start|stop>)", cmdStream}};
+    {"stream", "Control livestream mode (stream <start|stop>)", cmdStream},
+    {"testcomms", "Run N capture→request→export cycles and report avg throughput/goodput/integrity (testcomms <N>)", cmdTestComms}};
 
 const int numCommands = sizeof(commands) / sizeof(commands[0]);
 
@@ -481,6 +500,7 @@ void setRadioAmpTransmit()
   // Serial.print("RX_ON: HIGH");
   digitalWrite(RADIO_TX_ON_PIN, LOW);
   // Serial.println("   | TX_ON: LOW");
+  // rf23.setModeTx();
   delayMicroseconds(300); // ensure the amp is settled before transmitting
   // Serial.println("RADIO AMP SET TO TRANSMIT");
 }
@@ -496,6 +516,7 @@ void setRadioAmpReceive()
   // Serial.print("RX_ON: LOW");
   digitalWrite(RADIO_TX_ON_PIN, HIGH);
   // Serial.println("   | TX_ON: HIGH");
+  // rf23.setModeRx();
   delayMicroseconds(300); // ensure the amp is settled before receiving
   // Serial.println("RADIO AMP SET TO RX");
 }
@@ -510,7 +531,10 @@ void setRadioAmpIdle()
    */
   digitalWrite(RADIO_RX_ON_PIN, LOW);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+  // rf23.setModeIdle();
+  // delayMicroseconds(300); // ensure the amp is settled before next action
 }
+
 // Radio function implementations
 void initRadio()
 {
@@ -524,9 +548,9 @@ void initRadio()
    * Receive window: RXON high, TXON low.
    * Idle/standby: both low (saves current, keeps switch centered).
    */
-  // default to listening
-  digitalWrite(RADIO_RX_ON_PIN, HIGH);
-  digitalWrite(RADIO_TX_ON_PIN, LOW);
+  // default to Rx
+  digitalWrite(RADIO_RX_ON_PIN, LOW);
+  digitalWrite(RADIO_TX_ON_PIN, HIGH);
   delayMicroseconds(500);
 
   // Configure SPI1 interface for radio communication
@@ -590,6 +614,14 @@ void clearReception()
   waitingForRetry = false;
   lastRetryRequestTime = 0;
   retryAttemptCount = 0;
+
+  // Reset per-cycle retry accounting
+  initialReceivedPackets = 0;
+  totalRetryPacketsSent = 0;
+  totalGracePeriodMs = 0;
+  graceStartTime = 0;
+  retryOccurred = false;
+  cycleStatsReady = false;
 }
 
 void handlePacket()
@@ -600,6 +632,8 @@ void handlePacket()
     digitalWrite(LED_PIN, HIGH); // Turn on LED to indicate packet reception
     lastPacketTime = millis();
     lastRSSI = rf23.lastRssi(); // Store signal strength
+    rssiAccum += lastRSSI;
+    rssiCount++;
     packetsReceived++;
     processPacket(radioRxBuffer, len); // Process the received packet
     digitalWrite(LED_PIN, LOW);        // Turn off LED
@@ -718,6 +752,10 @@ void handleThermalHeaderPacket(uint8_t *buf)
 
 void handleThermalEndPacket(uint8_t *buf)
 {
+  // Ignore stale end packets that arrive after reception is already complete
+  if (imageComplete)
+    return;
+
   // Parse end packet
   ThermalEndPacket *endPacket = (ThermalEndPacket *)buf;
 
@@ -729,6 +767,7 @@ void handleThermalEndPacket(uint8_t *buf)
   // If we're in retry mode, interpret packetCount as number of retry packets sent
   if (waitingForRetry)
   {
+    totalRetryPacketsSent += pktCount; // accumulate across all retry rounds
     Serial.print("Satellite resent ");
     Serial.print(pktCount);
     Serial.println(" retry packets");
@@ -821,9 +860,12 @@ void handleThermalEndPacket(uint8_t *buf)
 
     imageComplete = false;
     waitingForRetry = true;
+    retryOccurred = true;
     endPacketReceivedTime = millis();
     lastRetryRequestTime = millis();
     retryAttemptCount = 0; // Will be incremented when first retry is sent
+    initialReceivedPackets = receivedPackets; // snapshot pre-retry count for integrity reporting
+    graceStartTime = millis();               // start tracking grace period dead time
     Serial.print("Waiting ");
     Serial.print(RETRY_GRACE_PERIOD_MS / 1000);
     Serial.println(" seconds for any in-flight packets before requesting retries...");
@@ -1095,6 +1137,13 @@ bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut)
 
   Serial.print(message);
 
+  // Detect satellite capture completion for testcomms
+  // this is a bit lazy but its the simplest way to know when the satellite has finished its capture and is ready for the GS to send the request command during testcomms. The satellite will print "RPI STATUS: IDLE" when it has completed capture and is waiting for the next command, so we can just look for that message in the serial output.
+  // note that this message is also printed after the rpi is done booting, but since we reset this flag at the start of each testcomms cycle, it should be fine.
+  if (message.indexOf("RPI STATUS: IDLE") >= 0) {
+    captureCompleteFlag = true;
+  }
+
   if (!hasMore)
   {
     if (message.length() == 0)
@@ -1138,6 +1187,7 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 
 void showReceptionSummary()
 {
+  cycleStatsReady = true;
   Serial.println("\n=== RECEPTION SUMMARY ===");
   Serial.print("Received ");
   Serial.print(receivedPackets);
@@ -1218,6 +1268,20 @@ void showReceptionSummary()
   // Serial.println(expectedLength);
   Serial.print("Last RSSI: ");
   Serial.println(lastRSSI);
+
+  // Preserve durations and retry stats for testcomms before resetting
+  lastCycleDownloadDuration   = thermalDataDownloadDuration;
+  lastCycleTransferDuration   = thermalDataTransferDuration;
+  lastCycleActiveRadioTime    = (thermalDataTransferDuration > totalGracePeriodMs)
+                                    ? thermalDataTransferDuration - totalGracePeriodMs
+                                    : thermalDataTransferDuration;
+  // Use retryOccurred flag — don't depend on retry end packet arriving before showReceptionSummary
+  lastCycleInitialPackets     = retryOccurred ? initialReceivedPackets : receivedPackets;
+  // Retry packets on air = at least the number recovered; totalRetryPacketsSent may be 0 if end packet
+  // hasn't arrived yet, so fall back to counting recovered packets as a lower bound
+  lastCycleTotalRetryPackets  = (totalRetryPacketsSent > 0)
+                                    ? totalRetryPacketsSent
+                                    : (retryOccurred ? (receivedPackets - initialReceivedPackets) : 0);
 
   // Reset timing variables
   thermalDataDownloadDuration = 0;
@@ -2044,6 +2108,312 @@ void cmdRequest(const char *args)
   forwardToSatellite('r');
 }
 
+void cmdTestComms(const char *args)
+{
+  bool doExport = false; // set true to also run exportThermalData() each cycle
+
+  // parse for number of cycles to run, default is 1
+  int numCycles = 1;
+  if (strlen(args) > 0)
+  {
+    int parsed = atoi(args);
+    if (parsed < 1 || parsed > 20)
+    {
+      Serial.println("Usage: testcomms <N>  (N = 1–20 cycles)");
+      return;
+    }
+    numCycles = parsed;
+  }
+
+  Serial.print("\n=== Test Comms: ");
+  Serial.print(numCycles);
+  Serial.println(" cycle(s) ===");
+
+  // Measuring RTT using ping
+  Serial.println("Measuring link RTT via ping...");
+  unsigned long rtt_ms = 0;
+  {
+    uint8_t pingByte = 'g';
+    unsigned long pingStart      = millis();
+    unsigned long prePingPackets = packetsReceived;
+
+    if (!sendBytesToSatellite(&pingByte, 1, 500))
+    {
+      Serial.println("Failed to send ping — aborting.");
+      return;
+    }
+    rf23.setModeRx();
+
+    unsigned long pingDeadline = millis() + 3000;
+    while (millis() < pingDeadline)
+    {
+      if (rf23.available())
+      {
+        handlePacket();
+        if (packetsReceived > prePingPackets)
+        {
+          rtt_ms = millis() - pingStart;
+          break;
+        }
+      }
+      delay(1);
+    }
+  }
+
+  if (rtt_ms == 0)
+  {
+    Serial.println("No ping response — link is down. Aborting.");
+    return;
+  }
+  Serial.print("RTT: ");
+  Serial.print(rtt_ms);
+  Serial.println(" ms");
+  
+  const unsigned long captureTimeoutMs = 46000UL + 2 * rtt_ms; // 46s (max timeout set on satellite for UART capture and transmission) + time it takes to make a roundtrip
+  const unsigned long rxTimeoutMs      = 90000UL + 2 * rtt_ms; // 90s + RTT, this is just an arbitrary value to timeout on a request if for any reason packets are not received or header is missing
+
+  float sumThroughput = 0.0f, sumGoodput = 0.0f, sumIntegrityFirst = 0.0f, sumIntegrityFinal = 0.0f, sumRecoveryRate = 0.0f, sumRSSI = 0.0f;
+  int cyclesWithRetry = 0;
+  int   completed     = 0;
+
+  // main testing loop: automated end-to-end image capture and downlink
+  for (int cycle = 1; cycle <= numCycles; cycle++)
+  {
+    delay(2000); // give satellite time to finish any in-flight TX (e.g. retry end packet) and return to RX
+    Serial.print("\n--- Cycle ");
+    Serial.print(cycle);
+    Serial.print(" / ");
+    Serial.println(numCycles);
+
+    // Step 1: capture image
+    Serial.println("Step 1: capture...");
+    clearReception(); // ensure previous state variables are cleared before running
+    downloadingThermalData = false;
+    waitingForRetry        = false;
+    retryAttemptCount      = 0;
+    captureCompleteFlag    = false; // resets flag here
+    rssiAccum = 0;
+    rssiCount = 0;
+
+    forwardToSatellite('u'); // send command
+    rf23.setModeRx();
+    delay(500); // brief delay to allow GS to switch to RX
+
+    Serial.print("Waiting for capture complete (timeout ");
+    Serial.print(captureTimeoutMs / 1000);
+    Serial.println("s)...");
+
+    // wait for the satellite to tell us that capture is done
+    unsigned long captureDeadline = millis() + captureTimeoutMs;
+    while (millis() < captureDeadline)
+    {
+      if (rf23.available())
+      {
+        handlePacket();
+      }
+      if (captureCompleteFlag)
+      {
+        Serial.println("Capture done!");
+        break;
+      }
+      if (isInterruptRequested())
+      {
+        Serial.println("Interrupted.");
+        resetInterrupt();
+        return; // exit testcomms
+      }
+    }
+
+    if (!captureCompleteFlag)
+    {
+      Serial.println("Capture timed out — skipping cycle.");
+      continue;
+    }
+
+    delay(500);
+    // Step 2: request downlink
+    Serial.println("Step 2: Requesting downlink...");
+
+    forwardToSatellite('r');
+    rf23.setModeRx(); // amp settles in ~300µs — no blocking delay needed, match manual path
+
+    Serial.print("Waiting for header packet (timeout ");
+    Serial.print(rxTimeoutMs / 1000);
+    Serial.println("s)...");
+
+    // Wait for header packet first
+    unsigned long rxDeadline = millis() + rxTimeoutMs;
+    while (millis() < rxDeadline && !headerReceived)
+    {
+      if (rf23.available())
+        handlePacket();
+      if (isInterruptRequested())
+      {
+        Serial.println("Interrupted.");
+        resetInterrupt();
+        return;
+      }
+    }
+
+    if (!headerReceived)
+    {
+      Serial.println("No header received — skipping cycle.");
+      continue;
+    }
+
+    // Wait for data transfer to complete
+    while (millis() < rxDeadline)
+    {
+      if (rf23.available()) {
+        handlePacket();
+      }
+        
+      // Inline retry request logic (mirrors main loop())
+      if (waitingForRetry && !imageComplete)
+      {
+        unsigned long now     = millis();
+        unsigned long wait    = (retryAttemptCount == 0) ? RETRY_GRACE_PERIOD_MS : RETRY_TIMEOUT_MS;
+        unsigned long timeRef = (retryAttemptCount == 0) ? endPacketReceivedTime : lastRetryRequestTime;
+        if (now - timeRef >= wait)
+        {
+          if (receivedPackets < expectedPackets && retryAttemptCount < MAX_RETRY_ATTEMPTS)
+          {
+            Serial.print("⏱️ Retry ");
+            Serial.print(retryAttemptCount + 1);
+            Serial.println("...");
+            if (retryAttemptCount == 0)
+              totalGracePeriodMs += now - graceStartTime; // record first grace period dead time
+            requestMissingPackets();
+            lastRetryRequestTime = now;
+            retryAttemptCount++;
+          }
+          else
+          {
+            waitingForRetry        = false;
+            downloadingThermalData = false;
+            autoMode = false;
+            showReceptionSummary();
+            break;
+          }
+        }
+      }
+
+
+      if (imageComplete || (receivedPackets > 0 && !downloadingThermalData && !waitingForRetry))
+        break;
+        
+
+      if (isInterruptRequested())
+      {
+        Serial.println("Interrupted.");
+        resetInterrupt();
+        return;
+      }
+    }
+
+    // If rxDeadline expired mid-retry (satellite stopped responding), stats were never computed
+    if (!cycleStatsReady && headerReceived)
+    {
+      Serial.println("⚠️ RX deadline expired — forcing reception summary with partial data.");
+      waitingForRetry = false;
+      downloadingThermalData = false;
+      showReceptionSummary();
+    }
+
+    Serial.println("Request done! Summarizing test cycle results...");
+
+    // ── Step 3: output test results ───────────────────────────────────────────
+    // Throughput: all bytes on air (original + retry) / active radio time (grace periods excluded)
+    uint32_t totalBytesSent = (uint32_t)(expectedPackets + lastCycleTotalRetryPackets) * RADIO_PACKET_MAX_SIZE;
+    float throughputBps = (lastCycleActiveRadioTime > 0)
+                              ? (float)totalBytesSent * 1000.0f / lastCycleActiveRadioTime
+                              : 0.0f;
+    // Goodput: useful data bytes / active radio time
+    uint32_t goodBytes  = (uint32_t)receivedPackets * PACKET_DATA_SIZE;
+    float goodputBps    = (lastCycleActiveRadioTime > 0)
+                              ? (float)goodBytes * 1000.0f / lastCycleActiveRadioTime
+                              : 0.0f;
+    // Integrity: first-pass rate, post-retry final rate, and recovery rate
+    float integrityFirst = (expectedPackets > 0)
+                               ? (float)lastCycleInitialPackets / expectedPackets * 100.0f
+                               : 0.0f;
+    float integrityFinal = (expectedPackets > 0)
+                               ? (float)receivedPackets / expectedPackets * 100.0f
+                               : 0.0f;
+    uint16_t missingAfterFirst = expectedPackets - lastCycleInitialPackets;
+    float recoveryRate = (lastCycleTotalRetryPackets > 0 && missingAfterFirst > 0)
+                             ? (float)(receivedPackets - lastCycleInitialPackets) / missingAfterFirst * 100.0f
+                             : 0.0f;
+    float avgRSSI        = (rssiCount > 0) ? (float)rssiAccum / rssiCount : 0.0f;
+
+    Serial.println("\n=== CYCLE SUMMARY ===");
+    Serial.print("  Throughput  : "); Serial.print(throughputBps, 1); Serial.println(" B/s");
+    Serial.print("  Goodput     : "); Serial.print(goodputBps, 1);    Serial.println(" B/s");
+    Serial.print("  Integrity   : ");
+    if (lastCycleTotalRetryPackets > 0)
+    {
+      Serial.print(integrityFirst, 1); Serial.print("% first-pass → ");
+      Serial.print(integrityFinal, 1); Serial.print("% after retry (");
+      Serial.print(lastCycleInitialPackets); Serial.print("→");
+      Serial.print(receivedPackets); Serial.print("/");
+      Serial.print(expectedPackets); Serial.print(" pkts, CRC ");
+      Serial.println(crcVerified ? "OK)" : "FAIL)");
+      Serial.print("  Recovery    : ");
+      Serial.print(recoveryRate, 1); Serial.print("% (");
+      Serial.print(receivedPackets - lastCycleInitialPackets); Serial.print("/");
+      Serial.print(missingAfterFirst); Serial.println(" lost pkts recovered)");
+    }
+    else
+    {
+      Serial.print(integrityFinal, 1); Serial.print("% (");
+      Serial.print(receivedPackets); Serial.print("/");
+      Serial.print(expectedPackets); Serial.print(" pkts, CRC ");
+      Serial.println(crcVerified ? "OK)" : "FAIL)");
+    }
+    Serial.print("  Avg RSSI   : ");
+    Serial.print(avgRSSI, 1); Serial.print(" dBm  (");
+    Serial.print(rssiCount); Serial.println(" samples)");
+
+    if (doExport) {
+      exportThermalData();
+    }
+
+    sumThroughput      += throughputBps;
+    sumGoodput         += goodputBps;
+    sumIntegrityFirst  += integrityFirst;
+    sumIntegrityFinal  += integrityFinal;
+    sumRSSI            += avgRSSI;
+    if (lastCycleTotalRetryPackets > 0)
+    {
+      sumRecoveryRate += recoveryRate;
+      cyclesWithRetry++;
+    }
+    completed++;
+  }
+
+  // ── Final summary ─────────────────────────────────────────────────────────
+  Serial.println("\n=== TEST COMMS RESULTS ===");
+  Serial.print("Cycles completed : ");
+  Serial.print(completed);
+  Serial.print(" / ");
+  Serial.println(numCycles);
+  if (completed > 0)
+  {
+    Serial.print("Avg Throughput        : "); Serial.print(sumThroughput / completed, 1); Serial.println(" B/s");
+    Serial.print("Avg Goodput           : "); Serial.print(sumGoodput    / completed, 1); Serial.println(" B/s");
+    Serial.print("Avg Integrity (1st)   : "); Serial.print(sumIntegrityFirst / completed, 1); Serial.println("% (first-pass, before retry)");
+    Serial.print("Avg Integrity (final) : "); Serial.print(sumIntegrityFinal / completed, 1); Serial.println("% (after retry recovery)");
+    if (cyclesWithRetry > 0)
+    {
+      Serial.print("Avg Recovery Rate     : "); Serial.print(sumRecoveryRate / cyclesWithRetry, 1); Serial.print("% (");
+      Serial.print(cyclesWithRetry); Serial.print("/"); Serial.print(completed); Serial.println(" cycles needed retry)");
+    }
+    Serial.print("Avg RSSI              : "); Serial.print(sumRSSI       / completed, 1); Serial.println(" dBm");
+    Serial.print("Link RTT         : "); Serial.print(rtt_ms); Serial.print(" ms  (one-way propagation est. "); Serial.print(rtt_ms / 2); Serial.println(" ms)");
+  }
+  Serial.println("========================");
+}
+
 void cmdRadioStatus(const char *args)
 {
   showReceptionSummary();
@@ -2248,6 +2618,8 @@ void loop()
         Serial.print(" of ");
         Serial.println(MAX_RETRY_ATTEMPTS);
 
+        if (retryAttemptCount == 0)
+          totalGracePeriodMs += currentTime - graceStartTime; // record first grace period dead time
         bool retryQueued = requestMissingPackets();
         lastRetryRequestTime = currentTime;
         retryAttemptCount++;
