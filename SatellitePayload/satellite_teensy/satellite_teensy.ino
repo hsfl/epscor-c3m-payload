@@ -25,8 +25,8 @@
  * - Radio: Transmits packetized data with header/data/end packets
  *
  * @author EPSCOR C3M Team
- * @date 2025-10-14
- * @version 1.0.0
+ * @date 2026-03-23
+ * @version 2.1.0
  */
 
 // Simplified Transmitter with UART (Essential Functions Only)
@@ -122,6 +122,19 @@ const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indica
 // Packet retry protocol
 const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing packets
 
+// Livestream protocol constants
+const uint8_t STREAM_FRAME_TYPE = 0xCC;                                 // Message type for livestream frame packets
+const uint8_t STREAM_MAGIC[4] = {0xCA, 0xFE, 0xBA, 0xBE};               // Magic header for livestream frames from Pi
+const uint16_t STREAM_FRAME_SIZE = 4800;                                // 80x60 8-bit = 4800 bytes per frame
+const uint8_t STREAM_PACKETS_PER_FRAME = (STREAM_FRAME_SIZE + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;  // ~107 packets
+const char STREAM_START_CMD[] = "STREAM_START\n";                       // Command to RPi to start streaming
+const char STREAM_STOP_CMD[] = "STREAM_STOP\n";                         // Command to RPi to stop streaming
+const char FRAME_REQUEST_CMD[] = "FRAME\n";                             // Command to RPi to send one frame
+
+// Stream mode state
+bool streamModeActive = false;
+uint8_t streamFrameBuffer[STREAM_FRAME_SIZE];  // Buffer for one stream frame
+
 // === Packet Structure Definitions ===
 
 /**
@@ -189,6 +202,32 @@ struct PACKED RetryRequestPacket
   uint8_t bitmap[45];   // 360 bits = 45 bytes, bit=1 means packet is missing
 };
 
+/**
+ * Stream frame header packet structure for livestream transmission
+ * Sent before each frame to inform ground station of frame data
+ * Total size: 6 bytes
+ */
+struct PACKED StreamFrameHeaderPacket
+{
+  uint8_t type;         // STREAM_FRAME_TYPE (0xCC)
+  uint8_t frameSeq;     // Frame sequence number (0-255, wrapping)
+  uint16_t frameSize;   // Frame size in bytes (4800)
+  uint16_t totalPackets; // Number of data packets for this frame
+};
+
+/**
+ * Stream frame data packet structure
+ * Contains chunk of stream frame data (no CRC for speed - best-effort delivery)
+ * Size: 3 + data length bytes
+ */
+struct PACKED StreamDataPacket
+{
+  uint8_t type;           // STREAM_FRAME_TYPE (0xCC)
+  uint8_t frameSeq;       // Frame sequence number to associate with header
+  uint8_t packetIndex;    // Packet index within frame (0-106)
+  uint8_t data[PACKET_DATA_SIZE]; // Frame data chunk
+};
+
 // Shared radio buffers to avoid stack allocations inside hot paths
 uint8_t radioRxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
 uint8_t radioTxBuffer[RADIO_PACKET_MAX_SIZE + RADIO_PACKET_MAX_SIZE];
@@ -251,6 +290,15 @@ void serviceGPS();
 void printGPSData();
 void printIMUData();
 void handleSensorCommand(uint8_t *buf, uint8_t len);
+
+// Forward declarations for stream mode
+void startStreamMode();
+void stopStreamMode();
+void handleStreamMode();
+void requestFrameFromPi();
+bool waitForStreamMagic(uint32_t timeout_ms);
+bool recvStreamFrameFromPi(uint8_t &frameSeq);
+void sendStreamFrameViaRadio(uint8_t frameSeq);
 
 /**
  * Sends a serial message via radio to ground station
@@ -523,13 +571,16 @@ void listenForCommands()
         else if (sub == '0')
         {
           digitalWrite(RPI_ENABLE, LOW); // Turn Pi OFF
+          RPI_IDLE_READY = false;        // Reset idle state
           radioPrintln("RPI POWER: OFF");
         }
         else if (sub == 's' || sub == 'S')
         {
           int state = digitalRead(RPI_ENABLE);
-          radioPrint("RPI POWER STATE: ");
-          radioPrintln(state ? "ON" : "OFF");
+          radioPrint("RPI POWER: ");
+          radioPrint(state ? "ON" : "OFF");
+          radioPrint(" | MODE: ");
+          radioPrintln(RPI_IDLE_READY ? "IDLE" : "NOT READY");
         }
         else
         {
@@ -548,6 +599,30 @@ void listenForCommands()
     else if (cmd == 'g' || cmd == 'G')
     {
       radioPrintln("pong from satellite"); // reply back to GS
+    }
+    else if (cmd == 'v' || cmd == 'V')
+    {
+      // Stream command: 'v' + '1' = start, 'v' + '0' = stop
+      if (len >= 2)
+      {
+        char sub = (char)radioRxBuffer[1];
+        if (sub == '1')
+        {
+          startStreamMode();
+        }
+        else if (sub == '0')
+        {
+          stopStreamMode();
+        }
+        else
+        {
+          radioPrintln("STREAM: Unknown subcommand (use v1 to start, v0 to stop)");
+        }
+      }
+      else
+      {
+        radioPrintln("STREAM: missing arg (use v1 to start, v0 to stop)");
+      }
     }
     else if (cmd == '~')
     {
@@ -603,6 +678,7 @@ void setup()
   radioPrintln("Commands:");
   radioPrintln(" 'u' - UART thermal capture (fast!)");
   radioPrintln(" 'r' - Send captured image via radio");
+  radioPrintln(" 'v1'/'v0' - Start/stop livestream mode");
   radioPrintln(" 't' - Check temperature sensors");
   radioPrintln(" 'c' - Check current sensors");
   radioPrintln(" 'd' - Dump RF23 RX FIFO contents");
@@ -1211,9 +1287,9 @@ void initRadio()
   // GFSK Modem Configurations - Ordered from fastest to slowest
   // Uncomment ONE line to select your desired configuration
 
-  // rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
+  rf23.setModemConfig(RH_RF22::GFSK_Rb125Fd125); // 125 kbps, 125 kHz deviation (fastest, needs strong signal)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb57_6Fd28_8); // 57.6 kbps, 28.8 kHz deviation
-  rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
+  // rf23.setModemConfig(RH_RF22::GFSK_Rb38_4Fd19_6); // 38.4 kbps, 19.6 kHz deviation (recommended starting point)
   // rf23.setModemConfig(RH_RF22::GFSK_Rb19_2Fd9_6);   // 19.2 kbps, 9.6 kHz deviation (good balance)
 
   // rf23.setModemConfig(RH_RF22::GFSK_Rb9_6Fd45); // 9.6 kbps, 45 kHz deviation (confirmed reliable)
@@ -1233,35 +1309,35 @@ void setRadioAmpTransmit()
 {
   /**
    * Transmit burst: TXON low, RXON high PER THE DATASHEET.
-   * Receive window: RXON high, TXON low.
-   * Idle/standby: both low (saves current, keeps switch centered).
    */
   digitalWrite(RADIO_RX_ON_PIN, HIGH);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+  // rf23.setModeTx(); // Put radio in transmit mode (set registers accordingly)
   delayMicroseconds(300); // ensure the amp is settled before transmitting
 }
+
 void setRadioAmpReceive()
 {
   /**
-   * Transmit burst: TXON low, RXON high PER THE DATASHEET.
    * Receive window: RXON low, TXON high.
-   * Idle/standby: both low (saves current, keeps switch centered).
    */
   digitalWrite(RADIO_RX_ON_PIN, LOW);
   digitalWrite(RADIO_TX_ON_PIN, HIGH);
+  // rf23.setModeRx(); 
   delayMicroseconds(300); // ensure the amp is settled before receiving
 }
+
 void setRadioAmpIdle()
 {
   /**
    * NOTE Shouldn't need to use this for the drone test but will
    * be useful later on for satellite deployment to conserve battery.
-   * Transmit burst: TXON high, RXON low.
-   * Receive window: RXON high, TXON low.
    * Idle/standby: both low (saves current, keeps switch centered).
    */
   digitalWrite(RADIO_RX_ON_PIN, LOW);
   digitalWrite(RADIO_TX_ON_PIN, LOW);
+  // rf23.setModeIdle();
+  delayMicroseconds(300); // ensure the amp is settled before next operation
 }
 
 /**
@@ -1273,6 +1349,13 @@ void setRadioAmpIdle()
 void loop()
 {
   serviceGPS();
+
+  // Handle stream mode if active
+  if (streamModeActive)
+  {
+    handleStreamMode();
+    return; // Skip normal processing during stream mode
+  }
 
   pollPIUartStatus();
 
@@ -1286,68 +1369,165 @@ void loop()
 #ifdef DEBUG
   if (Serial.available())
   {
-    char cmd = Serial.read();
+    static String serialLine = "";
+
     while (Serial.available())
-      Serial.read(); // Clear input buffer
-
-    radioPrint("Command: ");
-    radioPrintln(String(cmd));
-
-    switch (cmd)
     {
-    case 'z':
-    case 'Z':
-      radioPrintln("command Z pong from satellite"); // reply back to GS
-      break;
-    case 'u':
-    case 'U':
-      captureThermalImageUART();
-      break;
-    case 'r':
-    case 'R':
-      sendThermalDataViaRadio();
-      break;
-    case 't':
-    case 'T':
-      checkTemperatureSensors();
-      break;
-    case 'c':
-    case 'C':
-      checkCurrentSensors();
-      break;
-    case 'd':
-    case 'D':
-      dumpRf23PendingPackets();
-      break;
-    case 'g':
-      radioPrintln("========== GPS DATA ==========");
-      printGPSData();
-      radioPrintln("==============================");
-      break;
-    case 'i':
-      radioPrintln("========== IMU DATA ==========");
-      printIMUData();
-      radioPrintln("==============================");
-      break;
-    case 'b':
-    case 'B':
-      radioPrintln("========== SENSOR DATA ==========");
-      printGPSData();
-      radioPrintln("");
-      printIMUData();
-      radioPrintln("=================================");
-      break;
-    case 'G':
-      initGPS();
-      break;
-    case 'I':
-      initIMU();
-      break;
-    case '~':
-      SCB_AIRCR = 0x05FA0004;
-      break;
-    default:
-      radioPrintln("Unknown command. Use 'z','u','r','t','c','d','g','i','b','G','I','~'");
+      char c = Serial.read();
+      if (c == '\n' || c == '\r')
+      {
+        serialLine.trim();
+        if (serialLine.length() == 0)
+          continue;
+
+        radioPrint("command: ");
+        radioPrintln(serialLine);
+
+        // Build a 2-byte buffer matching the radio packet format so handlers
+        // can be called with the same interface as listenForCommands().
+        uint8_t buf[2] = {0, 0};
+        buf[0] = (uint8_t)serialLine[0];
+        uint8_t len = 1;
+        if (serialLine.length() >= 2)
+        {
+          buf[1] = (uint8_t)serialLine[1];
+          len = 2;
+        }
+
+        char cmd = (char)buf[0];
+
+        switch (cmd)
+        {
+        case 'u':
+        case 'U':
+          captureThermalImageUART();
+          break;
+
+        case 'r':
+        case 'R':
+          sendThermalDataViaRadio();
+          break;
+
+        case 'p':
+        case 'P':
+          if (len >= 2)
+          {
+            switch ((char)buf[1])
+            {
+            case '1':
+              digitalWrite(RPI_ENABLE, HIGH);
+              radioPrintln("RPI POWER: ON (Wait until 'RPI STATUS: IDLE' before thermal capture.)");
+              break;
+            case '0':
+              digitalWrite(RPI_ENABLE, LOW);
+              RPI_IDLE_READY = false;
+              radioPrintln("RPI POWER: OFF");
+              break;
+            case 's':
+            case 'S':
+            {
+              int state = digitalRead(RPI_ENABLE);
+              radioPrint("RPI POWER: ");
+              radioPrint(state ? "ON" : "OFF");
+              radioPrint(" | MODE: ");
+              radioPrintln(RPI_IDLE_READY ? "IDLE" : "NOT READY");
+              break;
+            }
+            default:
+              radioPrintln("RPI POWER: Unknown subcommand. Use: p1 / p0 / ps");
+              break;
+            }
+          }
+          else
+          {
+            radioPrintln("RPI POWER: missing arg. Use: p1 / p0 / ps");
+          }
+          break;
+
+        case 's':
+        case 'S':
+          handleSensorCommand(buf, len);
+          break;
+
+        case 'v':
+        case 'V':
+          if (len >= 2)
+          {
+            switch ((char)buf[1])
+            {
+            case '1':
+              startStreamMode();
+              break;
+            case '0':
+              stopStreamMode();
+              break;
+            default:
+              radioPrintln("STREAM: Unknown subcommand. Use: v1 / v0");
+              break;
+            }
+          }
+          else
+          {
+            radioPrintln("STREAM: missing arg. Use: v1 / v0");
+          }
+          break;
+
+        case 'g':
+          radioPrintln("pong from satellite");
+          break;
+
+        case 't':
+        case 'T':
+          checkTemperatureSensors();
+          break;
+
+        case 'c':
+        case 'C':
+          checkCurrentSensors();
+          break;
+
+        case 'd':
+        case 'D':
+          dumpRf23PendingPackets();
+          break;
+
+        case '~':
+          SCB_AIRCR = 0x05FA0004;
+          break;
+
+        default:
+          radioPrintln("Unknown command.");
+          radioPrintln("GS cmds : u / r / p1 / p0 / ps / sg / si / sb / sG / sI / v1 / v0 / g / ~");
+          radioPrintln("DBG only: t / c / d");
+
+          Serial.println("  u       - Capture thermal image (UART trigger to RPi)");
+          Serial.println("  r       - Transmit captured thermal data via radio");
+          Serial.println("  p1      - RPI power ON");
+          Serial.println("  p0      - RPI power OFF");
+          Serial.println("  ps      - RPI power status");
+          Serial.println("  sg      - Request GPS data");
+          Serial.println("  si      - Request IMU data");
+          Serial.println("  sb      - Request GPS + IMU data");
+          Serial.println("  sG      - Reinitialize GPS");
+          Serial.println("  sI      - Reinitialize IMU");
+          Serial.println("  v1      - Start livestream mode");
+          Serial.println("  v0      - Stop livestream mode");
+          Serial.println("  g       - Ping (pong reply)");
+          Serial.println("  ~       - Software reset");
+          Serial.println("  t       - [DBG] Read temperature sensors");
+          Serial.println("  c       - [DBG] Read current sensors");
+          Serial.println("  d       - [DBG] Dump pending RF23 packets");
+          break;
+        }
+
+        serialLine = "";
+      }
+      else
+      {
+        serialLine += c;
+        if (serialLine.length() > 16)
+          serialLine = serialLine.substring(serialLine.length() - 16);
+      }
     }
   }
 #endif
@@ -2036,4 +2216,333 @@ void sendThermalDataViaRadio()
     radioPrintln("⚠️ SAT Some packets lost");
   }
 #endif
+}
+
+// ============================================================================
+// LIVESTREAM MODE FUNCTIONS
+// ============================================================================
+
+/**
+ * Check if the buffer starts with stream magic header
+ */
+bool isStreamMagic(const uint8_t *buf)
+{
+  return buf[0] == STREAM_MAGIC[0] && buf[1] == STREAM_MAGIC[1] &&
+         buf[2] == STREAM_MAGIC[2] && buf[3] == STREAM_MAGIC[3];
+}
+
+/**
+ * Start livestream mode - send command to Pi and enter stream state
+ */
+void startStreamMode()
+{
+  if (!RPI_IDLE_READY)
+  {
+    radioPrintln("STREAM: RPi not ready, wait for RPI STATUS: IDLE");
+    return;
+  }
+
+  radioPrintln("STREAM: Starting livestream mode...");
+
+  // Clear any pending UART data
+  while (Serial2.available())
+    Serial2.read();
+
+  // Send stream start command to Pi
+  Serial2.print(STREAM_START_CMD);
+  Serial2.flush();
+
+  streamModeActive = true;
+  radioPrintln("STREAM: Mode active - forwarding frames to GS");
+}
+
+/**
+ * Stop livestream mode - send command to Pi and exit stream state
+ */
+void stopStreamMode()
+{
+  if (!streamModeActive)
+  {
+    radioPrintln("STREAM: Not in stream mode");
+    return;
+  }
+
+  radioPrintln("STREAM: Stopping livestream mode...");
+
+  // Send stream stop command to Pi
+  Serial2.print(STREAM_STOP_CMD);
+  Serial2.flush();
+
+  streamModeActive = false;
+  radioPrintln("STREAM: Mode stopped");
+}
+
+/**
+ * Scan UART byte-by-byte looking for STREAM_MAGIC header
+ * This allows recovery from partial data or misalignment
+ *
+ * @param timeout_ms Maximum time to wait for magic header
+ * @return true if stream magic was found
+ */
+bool waitForStreamMagic(uint32_t timeout_ms)
+{
+  uint32_t start = millis();
+  uint8_t matchIndex = 0;
+
+  while (millis() - start < timeout_ms)
+  {
+    if (Serial2.available())
+    {
+      uint8_t b = Serial2.read();
+      if (b == STREAM_MAGIC[matchIndex])
+      {
+        matchIndex++;
+        if (matchIndex == 4)
+        {
+          return true; // Found complete magic header
+        }
+      }
+      else
+      {
+        // Mismatch - check if this byte could be start of new magic
+        matchIndex = (b == STREAM_MAGIC[0]) ? 1 : 0;
+      }
+    }
+    else
+    {
+      delay(1);
+    }
+  }
+  return false; // Timeout
+}
+
+/**
+ * Receive one stream frame from Pi via UART
+ * Stream frame format: [STREAM_MAGIC 4B][Frame Seq 1B][Size 2B][Data 4800B][End 2B]
+ * Uses byte-by-byte scanning to find magic header (handles misalignment)
+ *
+ * @param frameSeq Output parameter for frame sequence number
+ * @return true if frame received successfully
+ */
+bool recvStreamFrameFromPi(uint8_t &frameSeq)
+{
+  const uint32_t STREAM_HEADER_TIMEOUT_MS = 1000; // 1s timeout for streaming
+  const uint32_t STREAM_DATA_TIMEOUT_MS = 2000;   // 2s for frame data (4800 bytes)
+
+  // Don't even try if no data available
+  if (!Serial2.available())
+  {
+    return false;
+  }
+
+  // Scan for stream magic byte-by-byte
+  if (!waitForStreamMagic(STREAM_HEADER_TIMEOUT_MS))
+  {
+    return false; // Timeout or no magic found
+  }
+
+  // Magic found, now read rest of header: 1 seq + 2 size = 3 bytes
+  uint8_t headerRest[3];
+  if (!readExact(Serial2, headerRest, 3, STREAM_HEADER_TIMEOUT_MS))
+  {
+    radioPrintln("STREAM: Header rest timeout");
+    return false;
+  }
+
+  frameSeq = headerRest[0];
+  uint16_t frameSize = (uint16_t)headerRest[1] | ((uint16_t)headerRest[2] << 8);
+
+#ifdef DEBUG
+  radioPrint("STREAM: seq=");
+  radioPrint(String(frameSeq));
+  radioPrint(" size=");
+  radioPrintln(String(frameSize));
+#endif
+
+  if (frameSize != STREAM_FRAME_SIZE)
+  {
+    radioPrint("STREAM: Bad frame size ");
+    radioPrint(String(frameSize));
+    radioPrint(" (expected ");
+    radioPrint(String(STREAM_FRAME_SIZE));
+    radioPrint(", got bytes 0x");
+    radioPrint(String(headerRest[1], HEX));
+    radioPrint(" 0x");
+    radioPrint(String(headerRest[2], HEX));
+    radioPrintln(")");
+    // Drain remaining data to resync
+    while (Serial2.available()) Serial2.read();
+    return false;
+  }
+
+  // Read frame data
+  if (!readExact(Serial2, streamFrameBuffer, STREAM_FRAME_SIZE, STREAM_DATA_TIMEOUT_MS))
+  {
+    radioPrintln("STREAM: Frame data timeout");
+    // Drain buffer to resync
+    while (Serial2.available()) Serial2.read();
+    return false;
+  }
+
+  // Read end markers
+  uint8_t ender[2];
+  if (!readExact(Serial2, ender, 2, 500))
+  {
+    radioPrintln("STREAM: End marker timeout");
+    // Drain buffer to resync
+    while (Serial2.available()) Serial2.read();
+    return false;
+  }
+
+  if (ender[0] != 0xFF || ender[1] != 0xFF)
+  {
+    radioPrint("STREAM: Bad end markers 0x");
+    radioPrint(String(ender[0], HEX));
+    radioPrint(" 0x");
+    radioPrintln(String(ender[1], HEX));
+    // Drain buffer to resync for next frame
+    while (Serial2.available()) Serial2.read();
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Send a stream frame via radio to ground station
+ * Uses STREAM_FRAME_TYPE packets for identification
+ *
+ * @param frameSeq Frame sequence number to include in packets
+ */
+void sendStreamFrameViaRadio(uint8_t frameSeq)
+{
+  // Send header packet first
+  StreamFrameHeaderPacket headerPkt;
+  headerPkt.type = STREAM_FRAME_TYPE;
+  headerPkt.frameSeq = frameSeq;
+  headerPkt.frameSize = STREAM_FRAME_SIZE;
+  headerPkt.totalPackets = STREAM_PACKETS_PER_FRAME;
+
+  setRadioAmpTransmit();
+
+  if (!rf23.send((uint8_t *)&headerPkt, sizeof(headerPkt)))
+  {
+    setRadioAmpReceive();
+    return;
+  }
+  rf23.waitPacketSent(100); // Short timeout for streaming
+
+  // Send data packets (best-effort, no retries for speed)
+  uint16_t bytesSent = 0;
+  uint8_t packetNum = 0;
+
+  while (bytesSent < STREAM_FRAME_SIZE)
+  {
+    // Check for stop command every 20 packets (allows faster response to stop)
+    if (packetNum > 0 && (packetNum % 20) == 0)
+    {
+      setRadioAmpReceive();
+      delay(2); // Brief pause to check for incoming packets
+      if (rf23.available())
+      {
+        uint8_t len = sizeof(radioRxBuffer);
+        if (rf23.recv(radioRxBuffer, &len))
+        {
+          if (len >= 2 && (radioRxBuffer[0] == 'v' || radioRxBuffer[0] == 'V') && radioRxBuffer[1] == '0')
+          {
+            stopStreamMode();
+            return; // Exit immediately
+          }
+        }
+      }
+      setRadioAmpTransmit();
+    }
+
+    uint16_t remaining = STREAM_FRAME_SIZE - bytesSent;
+    uint8_t chunkSize = (remaining < PACKET_DATA_SIZE) ? remaining : PACKET_DATA_SIZE;
+
+    // Build stream data packet
+    StreamDataPacket *dataPkt = (StreamDataPacket *)radioTxBuffer;
+    dataPkt->type = STREAM_FRAME_TYPE;
+    dataPkt->frameSeq = frameSeq;
+    dataPkt->packetIndex = packetNum;
+    memcpy(dataPkt->data, &streamFrameBuffer[bytesSent], chunkSize);
+
+    // Actual packet size: type(1) + frameSeq(1) + packetIndex(1) + data(chunkSize)
+    uint8_t packetSize = 3 + chunkSize;
+
+    rf23.send(radioTxBuffer, packetSize);
+    rf23.waitPacketSent(50);
+
+    bytesSent += chunkSize;
+    packetNum++;
+  }
+
+  setRadioAmpReceive();
+}
+
+/**
+ * Request a single frame from the Raspberry Pi
+ * Sends FRAME command over UART and clears any stale buffer data
+ */
+void requestFrameFromPi()
+{
+  // Clear any stale UART data before requesting
+  while (Serial2.available()) Serial2.read();
+
+  // Send frame request command
+  Serial2.print(FRAME_REQUEST_CMD);
+  Serial2.flush();
+}
+
+/**
+ * Handle stream mode - called from main loop when streaming is active
+ * Uses request-response flow control: request frame → receive → transmit → repeat
+ *
+ * Flow:
+ * 1. Request frame from Pi (FRAME command)
+ * 2. Wait for and receive frame with STREAM_MAGIC header
+ * 3. Transmit frame over radio to ground station
+ * 4. Check for stop command from GS
+ * 5. Request next frame
+ */
+void handleStreamMode()
+{
+  // Check for stop command from GS via radio first
+  if (rf23.available())
+  {
+    uint8_t len = sizeof(radioRxBuffer);
+    if (rf23.recv(radioRxBuffer, &len))
+    {
+      // Check for stream stop command
+      if (len >= 2 && (radioRxBuffer[0] == 'v' || radioRxBuffer[0] == 'V') && radioRxBuffer[1] == '0')
+      {
+        stopStreamMode();
+        return;
+      }
+    }
+  }
+
+  // Request a frame from Pi
+  requestFrameFromPi();
+
+  // Wait for and receive the frame
+  uint8_t frameSeq;
+  if (recvStreamFrameFromPi(frameSeq))
+  {
+    // Successfully received frame - transmit over radio to GS
+    sendStreamFrameViaRadio(frameSeq);
+
+    // Brief message every 10 frames (frameSeq wraps at 255)
+    if ((frameSeq % 10) == 0)
+    {
+      radioPrint("STREAM: Frame ");
+      radioPrintln(String(frameSeq));
+    }
+  }
+  else
+  {
+    // Failed to receive frame - will retry on next loop iteration
+    // The receive function already drains buffer on errors
+  }
 }

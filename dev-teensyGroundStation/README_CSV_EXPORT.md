@@ -1,4 +1,5 @@
 # Thermal Data CSV Export and Visualization
+_Version 2.0.0 (updated 2025-12-08) - includes livestreaming capture and viewer integration enhancements._
 
 This document describes the enhanced functionality for automatically capturing and visualizing thermal data from the ground station.
 

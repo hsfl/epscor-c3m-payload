@@ -1,9 +1,9 @@
 # EPSCOR C3M CubeSat Payload System
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/yourusername/epscor-c3m-payload)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/yourusername/epscor-c3m-payload)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Version 1.0.0** - Production Release (October 14, 2025)
+**Version 2.1.0** - Link Characterization Release (March 23, 2026)
 
 A complete thermal imaging payload system for CubeSat applications, featuring satellite-side thermal capture and ground station data reception via UHF radio link.
 
@@ -21,9 +21,11 @@ The EPSCOR C3M system captures thermal images from space and transmits them to a
 - **Frame Averaging**: 10-frame averaging for noise reduction
 - **Robust Radio Link**: 433MHz UHF transmission using RFM23BP transceivers (1W output power)
 - **Error Detection**: CRC16 validation on both per-packet and full-image levels
-- **Packet Recovery**: Tracks missing/duplicate packets with automatic reporting
+- **Packet Recovery**: Tracks missing/duplicate packets and automatically requests retransmission of missing packets (ground-station-initiated, up to 2 retry rounds)
+- **Link Characterization**: `testcomms` command runs repeated download cycles and reports throughput, goodput, integrity, recovery rate, RSSI, and RTT — with automatic CSV logging for long-range testing. note that testcomms does not run export and so it does not save the images from each test.
 - **Real-time Visualization**: Automatic CSV export and matplotlib-based thermal visualization
 - **Telemetry System**: 7× temperature sensors, 5× current sensors for system monitoring
+- **Signal Monitoring**: RSSI reporting via `pingloop` and radio reception status
 - **Debug/Flight Modes**: Verbose logging for development, minimal logging for production
 
 ## System Architecture
@@ -153,11 +155,17 @@ python ground_station_serial_cli_teensy.py
 
 In the ground station CLI:
 ```
-> capture      # Start averaging frames for thermal data
-> request      # Begin downlink of thermal data to ground station
-> export       # Export received data as CSV (auto-visualizes)
-> reset        # Software reset the flight satellite
+> capture          # Start averaging frames for thermal data
+> request          # Begin downlink of thermal data to ground station
+> export           # Export received data as CSV (auto-visualizes)
+> ping             # Test communication between GS and satellite
+> pingloop         # Continuously ping satellite and report RSSI
+> rstatus          # Show radio reception status
+> stream start     # Start thermal livestream (stream stop to end)
+> testcomms <N>    # Run N download cycles and report link metrics (auto-saves CSV)
 ```
+
+Run `help` in the CLI for the full command list.
 
 ## Configuration
 
@@ -247,10 +255,225 @@ python thermal_data_viewer.py thermal_data_042.csv
 
 **Note:** The `export` command in the ground station CLI automatically runs the viewer, but you can use this for reviewing previously captured data.
 
+### Thermal Livestream Mode
+
+**NEW in v1.1:** Real-time thermal video streaming from satellite to ground station!
+
+The livestream feature enables continuous, low-latency thermal video transmission for real-time monitoring and situational awareness. This mode prioritizes speed over data archival - frames are optimized for fast transmission and immediate display.
+
+#### How Livestream Works
+
+**Architecture Overview:**
+```
+[Thermal Camera] → [RPi] → [Satellite Teensy] → [Radio] → [GS Teensy] → [Python CLI] → [Live Viewer]
+     (USB)         (UART)    (Request/Response)  (433MHz)    (USB Serial)   (Queue)    (matplotlib)
+```
+
+**Data Flow:**
+
+1. **Ground Station Initiates:** User types `stream start` in the ground station CLI
+2. **Command Forwarding:** Ground station Teensy sends radio command `v1` to satellite
+3. **Satellite Activation:** Satellite Teensy sends `STREAM_START\n` via UART to Raspberry Pi
+4. **Request-Response Loop:**
+   - Satellite Teensy requests frame: sends `FRAME\n` to RPi via UART
+   - RPi captures latest thermal frame (160×120, 16-bit)
+   - RPi downsamples to 80×60, 8-bit for faster transmission
+   - RPi sends frame to Teensy via UART with magic header `0xCA 0xFE 0xBA 0xBE`
+   - Teensy packetizes frame into ~107 radio packets (45 bytes data each)
+   - Teensy transmits frame over 433MHz radio to ground station
+   - Ground station reassembles packets into complete frame
+   - Ground station forwards frame to Python CLI via USB serial
+   - Python CLI queues frame for visualization
+   - Matplotlib viewer displays frame in real-time (~5-10 FPS)
+   - **Teensy requests next frame** (loop continues)
+
+5. **Termination:** User types `stream stop` - command propagates back to stop the loop
+
+#### Frame Optimization for Streaming
+
+**Downsampling Strategy:**
+- Original: 160×120 pixels @ 16-bit (38,400 bytes) → takes ~45 seconds to transmit
+- Downsampled: 80×60 pixels @ 8-bit (4,800 bytes) → takes ~5.6 seconds to transmit
+- Method: 2×2 block averaging (preserves thermal patterns, reduces noise)
+- Scaling: 16-bit Kelvin×100 mapped to 8-bit (0°C=0, 100°C=255)
+
+**Why Downsampling:**
+- **8× faster transmission** (4,800 vs 38,400 bytes)
+- **Better frame rate** (~5-10 FPS vs <1 FPS for full resolution)
+- **Reduced radio congestion** (107 packets vs 854 packets per frame)
+- **Sufficient resolution** for real-time monitoring and situational awareness
+
+**Best-Effort Delivery:**
+- No packet retry logic (speed over reliability)
+- Ground station accepts partial frames (50%+ packets = display)
+- Dropped packets appear as visual artifacts but don't stall the stream
+
+#### Using Livestream Mode
+
+**Start Livestream:**
+```bash
+cd dev-teensyGroundStation
+python ground_station_serial_cli_teensy.py
+
+GS> stream start
+# Livestream begins, frames arrive continuously
+# Frame rate: ~5-10 FPS depending on radio conditions
+```
+
+**View Livestream (Automatic):**
+The Python CLI automatically detects stream mode and can launch the viewer:
+```bash
+# In a separate terminal while streaming is active:
+python thermal_data_viewer.py --stream
+
+# Or start CLI with auto-viewer:
+python ground_station_serial_cli_teensy.py --auto-stream-viewer
+```
+
+**Stop Livestream:**
+```
+GS> stream stop
+# Stream terminates gracefully
+# Satellite returns to normal command mode
+```
+
+#### Livestream Protocol Details
+
+**UART Frame Structure (RPi → Satellite Teensy):**
+```
+[Magic: 0xCA 0xFE 0xBA 0xBE] [Frame Seq: 1 byte] [Size: 2 bytes] [Data: 4800 bytes] [End: 0xFF 0xFF]
+Total: 4809 bytes per frame
+```
+
+**Radio Packet Structure (Teensy → Ground Station):**
+
+**Header Packet (6 bytes):**
+```
+[Type: 0xCC] [Frame Seq: 1 byte] [Frame Size: 2 bytes] [Total Packets: 2 bytes]
+```
+
+**Data Packets (48 bytes):**
+```
+[Type: 0xCC] [Frame Seq: 1 byte] [Packet Index: 1 byte] [Data: 45 bytes]
+```
+
+**Stream Statistics:**
+- Frame size: 4,800 bytes (80×60 @ 8-bit)
+- Packets per frame: 107 (4,800 ÷ 45 = 106.67, rounded up)
+- Radio time per frame: ~5.6 seconds @ 125 kbps (GFSK_Rb125Fd125)
+- Effective frame rate: ~10 FPS (ideal), ~5-8 FPS (typical with radio overhead)
+
+#### Flow Control Mechanism
+
+**Why Request-Response?**
+The satellite Teensy uses explicit flow control to prevent serial buffer overflow:
+
+1. **Problem:** If RPi continuously streams frames, UART buffer fills up → data loss
+2. **Solution:** Teensy only requests next frame after transmitting current one
+3. **Benefit:** Zero buffer overflow, predictable frame pacing
+
+**Request-Response Sequence:**
+```
+Teensy: "FRAME\n"          → RPi receives request
+RPi:    [Frame data 4809B] → Teensy receives frame
+Teensy: [Transmit via radio ~5.6s]
+Teensy: "FRAME\n"          → Request next frame
+(cycle repeats)
+```
+
+#### Livestream Performance
+
+**Factors Affecting Frame Rate:**
+- Radio link quality (RSSI, packet loss)
+- Modem configuration (faster = higher FPS, shorter range)
+- Camera FFC events (auto-calibration pauses streaming briefly)
+- Serial buffer processing speed
+
+**Optimizations:**
+- Latest frame buffer (no queue flushing - always fresh frame)
+- Best-effort delivery (no retries during streaming)
+- Efficient 8-bit encoding
+- Request-response flow control prevents buffer overflow
+
+**Typical Performance:**
+```
+Radio Config          Frame Rate    Transmission Time
+GFSK_Rb125Fd125       ~8-10 FPS     ~5.6s per frame
+GFSK_Rb57_6Fd28_8     ~4-6 FPS      ~12s per frame
+GFSK_Rb38_4Fd19_6     ~2-4 FPS      ~18s per frame
+```
+
+#### Livestream vs. Single Capture
+
+| Feature                | Livestream Mode       | Single Capture Mode      |
+|------------------------|-----------------------|--------------------------|
+| **Resolution**         | 80×60 @ 8-bit         | 160×120 @ 16-bit         |
+| **Data Size**          | 4,800 bytes           | 38,400 bytes             |
+| **Transmission Time**  | ~5.6s per frame       | ~45s per image           |
+| **Frame Rate**         | ~5-10 FPS             | <1 FPS                   |
+| **Frame Averaging**    | No (latest frame)     | Yes (10 frames avg)      |
+| **Error Correction**   | Best-effort           | CRC16 + packet retry     |
+| **Use Case**           | Real-time monitoring  | High-quality archival    |
+| **Data Archival**      | No (display only)     | Yes (CSV export)         |
+
+#### When to Use Livestream
+
+**Best For:**
+- Real-time situational awareness
+- Quick target scanning
+- Live thermal monitoring during operations
+- Verifying camera is working and pointed correctly
+- Demonstrating system capabilities
+
+**Not Ideal For:**
+- Scientific data collection (use single capture instead)
+- Archival imagery (no save function - display only)
+- Long-range operations (higher packet loss at distance)
+
+#### Troubleshooting Livestream
+
+**Issue:** Low frame rate or stuttering
+- **Solution:** Check radio link quality, reduce distance, or switch to faster modem config
+
+**Issue:** Visual artifacts (black patches in image)
+- **Cause:** Dropped radio packets (normal for best-effort streaming)
+- **Solution:** Acceptable if <20% packet loss; improve radio link if severe
+
+**Issue:** Stream won't start
+- **Check:**
+  1. Satellite RPI status: should show `RPI STATUS: IDLE` before streaming
+  2. Radio link active: try `ping` command first
+  3. Camera operational: test with single `capture` command first
+
+**Issue:** Stream won't stop
+- **Solution:** Send `stream stop` multiple times (5× with delays) to ensure delivery
+
+### Link Characterization (testcomms)
+
+The `testcomms` command automates repeated capture→request→export cycles to characterize
+the radio link — useful for long-range and antenna testing.
+
+```
+GS> testcomms 5
+```
+
+For each run it first measures link round-trip time via ping, then for every cycle reports:
+
+- **Throughput** (B/s): all bytes on air (original + retry) ÷ active radio time
+- **Goodput** (B/s): useful image bytes ÷ active radio time
+- **Integrity**: first-pass packet success rate → final rate after retry recovery
+- **Recovery rate**: fraction of missing packets recovered by retransmission
+- **Avg RSSI** (dBm) with sample count
+- **Link RTT** (ms) with one-way propagation estimate
+
+After all cycles complete, a summary of averages is printed. The Python CLI automatically
+detects the run and saves results to a timestamped file
+(`testcomms_results_YYYYMMDD_HHMMSS.csv`) with per-cycle and summary rows.
+
 ### Check Reception Statistics
 
 ```
-> radio status
+> rstatus
 Total Packets Expected: 854
 Packets Received: 850
 Packets Missing: 4
@@ -295,6 +518,19 @@ Ground station maintains:
 - Duplicate detection (same packet index received multiple times)
 - Missing packet range reporting
 - CRC error counters
+
+### Packet Retransmission (capture/request downlink)
+
+The capture/request downlink recovers dropped packets automatically:
+
+1. After the end packet, the ground station identifies which packet indices are missing.
+2. It sends a retry request (packet type `0xBB`) containing a bitmap of missing indices.
+3. The satellite retransmits only the requested packets.
+4. This repeats for up to `MAX_RETRY_ATTEMPTS = 2` rounds, with a short grace period
+   (~2.5s) after the end packet and a re-request timeout (~5s) between rounds.
+
+Retransmission applies to the capture/request flow only — livestream mode remains
+best-effort with no retries (speed over reliability).
 
 ## Telemetry & Monitoring
 
@@ -425,13 +661,28 @@ See [pdu_comm/pdu_protocol.h](pdu_comm/pdu_protocol.h) for complete protocol spe
 
 ## Known Issues & TODOs
 
-- [ ] Implement automatic packet retry logic on transmission failure
-- [ ] Add RSSI reporting to ground station CLI
-- [ ] Implement packet request/retransmission protocol for missing packets
+- [x] Automatic packet retry/retransmission for missing packets (ground-station-initiated, up to 2 rounds)
+- [x] RSSI reporting to ground station CLI (`pingloop`, reception status)
+- [x] Link characterization tooling (`testcomms` with CSV logging)
 - [ ] Add compression for thermal data to reduce transmission time
 - [ ] Create web-based ground station interface
 
 ## Version History
+
+### v2.1.0 (June 25, 2026) - Link Characterization Release
+
+**New Features:**
+- `testcomms <N>` command: runs N capture→request download cycles and reports per-cycle and
+  average throughput, goodput, integrity (first-pass and post-retry), recovery rate, RSSI, and link RTT
+- Automatic CSV logging of testcomms runs (`testcomms_results_YYYYMMDD_HHMMSS.csv`) via the Python CLI
+
+**Note:** `testcomms` is for link characterization only — it does not export thermal images per cycle.
+
+### v2.0.0 (December 8, 2025) - Livestream Release
+
+- Real-time thermal video streaming (`stream start`/`stream stop`) with 80×60 8-bit downsampled frames
+- Request-response UART flow control between Raspberry Pi and satellite Teensy
+- Best-effort, low-latency delivery optimized for live monitoring
 
 ### v1.0.0 (October 14, 2025) - Production Release
 
@@ -459,7 +710,7 @@ See [pdu_comm/pdu_protocol.h](pdu_comm/pdu_protocol.h) for complete protocol spe
 **System Specifications:**
 - Thermal image size: 120×160 pixels (38,400 bytes)
 - Frame averaging: 10 frames
-- Packet retry: Up to 3 retries per packet (TODO)
+- Packet retry: Ground-station-initiated retransmission, up to 2 retry rounds
 - CRC validation: Per-packet and full-image CRC16
 
 ## Contributing
@@ -488,5 +739,5 @@ For issues, questions, or feature requests, please open an issue on the project 
 
 ---
 
-**Project Status**: Production Ready (v1.0.0)
-**Last Updated**: October 14, 2025
+**Project Status**: Production Ready (v2.1.0)
+**Last Updated**: June 25, 2026

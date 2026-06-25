@@ -7,18 +7,18 @@ Reads data from serial port and allows user to send commands back
 Enhanced with CSV export detection and thermal data visualization
 
 @author EPSCOR C3M Team
-@date 2025-10-14
-@version 1.0.0
+@date 2025-03-23
+@version 2.1.0
 """
 
-__version__ = "1.0.0"
-__build_date__ = "2025-10-14"
+__version__ = "2.1.0"
+__build_date__ = "2025-03-23"
 
 import serial
 import threading
+import multiprocessing
 import sys
 import time
-import signal
 import os
 import subprocess
 import glob
@@ -33,6 +33,33 @@ THERMAL_CSV_START = "=== START CSV ==="
 THERMAL_CSV_END = "=== END CSV ==="
 THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---"
 ThermalCaptureTimestamp = datetime.now()
+
+# Testcomms result detection constants
+TESTCOMMS_START_MARKER   = "=== Test Comms:"
+TESTCOMMS_SUMMARY_MARKER = "=== TEST COMMS RESULTS ==="
+TESTCOMMS_RTT_MARKER     = "Link RTT"        # Last line of summary — triggers CSV save
+
+# Testcomms parsing state (reset each run)
+_tc = {
+    "active":        False,   # True while a testcomms run is in progress
+    "run_start":     None,    # datetime when run started
+    "num_cycles":    0,       # N from "=== Test Comms: N cycle(s) ==="
+    "cycles":        [],      # list of per-cycle dicts
+    "current":       None,    # dict being filled for the active cycle
+    "in_summary":    False,   # True after TESTCOMMS_SUMMARY_MARKER
+    "summary":       {},      # final averaged values
+}
+
+# Livestream protocol constants (binary protocol)
+STREAM_FRAME_MAGIC = b'WRM!'  # 4-byte magic header "WRM!" = 0x57 0x52 0x4D 0x21
+STREAM_FRAME_WIDTH = 80
+STREAM_FRAME_HEIGHT = 60
+STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4800 bytes
+STREAM_FRAME_HEADER_SIZE = 4 + 1 + 1 + 2  # magic + seq + pkts + checksum = 8 bytes
+STREAM_FRAME_TOTAL_SIZE = STREAM_FRAME_HEADER_SIZE + STREAM_FRAME_SIZE  # 8 + 4800 = 4808 bytes
+
+# Stream frame queue for viewer (multiprocessing for cross-process sharing)
+stream_frame_queue = multiprocessing.Queue(maxsize=10)  # Buffer up to 10 frames
 
 # Sensor telemetry cache
 sensor_cache = {"gps": {}, "imu": {}}
@@ -331,6 +358,181 @@ def get_next_thermal_filename():
     next_num = max_num + 1
     return f"thermal_data_{next_num:03d}.csv"
 
+def get_testcomms_filename():
+    """Return a testcomms CSV filename stamped with the current date and time."""
+    return datetime.now().strftime("testcomms_results_%Y%m%d_%H%M%S.csv")
+
+
+def save_testcomms_results(tc_state):
+    """Write testcomms run data to a CSV file."""
+    filename = get_testcomms_filename()
+    try:
+        with open(filename, 'w') as f:
+            run_start = tc_state["run_start"].isoformat(timespec="seconds") if tc_state["run_start"] else "unknown"
+            f.write(f"# testcomms run started {run_start}\n")
+            f.write(f"# requested_cycles,{tc_state['num_cycles']}\n")
+            rtt = tc_state["summary"].get("rtt_ms", "")
+            if rtt:
+                f.write(f"# link_rtt_ms,{rtt}\n")
+
+            # Header row
+            f.write("cycle,throughput_Bps,goodput_Bps,integrity_first_pct,integrity_final_pct,recovery_rate_pct,avg_rssi_dbm,rssi_samples,packets_received,packets_expected,crc_ok\n")
+
+            for cyc in tc_state["cycles"]:
+                f.write(",".join([
+                    str(cyc.get("cycle", "")),
+                    str(cyc.get("throughput_Bps", "")),
+                    str(cyc.get("goodput_Bps", "")),
+                    str(cyc.get("integrity_first_pct", "")),
+                    str(cyc.get("integrity_pct", "")),
+                    str(cyc.get("recovery_rate_pct", "")),
+                    str(cyc.get("avg_rssi_dbm", "")),
+                    str(cyc.get("rssi_samples", "")),
+                    str(cyc.get("packets_received", "")),
+                    str(cyc.get("packets_expected", "")),
+                    str(cyc.get("crc_ok", "")),
+                ]) + "\n")
+
+            # Averages row
+            s = tc_state["summary"]
+            f.write(",".join([
+                "AVERAGE",
+                str(s.get("avg_throughput_Bps", "")),
+                str(s.get("avg_goodput_Bps", "")),
+                str(s.get("avg_integrity_first_pct", "")),
+                str(s.get("avg_integrity_final_pct", "")),
+                str(s.get("avg_recovery_rate_pct", "")),
+                str(s.get("avg_rssi_dbm", "")),
+                "",
+                str(s.get("cycles_completed", "")),
+                str(tc_state["num_cycles"]),
+                "",
+            ]) + "\n")
+
+        print(f"\nTestcomms results saved to: {filename}")
+        return filename
+    except Exception as e:
+        print(f"\nError saving testcomms results: {e}")
+        return None
+
+
+def _parse_testcomms_line(line):
+    """Update testcomms parse state from a single serial line."""
+    stripped = line.strip()
+
+    # Start of a new run
+    if TESTCOMMS_START_MARKER in stripped:
+        _tc["active"]     = True
+        _tc["run_start"]  = datetime.now()
+        _tc["cycles"]     = []
+        _tc["current"]    = None
+        _tc["in_summary"] = False
+        _tc["summary"]    = {}
+        try:
+            m_cycles = re.search(r"(\d+)\s+cycle", stripped)
+            _tc["num_cycles"] = int(m_cycles.group(1)) if m_cycles else 0
+        except (AttributeError, ValueError):
+            _tc["num_cycles"] = 0
+        return
+
+    if not _tc["active"]:
+        return
+
+    # New cycle heading  "--- Cycle N / M"
+    m = re.match(r"---\s+Cycle\s+(\d+)\s*/\s*(\d+)", stripped)
+    if m:
+        if _tc["current"] is not None:
+            _tc["cycles"].append(_tc["current"])
+        _tc["current"] = {"cycle": int(m.group(1))}
+        _tc["in_summary"] = False
+        return
+
+    # Per-cycle metric lines
+    if _tc["current"] is not None and not _tc["in_summary"]:
+        m = re.search(r"Throughput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["current"]["throughput_Bps"] = float(m.group(1))
+            return
+        m = re.search(r"Goodput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["current"]["goodput_Bps"] = float(m.group(1))
+            return
+        # With retries: "X% first-pass → Y% after retry (A→B/C pkts, CRC OK)"
+        m = re.search(r"Integrity\s*:\s*([\d.]+)%\s*first-pass\s*→\s*([\d.]+)%\s*after retry\s*\((\d+)→(\d+)/(\d+)\s*pkts,\s*CRC\s*(\w+)", stripped)
+        if m:
+            _tc["current"]["integrity_first_pct"] = float(m.group(1))
+            _tc["current"]["integrity_pct"]        = float(m.group(2))
+            _tc["current"]["packets_received"]     = int(m.group(4))
+            _tc["current"]["packets_expected"]     = int(m.group(5))
+            _tc["current"]["crc_ok"]               = m.group(6).upper() == "OK"
+            return
+        # No retries: "X% (A/B pkts, CRC OK)"
+        m = re.search(r"Integrity\s*:\s*([\d.]+)%\s*\((\d+)/(\d+)\s*pkts,\s*CRC\s*(\w+)", stripped)
+        if m:
+            _tc["current"]["integrity_first_pct"] = float(m.group(1))
+            _tc["current"]["integrity_pct"]        = float(m.group(1))
+            _tc["current"]["packets_received"]     = int(m.group(2))
+            _tc["current"]["packets_expected"]     = int(m.group(3))
+            _tc["current"]["crc_ok"]               = m.group(4).upper() == "OK"
+            return
+        m = re.search(r"Recovery\s*:\s*([\d.]+)%\s*\((\d+)/(\d+)\s*lost", stripped)
+        if m:
+            _tc["current"]["recovery_rate_pct"]    = float(m.group(1))
+            _tc["current"]["packets_recovered"]    = int(m.group(2))
+            _tc["current"]["packets_lost_initial"] = int(m.group(3))
+            return
+        m = re.search(r"Avg RSSI\s*:\s*([-\d.]+)\s*dBm.*\((\d+)\s*sample", stripped)
+        if m:
+            _tc["current"]["avg_rssi_dbm"] = float(m.group(1))
+            _tc["current"]["rssi_samples"] = int(m.group(2))
+            return
+
+    # Summary section
+    if TESTCOMMS_SUMMARY_MARKER in stripped:
+        if _tc["current"] is not None:
+            _tc["cycles"].append(_tc["current"])
+            _tc["current"] = None
+        _tc["in_summary"] = True
+        return
+
+    if _tc["in_summary"]:
+        m = re.search(r"Cycles completed\s*:\s*(\d+)", stripped)
+        if m:
+            _tc["summary"]["cycles_completed"] = int(m.group(1))
+            return
+        m = re.search(r"Avg Throughput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_throughput_Bps"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Goodput\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_goodput_Bps"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Integrity \(1st\)\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_integrity_first_pct"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Integrity \(final\)\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_integrity_final_pct"] = float(m.group(1))
+            return
+        m = re.search(r"Avg Recovery Rate\s*:\s*([\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_recovery_rate_pct"] = float(m.group(1))
+            return
+        m = re.search(r"Avg RSSI\s*:\s*([-\d.]+)", stripped)
+        if m:
+            _tc["summary"]["avg_rssi_dbm"] = float(m.group(1))
+            return
+        m = re.search(r"Link RTT\s*:\s*(\d+)", stripped)
+        if m:
+            _tc["summary"]["rtt_ms"] = int(m.group(1))
+            # RTT is the last summary line — save results now
+            _tc["active"] = False
+            save_testcomms_results(_tc)
+            return
+
+
 def save_thermal_data(csv_data, filename):
     """Save CSV data to file"""
     try:
@@ -348,11 +550,11 @@ def run_thermal_viewer(filename):
         # Get the directory of the current script
         script_dir = os.path.dirname(os.path.abspath(__file__))
         viewer_script = os.path.join(script_dir, "thermal_data_viewer.py")
-        
+
         if not os.path.exists(viewer_script):
             print(f"❌ Thermal viewer script not found: {viewer_script}")
             return False
-        
+
         # Run the thermal viewer with the filename as argument
         print(f"🖼️  Opening thermal data viewer for: {filename}")
         subprocess.Popen([sys.executable, viewer_script, filename])
@@ -361,83 +563,256 @@ def run_thermal_viewer(filename):
         print(f"❌ Error running thermal viewer: {e}")
         return False
 
+
+def _viewer_process(queue):
+    """
+    Viewer process function - runs matplotlib in its own process (main thread).
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+
+    print("🎬 Starting livestream viewer...")
+    print("Waiting for stream frames...")
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Initialize with blank image (80x60)
+    initial_data = np.zeros((60, 80), dtype=np.uint8)
+    image = ax.imshow(initial_data, cmap='hot', vmin=0, vmax=255, aspect='equal',
+                      interpolation='nearest')
+    fig.colorbar(image, ax=ax, label='Intensity (0-255)')
+
+    ax.set_title('Thermal Livestream - Waiting for frames...')
+    ax.set_xlabel('Column')
+    ax.set_ylabel('Row')
+
+    frame_count = [0]
+
+    def update_frame(_):
+        try:
+            frame_data = queue.get_nowait()
+            frame_bytes = frame_data['data']
+            seq = frame_data['seq']
+            info = frame_data.get('info', '')
+
+            frame_array = np.frombuffer(frame_bytes, dtype=np.uint8)
+            frame_array = frame_array.reshape((60, 80))
+
+            image.set_data(frame_array)
+            frame_count[0] += 1
+            ax.set_title(f'Thermal Livestream - Frame {seq} ({info})')
+        except:
+            pass
+        return [image]
+
+    ani = FuncAnimation(fig, update_frame, interval=50, blit=True, cache_frame_data=False)
+    plt.show()
+    print(f"\nViewer closed. Frames displayed: {frame_count[0]}")
+
+
+def run_stream_viewer():
+    """
+    Run the thermal data viewer in livestream mode.
+    Runs in a separate process so GUI runs on main thread.
+    """
+    try:
+        import numpy as np
+        import matplotlib
+    except ImportError as e:
+        print(f"❌ Missing required module: {e}")
+        print("Install with: pip install matplotlib numpy")
+        return False
+
+    # Start viewer in a separate process
+    viewer_proc = multiprocessing.Process(target=_viewer_process, args=(stream_frame_queue,), daemon=True)
+    viewer_proc.start()
+    return True
+
 def read_serial(ser, stop_event):
-    """Read data from serial port in a separate thread"""
+    """Read data from serial port in a separate thread.
+
+    Handles both text-based commands/status and binary stream frames.
+    Binary frames use magic header 0xCAFEBABE for detection.
+    """
     global ThermalCaptureTimestamp
     csv_capture_mode = False
     csv_data = []
-    
+    partial_line_buffer = ""  # Buffer for incomplete lines during CSV capture
+
+    # Buffer for handling mixed text/binary data
+    raw_buffer = bytearray()
+    stream_frames_received = 0
+
     while not stop_event.is_set():
         try:
             if ser.in_waiting > 0:
-                data = ser.readline().decode('utf-8', errors='ignore')
-                if data:
-                    # Print the data as-is, preserving original newlines
-                    print(f"{data}", end='', flush=True)
+                # Read available bytes into buffer
+                new_data = ser.read(ser.in_waiting)
+                raw_buffer.extend(new_data)
 
-                    # Update sensor telemetry cache with incoming line
-                    update_sensor_cache(data)
-                    
-                    # Check for thermal data capture command time and save it for the csv.
-                    if THERMAL_CAPTURE_TIMESTAMP_FLAG in data:
-                        ThermalCaptureTimestamp = datetime.now()
-                        continue
+                # Process buffer - look for binary stream frames first
+                while True:
+                    # Check for stream frame magic in buffer
+                    magic_pos = raw_buffer.find(STREAM_FRAME_MAGIC)
 
-                    # Check for CSV start marker
-                    if THERMAL_CSV_START in data:
-                        print(f"\n🎯 CSV export detected! Starting data capture...")
-                        csv_capture_mode = True
-                        csv_data = []
-                        if THERMAL_CAPTURE_TIMESTAMP_FLAG not in data:
-                            ThermalCaptureTimestamp = datetime.now()
-                        continue
-                    
-                    # Check for CSV end marker
-                    if THERMAL_CSV_END in data:
-                        if csv_capture_mode:
-                            print(f"\n🏁 CSV export complete! Processing data...")
-                            csv_capture_mode = False
-                            
-                            # Save the captured data
-                            metadata_lines = build_sensor_metadata_lines(ThermalCaptureTimestamp)
-                            if metadata_lines:
-                                csv_content = '\n'.join(metadata_lines + [''] + csv_data)
+                    if magic_pos >= 0:
+                        # Found magic header
+                        # First, process any text data BEFORE the magic
+                        if magic_pos > 0:
+                            text_chunk = raw_buffer[:magic_pos]
+                            csv_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, partial_line_buffer)
+                            raw_buffer = raw_buffer[magic_pos:]
+                            magic_pos = 0
+
+                        # Check if we have a complete frame (4808 bytes total)
+                        frame_data_needed = STREAM_FRAME_TOTAL_SIZE
+                        if len(raw_buffer) >= frame_data_needed:
+                            # Extract frame
+                            frame_packet = raw_buffer[:frame_data_needed]
+                            raw_buffer = raw_buffer[frame_data_needed:]
+
+                            # Parse binary frame
+                            # Format: [magic:4][seq:1][pkts:1][checksum:2][data:4800]
+                            seq = frame_packet[4]
+                            pkts = frame_packet[5]
+                            checksum_received = frame_packet[6] | (frame_packet[7] << 8)
+                            frame_data = bytes(frame_packet[8:8+STREAM_FRAME_SIZE])
+
+                            # Validate checksum
+                            checksum_computed = sum(frame_data) & 0xFFFF
+
+                            # Validate pkts is reasonable (50-107)
+                            if pkts < 50 or pkts > 107:
+                                print(f"[STREAM] Bad pkts={pkts}, skipping")
+                                continue
+
+                            if checksum_received == checksum_computed:
+                                stream_frames_received += 1
+                                try:
+                                    stream_frame_queue.put_nowait({
+                                        'seq': seq,
+                                        'data': frame_data,
+                                        'info': f'pkts={pkts}/107'
+                                    })
+                                    if stream_frames_received % 10 == 1:
+                                        print(f"[STREAM] Frame {seq} OK (pkts={pkts}/107, chk={checksum_computed})")
+                                except:
+                                    pass  # Queue full, drop frame
                             else:
-                                csv_content = '\n'.join(csv_data)
-                            filename = get_next_thermal_filename()
-                            
-                            if save_thermal_data(csv_content, filename):
-                                # Run the thermal viewer
-                                run_thermal_viewer(filename)
-                            
-                            csv_data = []  # Clear for next capture
-                        continue
-                    
-                    # If in CSV capture mode, collect the data
-                    if csv_capture_mode:
-                        # Remove the "Teensy: " prefix and store clean data
-                        clean_data = (
-                            data.replace("Teensy: ", "")
-                            .replace("SAT> ", "")
-                            .rstrip('\n\r')
-                        )
-                        if clean_data:  # Only add non-empty lines
-                            csv_data.append(clean_data)
-                    
-                    # Check for reset message
-                    if "Resetting system..." in data:
-                        print("\nDetected system reset. Press 'Enter' twice to exit.")
-                        stop_event.set()
-                        # Send SIGINT to interrupt the main thread
-                        signal.raise_signal(signal.SIGINT)
-                        break  # Exit the read thread immediately
-                        
+                                print(f"[STREAM] Checksum mismatch: got {checksum_received}, computed {checksum_computed}")
+                        else:
+                            # Not enough data yet, wait for more
+                            break
+                    else:
+                        # No magic found - process as text up to partial magic possibility
+                        # Keep last 3 bytes in case magic is split across reads
+                        if len(raw_buffer) > 3:
+                            text_chunk = raw_buffer[:-3]
+                            raw_buffer = raw_buffer[-3:]
+                            csv_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, partial_line_buffer)
+                        break
             else:
-                # Small sleep to prevent busy waiting
+                # No data waiting - flush any remaining text in buffer
+                if len(raw_buffer) > 0 and raw_buffer.find(STREAM_FRAME_MAGIC) < 0:
+                    csv_capture_mode, partial_line_buffer = process_text_data(raw_buffer, csv_capture_mode, csv_data, partial_line_buffer)
+                    raw_buffer.clear()
                 time.sleep(0.01)
         except Exception as e:
             print(f"Read error: {e}")
             break
+
+
+def process_text_data(data_bytes, csv_capture_mode, csv_data, partial_line_buffer):
+    """Process text data from serial, handling CSV capture and display.
+
+    Returns updated (csv_capture_mode, partial_line_buffer) tuple.
+    partial_line_buffer holds incomplete lines that don't end with newline.
+    """
+    global ThermalCaptureTimestamp
+
+    try:
+        text = data_bytes.decode('utf-8', errors='ignore')
+    except:
+        return csv_capture_mode, partial_line_buffer
+
+    # Prepend any buffered partial line from previous call
+    if partial_line_buffer:
+        text = partial_line_buffer + text
+        partial_line_buffer = ""
+
+    # Split into lines
+    lines = text.split('\n')
+
+    # If data doesn't end with newline, last element is a partial line - buffer it
+    if not text.endswith('\n') and len(lines) > 0:
+        partial_line_buffer = lines[-1]
+        lines = lines[:-1]
+
+    for line in lines:
+        if not line:
+            continue
+
+        # Print text data with newline
+        print(line, flush=True)
+
+        # Update sensor telemetry cache
+        update_sensor_cache(line)
+
+        # Parse testcomms results
+        _parse_testcomms_line(line)
+
+        # Check for thermal data capture timestamp
+        if THERMAL_CAPTURE_TIMESTAMP_FLAG in line:
+            ThermalCaptureTimestamp = datetime.now()
+            continue
+
+        # Check for CSV start marker
+        if THERMAL_CSV_START in line:
+            print(f"\n🎯 CSV export detected! Starting data capture...")
+            csv_capture_mode = True
+            csv_data.clear()
+            if THERMAL_CAPTURE_TIMESTAMP_FLAG not in line:
+                ThermalCaptureTimestamp = datetime.now()
+            continue
+
+        # Check for CSV end marker
+        if THERMAL_CSV_END in line:
+            if csv_capture_mode:
+                print(f"\n🏁 CSV export complete! Processing data...")
+                csv_capture_mode = False
+
+                # Save the captured data
+                metadata_lines = build_sensor_metadata_lines(ThermalCaptureTimestamp)
+                if metadata_lines:
+                    csv_content = '\n'.join(metadata_lines + [''] + csv_data)
+                else:
+                    csv_content = '\n'.join(csv_data)
+                filename = get_next_thermal_filename()
+
+                if save_thermal_data(csv_content, filename):
+                    run_thermal_viewer(filename)
+
+                csv_data.clear()
+            continue
+
+        # If in CSV capture mode, collect the data
+        if csv_capture_mode:
+            clean_data = (
+                line.replace("Teensy: ", "")
+                .replace("SAT> ", "")
+                .rstrip('\n\r')
+            )
+            if clean_data:
+                csv_data.append(clean_data)
+
+        # Check for reset message
+        if "Resetting system..." in line:
+            print("\nDetected system reset. Press 'Enter' twice to exit.")
+
+    return csv_capture_mode, partial_line_buffer
+
+
 
 def main():
     # Find and connect to serial port
@@ -483,8 +858,24 @@ def main():
                 
                 if user_input.lower() in ['quit', 'exit']:
                     break
-                
+
+                # Handle local commands
+                if user_input.lower() == 'view':
+                    # Start the livestream viewer
+                    run_stream_viewer()
+                    continue
+                elif user_input.lower() == 'help local':
+                    print("Local CLI commands:")
+                    print("  view       - Open livestream viewer window")
+                    print("  quit/exit  - Exit the CLI")
+                    continue
+
                 if user_input:
+                    # Check if this is a stream start command - auto-launch viewer
+                    if user_input.lower() in ['stream start', 'stream 1']:
+                        print("🎬 Auto-launching livestream viewer...")
+                        run_stream_viewer()
+
                     ser.write((user_input + '\n').encode())
                     #useful debug print(f"Sent: {user_input}")
                     
@@ -515,4 +906,6 @@ def main():
             print("\nSerial connection closed.")
 
 if __name__ == "__main__":
+    # Required for multiprocessing on macOS
+    multiprocessing.set_start_method('spawn', force=True)
     main()

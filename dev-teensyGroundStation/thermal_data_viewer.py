@@ -7,21 +7,28 @@ Usage: python thermal_data_viewer.py [filename]
 If no filename is provided, defaults to thermal_data_001.csv
 
 @author EPSCOR C3M Team
-@date 2025-10-14
-@version 1.0.0
+@date 2025-12-08
+@version 2.0.0
 """
 
-__version__ = "1.0.0"
-__build_date__ = "2025-10-14"
+__version__ = "2.0.0"
+__build_date__ = "2025-12-08"
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import sys
 import os
 import webbrowser
+import argparse
 from io import StringIO
 from matplotlib.offsetbox import TextArea, AnnotationBbox
 from matplotlib.widgets import Button
+
+# Livestream constants
+STREAM_FRAME_WIDTH = 80
+STREAM_FRAME_HEIGHT = 60
+STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4800 bytes
 
 def _parse_ddmm_mmmm(coord):
     """Return DMS text and decimal degrees from DDMM.MMMM coordinate strings."""
@@ -150,41 +157,133 @@ def load_thermal_file(filename):
     data = np.loadtxt(data_buffer, delimiter=",")
     return data, metadata
 
-def main():
-    # Get filename from command line argument or use default
-    if len(sys.argv) > 1:
-        filename = sys.argv[1]
-        print("Using filename: " + filename) 
-    else:
-        filename = 'thermal_data_001.csv'
-        print("Using default filename: " + filename) 
-    
+def run_livestream_viewer():
+    """
+    Run the livestream viewer mode.
+    Connects to the stream_frame_queue from the CLI and displays frames in real-time.
+    """
+    # Import the queue from the CLI module
+    try:
+        from ground_station_serial_cli_teensy import stream_frame_queue
+    except ImportError:
+        print("Error: Cannot import stream_frame_queue from CLI module")
+        print("Make sure ground_station_serial_cli_teensy.py is in the same directory")
+        return
+
+    print("Starting livestream viewer...")
+    print("Waiting for stream frames from ground station...")
+    print("Press Ctrl+C or close window to exit")
+
+    # Set up the figure and axis
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Initialize with blank image (80x60)
+    initial_data = np.zeros((STREAM_FRAME_HEIGHT, STREAM_FRAME_WIDTH), dtype=np.uint8)
+    image = ax.imshow(initial_data, cmap='hot', vmin=0, vmax=255, aspect='equal',
+                      interpolation='nearest')
+    cbar = fig.colorbar(image, ax=ax, label='Intensity (0-255)')
+
+    ax.set_title('Thermal Livestream - Waiting for frames...')
+    ax.set_xlabel('Column')
+    ax.set_ylabel('Row')
+
+    # Stats text
+    stats_text = ax.text(0.02, 0.98, '', transform=ax.transAxes,
+                         verticalalignment='top', fontsize=9,
+                         bbox=dict(boxstyle='round', facecolor='black', alpha=0.7),
+                         color='white')
+
+    frame_count = 0
+    last_seq = -1
+
+    def update_frame(frame_num):
+        nonlocal frame_count, last_seq
+
+        try:
+            # Try to get a frame from the queue (non-blocking)
+            frame_data = stream_frame_queue.get_nowait()
+
+            frame_bytes = frame_data['data']
+            seq = frame_data['seq']
+            info = frame_data.get('info', '')
+
+            # Convert bytes to numpy array and reshape
+            frame_array = np.frombuffer(frame_bytes, dtype=np.uint8)
+            frame_array = frame_array.reshape((STREAM_FRAME_HEIGHT, STREAM_FRAME_WIDTH))
+
+            # Update the image
+            image.set_array(frame_array)
+
+            # Update stats
+            frame_count += 1
+            dropped = 0
+            if last_seq >= 0:
+                expected_seq = (last_seq + 1) & 0xFF
+                if seq != expected_seq:
+                    dropped = (seq - expected_seq) & 0xFF
+            last_seq = seq
+
+            min_val = frame_array.min()
+            max_val = frame_array.max()
+            mean_val = frame_array.mean()
+
+            # Convert 8-bit intensity back to approximate temperature
+            # 0=0°C, 255=100°C based on downsample mapping
+            min_temp = min_val / 255.0 * 100.0
+            max_temp = max_val / 255.0 * 100.0
+            mean_temp = mean_val / 255.0 * 100.0
+
+            stats_str = (f'Frame: {frame_count} | Seq: {seq} | {info}\n'
+                         f'Temp: {min_temp:.1f}°C - {max_temp:.1f}°C (mean: {mean_temp:.1f}°C)')
+            if dropped > 0:
+                stats_str += f'\nDropped: {dropped} frames'
+
+            stats_text.set_text(stats_str)
+            ax.set_title(f'Thermal Livestream - Frame {frame_count}', fontsize=12)
+
+        except:
+            # No frame available, keep current display
+            pass
+
+        return [image, stats_text]
+
+    # Create animation (update every 50ms = 20fps max)
+    ani = animation.FuncAnimation(fig, update_frame, interval=50, blit=True, cache_frame_data=False)
+
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\nLivestream ended. Total frames displayed: {frame_count}")
+
+
+def view_thermal_file(filename):
+    """View a thermal data CSV file"""
     # Check if file exists
     if not os.path.exists(filename):
         print(f"Error: File '{filename}' not found!")
         print("Usage: python thermal_data_viewer.py [filename]")
         return
-    
+
     try:
         # Load the thermal data
         print(f"Loading thermal data from: {filename}")
         data, metadata = load_thermal_file(filename)
-        
+
         # Display as thermal image
         fig, ax = plt.subplots(figsize=(12, 8))
         image = ax.imshow(data, cmap='hot', aspect='auto')
         fig.colorbar(image, ax=ax, label='Temperature (°C)')
-        
+
         # Add some statistics
         min_temp = np.nanmin(data)
         max_temp = np.nanmax(data)
         mean_temp = np.nanmean(data)
-        
+
         # Build title and subtitle
         main_title = f'Thermal Image from Flat Sat - {filename}'
-        
+
         subtitle_parts = [f'Min: {min_temp:.1f}°C, Max: {max_temp:.1f}°C, Mean: {mean_temp:.1f}°C']
-        
+
         if metadata.get("captured_at"):
             subtitle_parts.append(f'Captured: {metadata["captured_at"]}')
 
@@ -220,13 +319,13 @@ def main():
                 f"https://maps.google.com/maps?q="
                 f"{gps_location_decimal[0]:.6f},{gps_location_decimal[1]:.6f}"
             )
-        
+
         subtitle = '\n'.join(subtitle_parts)
-        
+
         ax.set_title(main_title + '\n' + subtitle, fontsize=10, pad=10)
         ax.set_xlabel('Column')
         ax.set_ylabel('Row')
-        
+
         if maps_link:
             fig.subplots_adjust(top=0.80, bottom=0.1)
             button_ax = fig.add_axes([0.35, 0.92, 0.20, 0.05])
@@ -238,9 +337,9 @@ def main():
             maps_button.on_clicked(on_button_click)
         else:
             fig.tight_layout()
-        
+
         plt.show()
-        
+
         print(f"Thermal image displayed successfully!")
         print(f"Temperature range: {min_temp:.1f}°C to {max_temp:.1f}°C")
         print(f"Mean temperature: {mean_temp:.1f}°C")
@@ -252,11 +351,30 @@ def main():
                 print(f"Google Maps: {maps_link}")
         elif gps_location_raw:
             print(f"GPS location unparsed: {gps_location_raw}")
-        
+
         print("GS> ")
     except Exception as e:
         print(f"Error loading or displaying thermal data: {e}")
         print("Make sure the file contains valid CSV data with temperature values.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Thermal Data Viewer - View thermal images from CSV or livestream'
+    )
+    parser.add_argument('filename', nargs='?', default='thermal_data_001.csv',
+                        help='CSV file to view (default: thermal_data_001.csv)')
+    parser.add_argument('--stream', action='store_true',
+                        help='Run in livestream mode to view real-time thermal data')
+
+    args = parser.parse_args()
+
+    if args.stream:
+        run_livestream_viewer()
+    else:
+        print(f"Using filename: {args.filename}")
+        view_thermal_file(args.filename)
+
 
 if __name__ == "__main__":
     main()
