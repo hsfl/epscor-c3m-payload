@@ -1,9 +1,9 @@
 # EPSCOR C3M CubeSat Payload System
 
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](https://github.com/yourusername/epscor-c3m-payload)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/yourusername/epscor-c3m-payload)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Version 2.0.0** - Livestream Release (December 8, 2025)
+**Version 2.1.0** - Link Characterization Release (March 23, 2026)
 
 A complete thermal imaging payload system for CubeSat applications, featuring satellite-side thermal capture and ground station data reception via UHF radio link.
 
@@ -21,9 +21,11 @@ The EPSCOR C3M system captures thermal images from space and transmits them to a
 - **Frame Averaging**: 10-frame averaging for noise reduction
 - **Robust Radio Link**: 433MHz UHF transmission using RFM23BP transceivers (1W output power)
 - **Error Detection**: CRC16 validation on both per-packet and full-image levels
-- **Packet Recovery**: Tracks missing/duplicate packets with automatic reporting
+- **Packet Recovery**: Tracks missing/duplicate packets and automatically requests retransmission of missing packets (ground-station-initiated, up to 2 retry rounds)
+- **Link Characterization**: `testcomms` command runs repeated download cycles and reports throughput, goodput, integrity, recovery rate, RSSI, and RTT — with automatic CSV logging for long-range testing. note that testcomms does not run export and so it does not save the images from each test.
 - **Real-time Visualization**: Automatic CSV export and matplotlib-based thermal visualization
 - **Telemetry System**: 7× temperature sensors, 5× current sensors for system monitoring
+- **Signal Monitoring**: RSSI reporting via `pingloop` and radio reception status
 - **Debug/Flight Modes**: Verbose logging for development, minimal logging for production
 
 ## System Architecture
@@ -153,11 +155,17 @@ python ground_station_serial_cli_teensy.py
 
 In the ground station CLI:
 ```
-> capture      # Start averaging frames for thermal data
-> request      # Begin downlink of thermal data to ground station
-> export       # Export received data as CSV (auto-visualizes)
-> reset        # Software reset the flight satellite
+> capture          # Start averaging frames for thermal data
+> request          # Begin downlink of thermal data to ground station
+> export           # Export received data as CSV (auto-visualizes)
+> ping             # Test communication between GS and satellite
+> pingloop         # Continuously ping satellite and report RSSI
+> rstatus          # Show radio reception status
+> stream start     # Start thermal livestream (stream stop to end)
+> testcomms <N>    # Run N download cycles and report link metrics (auto-saves CSV)
 ```
+
+Run `help` in the CLI for the full command list.
 
 ## Configuration
 
@@ -440,10 +448,32 @@ GFSK_Rb38_4Fd19_6     ~2-4 FPS      ~18s per frame
 **Issue:** Stream won't stop
 - **Solution:** Send `stream stop` multiple times (5× with delays) to ensure delivery
 
+### Link Characterization (testcomms)
+
+The `testcomms` command automates repeated capture→request→export cycles to characterize
+the radio link — useful for long-range and antenna testing.
+
+```
+GS> testcomms 5
+```
+
+For each run it first measures link round-trip time via ping, then for every cycle reports:
+
+- **Throughput** (B/s): all bytes on air (original + retry) ÷ active radio time
+- **Goodput** (B/s): useful image bytes ÷ active radio time
+- **Integrity**: first-pass packet success rate → final rate after retry recovery
+- **Recovery rate**: fraction of missing packets recovered by retransmission
+- **Avg RSSI** (dBm) with sample count
+- **Link RTT** (ms) with one-way propagation estimate
+
+After all cycles complete, a summary of averages is printed. The Python CLI automatically
+detects the run and saves results to a timestamped file
+(`testcomms_results_YYYYMMDD_HHMMSS.csv`) with per-cycle and summary rows.
+
 ### Check Reception Statistics
 
 ```
-> radio status
+> rstatus
 Total Packets Expected: 854
 Packets Received: 850
 Packets Missing: 4
@@ -488,6 +518,19 @@ Ground station maintains:
 - Duplicate detection (same packet index received multiple times)
 - Missing packet range reporting
 - CRC error counters
+
+### Packet Retransmission (capture/request downlink)
+
+The capture/request downlink recovers dropped packets automatically:
+
+1. After the end packet, the ground station identifies which packet indices are missing.
+2. It sends a retry request (packet type `0xBB`) containing a bitmap of missing indices.
+3. The satellite retransmits only the requested packets.
+4. This repeats for up to `MAX_RETRY_ATTEMPTS = 2` rounds, with a short grace period
+   (~2.5s) after the end packet and a re-request timeout (~5s) between rounds.
+
+Retransmission applies to the capture/request flow only — livestream mode remains
+best-effort with no retries (speed over reliability).
 
 ## Telemetry & Monitoring
 
@@ -618,13 +661,28 @@ See [pdu_comm/pdu_protocol.h](pdu_comm/pdu_protocol.h) for complete protocol spe
 
 ## Known Issues & TODOs
 
-- [ ] Implement automatic packet retry logic on transmission failure
-- [ ] Add RSSI reporting to ground station CLI
-- [ ] Implement packet request/retransmission protocol for missing packets
+- [x] Automatic packet retry/retransmission for missing packets (ground-station-initiated, up to 2 rounds)
+- [x] RSSI reporting to ground station CLI (`pingloop`, reception status)
+- [x] Link characterization tooling (`testcomms` with CSV logging)
 - [ ] Add compression for thermal data to reduce transmission time
 - [ ] Create web-based ground station interface
 
 ## Version History
+
+### v2.1.0 (June 25, 2026) - Link Characterization Release
+
+**New Features:**
+- `testcomms <N>` command: runs N capture→request download cycles and reports per-cycle and
+  average throughput, goodput, integrity (first-pass and post-retry), recovery rate, RSSI, and link RTT
+- Automatic CSV logging of testcomms runs (`testcomms_results_YYYYMMDD_HHMMSS.csv`) via the Python CLI
+
+**Note:** `testcomms` is for link characterization only — it does not export thermal images per cycle.
+
+### v2.0.0 (December 8, 2025) - Livestream Release
+
+- Real-time thermal video streaming (`stream start`/`stream stop`) with 80×60 8-bit downsampled frames
+- Request-response UART flow control between Raspberry Pi and satellite Teensy
+- Best-effort, low-latency delivery optimized for live monitoring
 
 ### v1.0.0 (October 14, 2025) - Production Release
 
@@ -652,7 +710,7 @@ See [pdu_comm/pdu_protocol.h](pdu_comm/pdu_protocol.h) for complete protocol spe
 **System Specifications:**
 - Thermal image size: 120×160 pixels (38,400 bytes)
 - Frame averaging: 10 frames
-- Packet retry: Up to 3 retries per packet (TODO)
+- Packet retry: Ground-station-initiated retransmission, up to 2 retry rounds
 - CRC validation: Per-packet and full-image CRC16
 
 ## Contributing
@@ -681,5 +739,5 @@ For issues, questions, or feature requests, please open an issue on the project 
 
 ---
 
-**Project Status**: Production Ready (v1.0.0)
-**Last Updated**: October 14, 2025
+**Project Status**: Production Ready (v2.1.0)
+**Last Updated**: June 25, 2026
