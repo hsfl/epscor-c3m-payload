@@ -37,12 +37,9 @@ import numpy as np
 import time
 import serial
 import cv2
-from queue import Queue, Empty, Full
-import threading
 import pyudev
 import re
 import os
-import sys
 
 # UART Configuration for Teensy communication
 UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
@@ -52,15 +49,13 @@ STREAM_START_COMMAND = b'STREAM_START\n'  # Command to start livestream mode
 STREAM_STOP_COMMAND = b'STREAM_STOP\n'    # Command to stop livestream mode
 FRAME_REQUEST_COMMAND = b'FRAME\n'        # Command to request a single stream frame
 
+# Scan /dev/video* devices and return the index whose USB vendor ID matches the FLIR Boson Camera 
 def find_boson_index(vendor_id="09cb"):
-    """
-    Scan /dev/video* devices and return the index whose USB vendor ID matches the FLIR Boson.
-    """
     context = pyudev.Context()
     candidates = []
 
     for device in context.list_devices(subsystem='video4linux'):
-        node = device.device_node  # e.g. /dev/video0
+        node = device.device_node
         if not node:
             continue
 
@@ -75,11 +70,12 @@ def find_boson_index(vendor_id="09cb"):
             candidates.append((index, node, vid))
 
     if not candidates:
-        raise RuntimeError("No Boson-matching video device found.")
+        raise RuntimeError(f"Could not find Boson camera in usb devices. Confirm that the vendor id is {vendor_id}")
 
-    candidates.sort()  # lowest index = usually the primary raw stream
+    candidates.sort()
     return candidates[0][0]
 
+# Takes in 16-bit thermal data and normalizes it to 8-bit for image generation
 def normalize_thermal(frame16, low_pct=1, high_pct=99):
     lo, hi = np.percentile(frame16, (low_pct, high_pct))
     if hi <= lo:
@@ -88,11 +84,9 @@ def normalize_thermal(frame16, low_pct=1, high_pct=99):
     norm = ((clipped - lo) / (hi - lo) * 255).astype(np.uint8)
     return norm
 
-def record_boson_frame(camera_index):
-    dir = '/home/artemis4/debug'
-    path = os.path.join(dir, "boson_image.png")
-    os.makedirs(dir, exist_ok=True)
-
+# Takes one thermal capture and returns the image data in bytes
+# If debug is enabled, this function will also generate a png image of the thermal capture 
+def record_boson_frame(camera_index, debug=False):
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
 
     try:
@@ -114,12 +108,18 @@ def record_boson_frame(camera_index):
         else:
             frame16 = frame
 
-        norm = normalize_thermal(frame16)
-        write = cv2.imwrite(path, norm)
-        if write:
-            print(f"Image saved to {path}")
-        else:
-            print("Failed to save snapshot")
+        if debug:
+            dir = '/home/artemis4/debug'
+            path = os.path.join(dir, "boson_image.png")
+            os.makedirs(dir, exist_ok=True)
+
+            norm = normalize_thermal(frame16)
+            write = cv2.imwrite(path, norm)
+
+            if write:
+                print(f"Image saved to {path}")
+            else:
+                print("Failed to save thermal image")
 
         return frame16.tobytes()
     finally:
@@ -135,7 +135,6 @@ def send_status_uart(message: str, uart_port):
     except Exception as e:
         print(f"UART status send error: {e}")
         return False
-
 
 def send_data_uart(data, uart_port):
     """
@@ -286,7 +285,7 @@ def main():
                 print("="*40)
                 send_status_uart("CAPTURE_START", uart)
 
-                # NEW CODE
+                # NEW CODE HERE (07-07-2026)
                 try:
                     index = find_boson_index()
                     print(f"Found boson camera at index {index}")
@@ -302,6 +301,8 @@ def main():
                     thermal_data = None
                     send_status_uart("CAPTURE_ERROR", uart)
                     continue
+
+                # END OF NEW CODE
                 
                 if thermal_data is None:
                     print("No thermal data available; notifying Teensy.")
