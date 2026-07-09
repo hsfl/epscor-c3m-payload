@@ -49,6 +49,9 @@ STREAM_START_COMMAND = b'STREAM_START\n'  # Command to start livestream mode
 STREAM_STOP_COMMAND = b'STREAM_STOP\n'    # Command to stop livestream mode
 FRAME_REQUEST_COMMAND = b'FRAME\n'        # Command to request a single stream frame
 
+BOSON_IMAGE_HEIGHT = 256
+BOSON_TELEMETRY_ROWS = 2
+
 # Scan /dev/video* devices and return the index whose USB vendor ID matches the FLIR Boson Camera 
 def find_boson_index(vendor_id="09cb"):
     context = pyudev.Context()
@@ -86,7 +89,7 @@ def normalize_thermal(frame16, low_pct=1, high_pct=99):
 
 # Takes one thermal capture and returns the image data in bytes
 # If debug is enabled, this function will also generate a png image of the thermal capture 
-def record_boson_frame(camera_index, debug=False):
+def record_boson_frame(camera_index, uart_port, debug=False):
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
 
     try:
@@ -108,6 +111,16 @@ def record_boson_frame(camera_index, debug=False):
         else:
             frame16 = frame
 
+        send_status_uart(f"Initial frame shape: {frame16.shape}", uart_port)
+
+        # Remove telemetry rows appended to the bottom of the frame
+        if frame16.shape[0] > BOSON_IMAGE_HEIGHT:
+            frame16 = frame16[:BOSON_IMAGE_HEIGHT, :]
+        elif frame16.shape[0] != BOSON_IMAGE_HEIGHT:
+                send_status_uart(f"Unexpected frame height: {frame16.shape}, "f"Expcted {BOSON_IMAGE_HEIGHT}", uart_port)
+
+        send_status_uart(f"Final frame shape: {frame16.shape}", uart_port)
+
         if debug:
             dir = '/home/artemis4/debug'
             path = os.path.join(dir, "boson_image.png")
@@ -120,6 +133,8 @@ def record_boson_frame(camera_index, debug=False):
                 print(f"Image saved to {path}")
             else:
                 print("Failed to save thermal image")
+        
+        print(f"Frame shape: {frame16.shape}")
 
         return frame16.tobytes()
     finally:
@@ -275,7 +290,6 @@ def main():
         send_status_uart("IDLE", uart)
 
         while True:
-            print("true")
             # Wait for command from Teensy via UART
             command = wait_for_uart_command(uart)
 
@@ -295,7 +309,7 @@ def main():
                     continue
 
                 try:
-                    thermal_data = record_boson_frame(index)
+                    thermal_data = record_boson_frame(index, uart)
                 except Exception as cap_error:
                     print(f"Capture error: {cap_error}")
                     thermal_data = None
