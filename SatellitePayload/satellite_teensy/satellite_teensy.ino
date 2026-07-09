@@ -85,7 +85,7 @@ const uint8_t UART_MAGIC[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 const uint8_t UART_END[2] = {0xFF, 0xFF};
 
 // New Jaycee 07/08/26
-const uint8_t UART_HEADER_SIZE = 8;
+const uint8_t UART_HEADER_SIZE = 7;
 
 const uint32_t UART_HEADER_TIMEOUT_MS = 15000;  // 15s to see header (Pi capture + prep time)
 const uint32_t UART_PAYLOAD_TIMEOUT_MS = 30000; // 30s to receive payload
@@ -99,7 +99,7 @@ bool piCaptureInProgress = false;
 bool RPI_IDLE_READY = false;
 
 // Image data storage and tracking
-uint16_t capturedImageLength = 0; // Length of captured thermal image
+uint32_t capturedImageLength = 0; // Length of captured thermal image
 
 // Change from 40000 to 165000
 // Buffer for thermal image storage
@@ -1624,13 +1624,13 @@ bool payloadIsStatus(const uint8_t *payload, uint16_t len)
 // Receive ONE framed message from the Pi into 'dest' (up to destMax)
 // Returns: true on success; writes outLen and sets isStatus accordingly.
 bool recvFramedFromPi(HardwareSerial &port,
-                      uint8_t *dest, uint16_t destMax,
-                      uint16_t &outLen, bool &isStatus)
+                      uint8_t *dest, uint32_t destMax,
+                      uint32_t &outLen, bool &isStatus)
 {
   outLen = 0;
   isStatus = false;
 
-  // Jaycee change 2 length to 4 length
+  // Jaycee change 2 length to 3 length
   // 1) Header: 4 magic + 4 length
   uint8_t header[UART_HEADER_SIZE];
   if (!readExact(port, header, UART_HEADER_SIZE, UART_HEADER_TIMEOUT_MS))
@@ -1651,7 +1651,7 @@ bool recvFramedFromPi(HardwareSerial &port,
     return false;
   }
 
-  uint16_t len = (uint16_t)header[4] | ((uint16_t)header[5] << 8) | ((uint32_t)header[6] << 16) | ((uint32_t)header[7] << 24);
+  uint16_t len = (uint16_t)header[4] | ((uint16_t)header[5] << 8) | ((uint32_t)header[6] << 16);
   if (len == 0)
   {
     radioPrintln("ERROR: Zero-length payload");
@@ -1747,7 +1747,7 @@ void pollPIUartStatus()
 
   while (Serial2.available() >= 6)
   {
-    uint16_t rxLen = 0;
+    uint32_t rxLen = 0;
     bool isStatus = false;
 
     if (!recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus))
@@ -1804,7 +1804,7 @@ void captureThermalImageUART()
 
   while (!imageReceived)
   {
-    uint16_t rxLen = 0;
+    uint32_t rxLen = 0;
     bool isStatus = false;
 
     if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
@@ -1898,8 +1898,8 @@ void sendSpecificPacket(uint16_t packetIndex)
   }
 
   // Calculate packet data
-  uint16_t byteOffset = (uint32_t)packetIndex * PACKET_DATA_SIZE;
-  uint16_t remaining = capturedImageLength - byteOffset;
+  uint32_t byteOffset = (uint32_t)packetIndex * PACKET_DATA_SIZE;
+  uint32_t remaining = capturedImageLength - byteOffset;
   uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
 
   // Build data packet
@@ -2107,7 +2107,7 @@ void sendThermalDataViaRadio()
     return;
   }
 
-  uint16_t bytesSent = 0;
+  uint32_t bytesSent = 0;
   uint16_t packetNum = 0;
   uint16_t successCount = 0;
   uint16_t failCount = 0;
@@ -2117,7 +2117,7 @@ void sendThermalDataViaRadio()
 
   while (bytesSent < capturedImageLength)
   {
-    uint16_t remaining = capturedImageLength - bytesSent;
+    uint32_t remaining = capturedImageLength - bytesSent;
     uint16_t chunkSize = (remaining < (uint16_t)PACKET_DATA_SIZE) ? remaining : (uint16_t)PACKET_DATA_SIZE;
 
     // Build data packet

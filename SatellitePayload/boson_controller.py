@@ -21,8 +21,8 @@ Hardware Requirements:
 Communication Protocol:
 - UART: 115200 baud, 8N1
 - Trigger: "TRIGGER\n" command from Teensy
-- Header: Magic bytes (0xDE 0xAD 0xBE 0xEF) + 16-bit length
-- Data: Raw thermal image data (16-bit per pixel)
+- Header: Magic bytes (0xDE 0xAD 0xBE 0xEF) + 24-bit length
+- Data: Raw thermal image data (24-bit per pixel)
 - End: Magic bytes (0xFF 0xFF)
 
 @author EPSCOR C3M Team
@@ -136,7 +136,10 @@ def record_boson_frame(camera_index, uart_port, debug=False):
         
         print(f"Frame shape: {frame16.shape}")
 
-        return frame16.tobytes()
+        bytes = frame16.tobytes()
+        send_status_uart(f"frame16 bytes: {len(bytes)}", uart_port)
+
+        return bytes
     finally:
         cap.release()
 
@@ -175,9 +178,10 @@ def send_data_uart(data, uart_port):
         header = bytearray()
         header.extend([0xDE, 0xAD, 0xBE, 0xEF])  # Magic bytes for validation
         
-        # Add data length (little-endian, 16-bit)
+        # Changed from 2 to 3 byte length in header
+        # Add data length (little-endian, 24-bit)
         length = len(data)
-        header.extend([length & 0xFF, (length >> 8) & 0xFF])
+        header.extend([length & 0xFF, (length >> 8), (length >> 16) & 0xFF])
         
         # print("Sending header...")
         uart_port.write(header)
