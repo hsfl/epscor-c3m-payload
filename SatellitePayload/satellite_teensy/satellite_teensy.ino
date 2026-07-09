@@ -53,8 +53,8 @@
 /**  Build configuration flags
  *  Uncomment ONE of these for your build target:
  * */
-// #define DEBUG    // Verbose logging for development
-#define FLIGHT // Flight mode - minimal logging
+#define DEBUG    // Verbose logging for development
+// #define FLIGHT // Flight mode - minimal logging
 
 // Packed struct attribute for ensuring no padding bytes
 #define PACKED __attribute__((packed))
@@ -84,6 +84,9 @@ const int RADIO_WAIT_PACKET_SENT_MS = 500;
 const uint8_t UART_MAGIC[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 const uint8_t UART_END[2] = {0xFF, 0xFF};
 
+// New Jaycee 07/08/26
+const uint8_t UART_HEADER_SIZE = 8;
+
 const uint32_t UART_HEADER_TIMEOUT_MS = 15000;  // 15s to see header (Pi capture + prep time)
 const uint32_t UART_PAYLOAD_TIMEOUT_MS = 30000; // 30s to receive payload
 const uint32_t UART_END_TIMEOUT_MS = 1000;      // 1s to see end markers
@@ -98,8 +101,9 @@ bool RPI_IDLE_READY = false;
 // Image data storage and tracking
 uint16_t capturedImageLength = 0; // Length of captured thermal image
 
+// Change from 40000 to 165000
 // Buffer for thermal image storage
-const uint32_t MAX_IMG = 40000; // Maximum image buffer size (40KB)
+const uint32_t MAX_IMG = 165000; // Maximum image buffer size
 uint8_t imgBuf[MAX_IMG];        // Buffer to store thermal image data
 
 // Serial output redirection
@@ -1626,9 +1630,10 @@ bool recvFramedFromPi(HardwareSerial &port,
   outLen = 0;
   isStatus = false;
 
-  // 1) Header: 4 magic + 2 length
-  uint8_t header[6];
-  if (!readExact(port, header, 6, UART_HEADER_TIMEOUT_MS))
+  // Jaycee change 2 length to 4 length
+  // 1) Header: 4 magic + 4 length
+  uint8_t header[UART_HEADER_SIZE];
+  if (!readExact(port, header, UART_HEADER_SIZE, UART_HEADER_TIMEOUT_MS))
   {
     radioPrintln("ERROR: UART header timeout");
     return false;
@@ -1646,7 +1651,7 @@ bool recvFramedFromPi(HardwareSerial &port,
     return false;
   }
 
-  uint16_t len = (uint16_t)header[4] | ((uint16_t)header[5] << 8);
+  uint16_t len = (uint16_t)header[4] | ((uint16_t)header[5] << 8) | ((uint32_t)header[6] << 16) | ((uint32_t)header[7] << 24);
   if (len == 0)
   {
     radioPrintln("ERROR: Zero-length payload");
