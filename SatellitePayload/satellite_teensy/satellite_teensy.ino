@@ -20,7 +20,7 @@
  * - UART connection between Teensy and RPI
  *
  * Communication Protocol:
- * - UART Trigger: Sends "TRIGGER\n" command to initiate RPI capture
+ * - UART Trigger: Sends "TRIGGER\n" command to initiate RPI capture  
  * - UART Data: Receives thermal data with header/end markers
  * - Radio: Transmits packetized data with header/data/end packets
  *
@@ -55,6 +55,13 @@
  * */
 #define DEBUG    // Verbose logging for development
 // #define FLIGHT // Flight mode - minimal logging
+
+/** Bench debugging without the radio.
+ *  When defined, the RF23 is never initialised and no SPI/RF traffic is
+ *  generated: radio output is redirected to USB Serial and commands are driven
+ *  from the DEBUG serial console in loop(). Comment out to restore the radio.
+ */
+#define RADIO_DISABLED
 
 // Packed struct attribute for ensuring no padding bytes
 #define PACKED __attribute__((packed))
@@ -311,6 +318,11 @@ void sendStreamFrameViaRadio(uint8_t frameSeq);
  */
 void radioPrint(const String &message)
 {
+#ifdef RADIO_DISABLED
+  Serial.print(message);
+  return;
+#endif
+
   if (!radioReady)
     return;
 
@@ -351,7 +363,10 @@ void radioPrint(const String &message)
 void radioPrintln(const String &message = "")
 {
   radioPrint(message + "\n");
+
+#ifndef RADIO_DISABLED
   sendSerialBuffer(); // Force send after newline
+#endif
 }
 
 /**
@@ -1250,6 +1265,12 @@ void initRadio()
 {
   // radioPrintln("Initializing radio");
 
+#ifdef RADIO_DISABLED
+  radioReady = false;
+  radioPrintln("RADIO_DISABLED: radio not initialised, output on USB Serial.");
+  return;
+#endif
+
   // Configure RX/TX control pins
   pinMode(RADIO_RX_ON_PIN, OUTPUT); // RX_ON pin
   pinMode(RADIO_TX_ON_PIN, OUTPUT); // TX_ON pin
@@ -1364,10 +1385,12 @@ void loop()
   pollPIUartStatus();
 
   // Handle commands from ground station via radio
+#ifndef RADIO_DISABLED
   while (rf23.available())
   {
     listenForCommands();
   }
+#endif
 
   // Also allow manual commands via serial for testing/debug
 #ifdef DEBUG
@@ -2021,6 +2044,12 @@ void handleRetryRequest(uint8_t *buf, uint8_t len)
  */
 bool sendPacketReliable(uint8_t *data, uint8_t len)
 {
+#ifdef RADIO_DISABLED
+  (void)data;
+  (void)len;
+  return false;
+#endif
+
   if (len == 0 || len > rf23.maxMessageLength())
   {
 #ifdef DEBUG
@@ -2421,6 +2450,11 @@ bool recvStreamFrameFromPi(uint8_t &frameSeq)
  */
 void sendStreamFrameViaRadio(uint8_t frameSeq)
 {
+#ifdef RADIO_DISABLED
+  (void)frameSeq;
+  return;
+#endif
+
   // Send header packet first
   StreamFrameHeaderPacket headerPkt;
   headerPkt.type = STREAM_FRAME_TYPE;
@@ -2514,6 +2548,7 @@ void requestFrameFromPi()
 void handleStreamMode()
 {
   // Check for stop command from GS via radio first
+#ifndef RADIO_DISABLED
   if (rf23.available())
   {
     uint8_t len = sizeof(radioRxBuffer);
@@ -2527,6 +2562,7 @@ void handleStreamMode()
       }
     }
   }
+#endif
 
   // Request a frame from Pi
   requestFrameFromPi();
