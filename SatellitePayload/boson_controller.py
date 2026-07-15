@@ -104,12 +104,15 @@ def record_boson_frame(camera_index, uart_port, debug=False):
         if not ret:
             print('Error: Failed to read frame.')
             return None
-
+        
         # Store raw data (convert to 16-bit if needed)
         if frame.dtype != np.uint16:
             frame16 = np.left_shift(frame.astype(np.uint16), 8)
         else:
             frame16 = frame
+
+        send_status_uart(f"Frame16 type {frame16.dtype}", uart_port)
+        send_status_uart(f"Frame16 min {frame16.min()} max {frame16.max()} mean {frame16.mean():.1f}", uart_port)
 
         send_status_uart(f"Initial frame shape: {frame16.shape}", uart_port)
 
@@ -181,7 +184,8 @@ def send_data_uart(data, uart_port):
         # Changed from 2 to 3 byte length in header
         # Add data length (little-endian, 24-bit)
         length = len(data)
-        header.extend([length & 0xFF, (length >> 8), (length >> 16) & 0xFF])
+        # header.extend([length & 0xFF, (length >> 8) & 0xFF])
+        header.extend([length & 0xFF, (length >> 8) & 0xFF, (length >> 16) & 0xFF])
         
         # print("Sending header...")
         uart_port.write(header)

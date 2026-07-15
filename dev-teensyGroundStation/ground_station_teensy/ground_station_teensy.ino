@@ -63,9 +63,9 @@ const int RADIO_WAIT_PACKET_SENT_MS = 500;
 const uint8_t LED_PIN = 13;
 
 // Image reception buffer and tracking variables
-const uint32_t MAX_IMG = 40000;      // Maximum image buffer size (40KB)
+const uint32_t MAX_IMG = 165000;      // Maximum image buffer size (40KB)
 uint8_t imgBuffer[MAX_IMG];          // Buffer to store received thermal image data
-uint16_t expectedLength = 0;         // Expected total image size from header
+uint32_t expectedLength = 0;         // Expected total image size from header // Jayee changed to 32 bits
 uint16_t expectedPackets = 0;        // Total number of packets expected
 uint16_t receivedPackets = 0;        // Number of packets successfully received
 bool headerReceived = false;         // Flag indicating header packet was received
@@ -77,7 +77,7 @@ uint32_t crcErrorCount = 0;          // Count of packets dropped due to CRC mism
 bool crcVerified = false;            // True when computed CRC matches expected CRC
 
 // Packet tracking for duplicate detection and missing packet identification
-bool packetReceived[1200]; // Array to track which packets have been received
+bool packetReceived[4000]; // Array to track which packets have been received // Jaycee changed from 1200 to 4000
 uint16_t maxPacketNum = 0; // Highest packet number received
 
 // Communication statistics
@@ -149,7 +149,7 @@ struct PACKED ThermalHeaderPacket
 {
   uint8_t marker1;       // 0xFF
   uint8_t marker2;       // 0xFF
-  uint16_t imageLength;  // Total image size in bytes
+  uint32_t imageLength;  // Total image size in bytes // Jaycee changed uint16_t to uint32_t
   uint16_t totalPackets; // Number of data packets to follow
   uint16_t magic[2];     // {0xDEAD, 0xBEEF}
 };
@@ -677,7 +677,7 @@ void processPacket(uint8_t *buf, uint8_t len)
     handleSerialMessage(buf, len);
   }
   // Check for header packet (10 bytes with magic bytes)
-  else if (len == 10 && buf[0] == 0xFF && buf[1] == 0xFF)
+  else if (len == 12 && buf[0] == 0xFF && buf[1] == 0xFF)
   {
     handleThermalHeaderPacket(buf);
   }
@@ -697,6 +697,14 @@ void processPacket(uint8_t *buf, uint8_t len)
     Serial.println("Header received: " + String(headerReceived));
     Serial.println("imageComplete: " + String(imageComplete));
     Serial.println("buf len: " + String(len));
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+      Serial.print(buf[i], HEX);
+      Serial.print(" ");
+    }
+
+    Serial.println();
     Serial.println("Unknown radio packet?! Dumping radio packets.");
     dumpRf23PendingPacketsToSerial();
   }
@@ -931,7 +939,8 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len)
   }
 
   // packet index is within bounds
-  if (packetNum >= 1200)
+    // jaycee change 1200 to 4000
+  if (packetNum >= 4000)
     return;
 
   // passed all checks, mark as downloading
@@ -1246,7 +1255,8 @@ void showReceptionSummary()
   }
 
   // Indicate if thermal image is ready for export
-  if (expectedLength == 38400)
+  // Changed to boson size jaycee
+  if (expectedLength == 163840)
   {
     Serial.println("\nThermal image ready! Type 'export' to export as CSV");
   }
@@ -1288,9 +1298,11 @@ void showReceptionSummary()
   thermalDataTransferDuration = 0;
 }
 
+// Modified for boson camera
 void exportThermalData()
 {
-  if (!headerReceived || expectedLength != 38400)
+  // Changed 38400 to 163840 bits
+  if (!headerReceived || expectedLength != 163840)
   {
     Serial.println("No complete thermal image to export");
     return;
@@ -1305,12 +1317,13 @@ void exportThermalData()
   Serial.println("Copying data below to a 'thermal_image.csv'");
   Serial.println(THERMAL_CSV_START);
 
+  // change 120x160 to 320x256
   // Export thermal data as CSV (120x160 pixel grid)
-  for (int row = 0; row < 120; row++)
+  for (int row = 0; row < 320; row++)
   {
-    for (int col = 0; col < 160; col++)
+    for (int col = 0; col < 256; col++)
     {
-      uint32_t idx = (row * 160 + col) * 2; // 2 bytes per pixel
+      uint32_t idx = (row * 256 + col) * 2; // 2 bytes per pixel
       if (idx < MAX_IMG - 1)
       {
         // Convert raw 16-bit value to temperature in Celsius
@@ -1329,7 +1342,7 @@ void exportThermalData()
       {
         Serial.print("NaN"); // Buffer overflow protection
       }
-      if (col < 159)
+      if (col < 319)
         Serial.print(","); // CSV separator
     }
     Serial.println(); // New line for each row

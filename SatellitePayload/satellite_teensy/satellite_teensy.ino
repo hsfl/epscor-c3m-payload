@@ -25,8 +25,8 @@
  * - Radio: Transmits packetized data with header/data/end packets
  *
  * @author EPSCOR C3M Team
- * @date 2026-03-23
- * @version 2.1.0
+ * @date 2026-07-09
+ * @version 1.0.0
  */
 
 // Simplified Transmitter with UART (Essential Functions Only)
@@ -1651,7 +1651,7 @@ bool recvFramedFromPi(HardwareSerial &port,
     return false;
   }
 
-  uint16_t len = (uint16_t)header[4] | ((uint16_t)header[5] << 8) | ((uint32_t)header[6] << 16);
+  uint32_t len = (uint32_t)header[4] | ((uint32_t)header[5] << 8) | ((uint32_t)header[6] << 16);
   if (len == 0)
   {
     radioPrintln("ERROR: Zero-length payload");
