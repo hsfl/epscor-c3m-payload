@@ -151,13 +151,13 @@ uint8_t streamFrameBuffer[STREAM_FRAME_SIZE];  // Buffer for one stream frame
 /**
  * Header packet structure for thermal image transmission
  * Sent first to inform ground station of total image size and packet count
- * Total size: 10 bytes
+ * Total size: 12 bytes
  */
 struct PACKED ThermalHeaderPacket
 {
   uint8_t marker1;       // 0xFF
   uint8_t marker2;       // 0xFF
-  uint16_t imageLength;  // Total image size in bytes
+  uint32_t imageLength;  // Total image size in bytes
   uint16_t totalPackets; // Number of data packets to follow
   uint16_t magic[2];     // {0xDEAD, 0xBEEF}
 };

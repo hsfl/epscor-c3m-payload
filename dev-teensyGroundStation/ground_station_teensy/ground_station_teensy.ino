@@ -143,7 +143,7 @@ unsigned long endPacketReceivedTime;              // When we received the end pa
 /**
  * Header packet structure for thermal image transmission
  * Sent first to inform ground station of total image size and packet count
- * Total size: 10 bytes
+ * Total size: 12 bytes
  */
 struct PACKED ThermalHeaderPacket
 {
@@ -151,7 +151,7 @@ struct PACKED ThermalHeaderPacket
   uint8_t marker2;       // 0xFF
   uint32_t imageLength;  // Total image size in bytes // Jaycee changed uint16_t to uint32_t
   uint16_t totalPackets; // Number of data packets to follow
-  uint16_t magic[2];     // {0xDEAD, 0xBEEF}
+  uint16_t magic[2];     // {0xDEAD, 0xBEEF}, total 4 bytes
 };
 
 /**
@@ -676,11 +676,11 @@ void processPacket(uint8_t *buf, uint8_t len)
   {
     handleSerialMessage(buf, len);
   }
-  // Check for header packet (10 bytes with magic bytes)
+  // Check for header packet (12 bytes with magic bytes)
   else if (len == 12 && buf[0] == 0xFF && buf[1] == 0xFF)
   {
     handleThermalHeaderPacket(buf);
-  }
+  }                                                                                                                                                                                                             
   // Check for end packet (6 bytes with magic bytes)
   else if (len == 6 && buf[0] == 0xEE && buf[1] == 0xEE)
   {
