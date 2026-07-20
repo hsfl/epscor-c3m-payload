@@ -1350,11 +1350,11 @@ void exportThermalData()
 
   // Export raw thermal data as CSV (320x256 pixel grid, one raw 16-bit value per pixel)
   // Comma-separated so it still parses as CSV; no temperature conversion applied.
-  for (int row = 0; row < 320; row++)
+  for (int row = 0; row < 256; row++)
   {
-    for (int col = 0; col < 256; col++)
+    for (int col = 0; col < 320; col++)
     {
-      uint32_t idx = (row * 256 + col) * 2; // 2 bytes per pixel
+      uint32_t idx = (row * 320 + col) * 2; // 2 bytes per pixel
       if (idx < MAX_IMG - 1)
       {
         // Print raw 16-bit sensor value (little-endian)
@@ -1365,7 +1365,7 @@ void exportThermalData()
       {
         Serial.print("NaN"); // Buffer overflow protection
       }
-      if (col < 255)
+      if (col < 319)
         Serial.print(","); // CSV separator
     }
     Serial.println(); // New line for each row
