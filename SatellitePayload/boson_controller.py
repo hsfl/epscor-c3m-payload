@@ -40,6 +40,8 @@ import cv2
 import pyudev
 import re
 import os
+import sys
+from pathlib import Path
 
 # UART Configuration for Teensy communication
 UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
@@ -116,11 +118,11 @@ def record_boson_frame(camera_index, uart_port, debug=False):
 
         send_status_uart(f"Initial frame shape: {frame16.shape}", uart_port)
 
-        # Remove telemetry rows appended to the bottom of the frame
+        # Remove telemetry rows appended to the top of the frame
         if frame16.shape[0] > BOSON_IMAGE_HEIGHT:
-            frame16 = frame16[:BOSON_IMAGE_HEIGHT, :]
+            frame16 = frame16[-BOSON_IMAGE_HEIGHT:, :]
         elif frame16.shape[0] != BOSON_IMAGE_HEIGHT:
-                send_status_uart(f"Unexpected frame height: {frame16.shape}, "f"Expcted {BOSON_IMAGE_HEIGHT}", uart_port)
+                send_status_uart(f"Unexpected frame height: {frame16.shape}, "f"Expected {BOSON_IMAGE_HEIGHT}", uart_port)
 
         send_status_uart(f"Final frame shape: {frame16.shape}", uart_port)
 
@@ -277,6 +279,7 @@ def wait_for_uart_trigger(uart_port, timeout=None):
     return result == 'trigger'
 
 def main():
+    print("Boson camera initialized")
     print("RPi Thermal Camera - UART Output")
     print("="*40)
 
@@ -317,7 +320,7 @@ def main():
                     continue
 
                 try:
-                    thermal_data = record_boson_frame(index, uart)
+                    thermal_data = record_boson_frame(index, uart, True)
                 except Exception as cap_error:
                     print(f"Capture error: {cap_error}")
                     thermal_data = None
