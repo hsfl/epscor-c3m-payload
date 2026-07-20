@@ -1319,6 +1319,37 @@ void exportThermalData()
 
   // change 120x160 to 320x256
   // Export thermal data as CSV (120x160 pixel grid)
+  // for (int row = 0; row < 320; row++)
+  // {
+  //   for (int col = 0; col < 256; col++)
+  //   {
+  //     uint32_t idx = (row * 256 + col) * 2; // 2 bytes per pixel
+  //     if (idx < MAX_IMG - 1)
+  //     {
+  //       // Convert raw 16-bit value to temperature in Celsius
+  //       uint16_t pixel = imgBuffer[idx] | (imgBuffer[idx + 1] << 8);
+  //       // if (pixel >= 27315 && pixel <= 37315)
+  //       // {                                        // Valid temperature range (0-100°C)
+  //       //   float tempC = (pixel - 27315) / 100.0; // Convert from Kelvin*100 to Celsius
+  //       //   Serial.print(tempC, 2);
+  //       // }
+  //       // else
+  //       // {
+  //       //   Serial.print("NaN"); // Invalid temperature value
+  //       // }
+  //     }
+  //     else
+  //     {
+  //       Serial.print("NaN"); // Buffer overflow protection
+  //     }
+  //     if (col < 319)
+  //       Serial.print(","); // CSV separator
+  //   }
+  //   Serial.println(); // New line for each row
+  // }
+
+  // Export raw thermal data as CSV (320x256 pixel grid, one raw 16-bit value per pixel)
+  // Comma-separated so it still parses as CSV; no temperature conversion applied.
   for (int row = 0; row < 320; row++)
   {
     for (int col = 0; col < 256; col++)
@@ -1326,23 +1357,15 @@ void exportThermalData()
       uint32_t idx = (row * 256 + col) * 2; // 2 bytes per pixel
       if (idx < MAX_IMG - 1)
       {
-        // Convert raw 16-bit value to temperature in Celsius
+        // Print raw 16-bit sensor value (little-endian)
         uint16_t pixel = imgBuffer[idx] | (imgBuffer[idx + 1] << 8);
-        if (pixel >= 27315 && pixel <= 37315)
-        {                                        // Valid temperature range (0-100°C)
-          float tempC = (pixel - 27315) / 100.0; // Convert from Kelvin*100 to Celsius
-          Serial.print(tempC, 2);
-        }
-        else
-        {
-          Serial.print("NaN"); // Invalid temperature value
-        }
+        Serial.print(pixel);
       }
       else
       {
         Serial.print("NaN"); // Buffer overflow protection
       }
-      if (col < 319)
+      if (col < 255)
         Serial.print(","); // CSV separator
     }
     Serial.println(); // New line for each row

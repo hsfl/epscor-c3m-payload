@@ -544,6 +544,44 @@ def save_thermal_data(csv_data, filename):
         print(f"\n❌ Error saving thermal data: {e}")
         return False
 
+
+def normalize_thermal_grid(grid, low_pct=1, high_pct=99):
+    """Percentile-clip a raw thermal grid to 0-255 uint8 for viewing.
+
+    Mirrors normalize_thermal() in boson_controller.py. The downlinked data
+    is raw, non-radiometric sensor counts (full bit depth preserved), so this
+    is a contrast stretch for visualization only — not a temperature mapping.
+    """
+    import numpy as np
+    lo, hi = np.nanpercentile(grid, (low_pct, high_pct))
+    if hi <= lo:
+        hi = lo + 1  # avoid div-by-zero on a flat frame
+    clipped = np.clip(grid, lo, hi)
+    norm = ((clipped - lo) / (hi - lo) * 255).astype(np.uint8)
+    return norm
+
+
+def build_normalized_csv(csv_rows, metadata_lines):
+    """Return normalized (0-255) CSV text built from raw numeric CSV rows.
+
+    Parses the raw grid, normalizes it for viewing, and re-serializes as
+    integers with the same metadata header as the raw file. Returns None if
+    the grid cannot be parsed.
+    """
+    import numpy as np
+    from io import StringIO
+
+    grid = np.loadtxt(StringIO('\n'.join(csv_rows)), delimiter=',')
+    norm = normalize_thermal_grid(grid)
+
+    buf = StringIO()
+    np.savetxt(buf, norm, fmt='%d', delimiter=',')
+    norm_rows = buf.getvalue().rstrip('\n').split('\n')
+
+    if metadata_lines:
+        return '\n'.join(metadata_lines + [''] + norm_rows)
+    return '\n'.join(norm_rows)
+
 def run_thermal_viewer(filename):
     """Run the thermal data viewer with the specified file"""
     try:
@@ -784,14 +822,29 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, partial_line_buffe
 
                 # Save the captured data
                 metadata_lines = build_sensor_metadata_lines(ThermalCaptureTimestamp)
-                if metadata_lines:
-                    csv_content = '\n'.join(metadata_lines + [''] + csv_data)
-                else:
-                    csv_content = '\n'.join(csv_data)
-                filename = get_next_thermal_filename()
 
-                if save_thermal_data(csv_content, filename):
-                    run_thermal_viewer(filename)
+                # 1) Raw, full-bit-depth CSV — preserved exactly as downlinked
+                if metadata_lines:
+                    raw_content = '\n'.join(metadata_lines + [''] + csv_data)
+                else:
+                    raw_content = '\n'.join(csv_data)
+                raw_filename = get_next_thermal_filename()
+                save_thermal_data(raw_content, raw_filename)
+
+                # 2) Normalized CSV (0-255) for viewing. This runs inside the
+                #    daemon read thread, so any failure must not kill reading —
+                #    on error we keep the raw file and fall back to viewing it.
+                view_filename = raw_filename
+                norm_filename = raw_filename.replace(".csv", "_normalized.csv")
+                try:
+                    norm_content = build_normalized_csv(list(csv_data), metadata_lines)
+                    if norm_content is not None and save_thermal_data(norm_content, norm_filename):
+                        view_filename = norm_filename
+                except Exception as e:
+                    print(f"\n⚠️ Normalization failed ({e}); viewing raw data instead.")
+
+                # Visualize the normalized data (raw as fallback)
+                run_thermal_viewer(view_filename)
 
                 csv_data.clear()
             continue

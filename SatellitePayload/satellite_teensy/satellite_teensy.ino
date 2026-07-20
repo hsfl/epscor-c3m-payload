@@ -61,7 +61,7 @@
  *  generated: radio output is redirected to USB Serial and commands are driven
  *  from the DEBUG serial console in loop(). Comment out to restore the radio.
  */
-#define RADIO_DISABLED
+// #define RADIO_DISABLED
 
 // Packed struct attribute for ensuring no padding bytes
 #define PACKED __attribute__((packed))
@@ -1855,32 +1855,34 @@ void captureThermalImageUART()
   radioPrintln(" image bytes");
 
   // Quick quality check (same logic you already had)
-  if (capturedImageLength >= 38400)
-  {
-    int validPixels = 0;
-    for (uint32_t i = 0; i + 1 < capturedImageLength; i += 2)
-    {
-      uint16_t pixel = imgBuf[i] | (uint16_t(imgBuf[i + 1]) << 8);
-      float tempC = (pixel - 27315) / 100.0f;
-      if (tempC >= 0 && tempC <= 60)
-        validPixels++;
-    }
-    float validPct = (float)validPixels * 100.0f / (capturedImageLength / 2);
-    radioPrint("Data quality: ");
-    radioPrint(String(validPct, 1));
-    radioPrintln("% valid temperature pixels");
-
-    if (validPct > 95)
-      radioPrintln("✓ Excellent data quality! Ready for radio transmission - press 'r'");
-    else if (validPct > 50)
-      radioPrintln("⚠️ Moderate data quality - may still be usable");
-    else
-      radioPrintln("❌ Poor data quality detected");
-  }
-  else
-  {
-    radioPrintln("⚠️ Received size smaller than expected for thermal image");
-  }
+  // Removed per-pixel valid-temperature check: image is now treated as raw
+  // 16-bit sensor values, so the Kelvin*100 validity metric no longer applies.
+  // if (capturedImageLength >= 38400)
+  // {
+  //   int validPixels = 0;
+  //   for (uint32_t i = 0; i + 1 < capturedImageLength; i += 2)
+  //   {
+  //     uint16_t pixel = imgBuf[i] | (uint16_t(imgBuf[i + 1]) << 8);
+  //     float tempC = (pixel - 27315) / 100.0f;
+  //     if (tempC >= 0 && tempC <= 60)
+  //       validPixels++;
+  //   }
+  //   float validPct = (float)validPixels * 100.0f / (capturedImageLength / 2);
+  //   radioPrint("Data quality: ");
+  //   radioPrint(String(validPct, 1));
+  //   radioPrintln("% valid temperature pixels");
+  //
+  //   if (validPct > 95)
+  //     radioPrintln("✓ Excellent data quality! Ready for radio transmission - press 'r'");
+  //   else if (validPct > 50)
+  //     radioPrintln("⚠️ Moderate data quality - may still be usable");
+  //   else
+  //     radioPrintln("❌ Poor data quality detected");
+  // }
+  // else
+  // {
+  //   radioPrintln("⚠️ Received size smaller than expected for thermal image");
+  // }
 
   // Drain any post-capture status messages immediately
   pollPIUartStatus();
