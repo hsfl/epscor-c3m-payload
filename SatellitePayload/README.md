@@ -1,5 +1,5 @@
 # Raspberry Pi Setup
-Instructions for deploying `thermal_camera_controller.py` onto the Raspberry Pi and configuring it to run automatically on boot.
+Instructions for deploying `thermal_camera_controller.py` or `boson_controller.py` onto the Raspberry Pi and configuring it to run automatically on boot.
 
 ## Prerequisites
 ### Hardware
@@ -22,6 +22,7 @@ From your development machine, in the repo root:
 
 ```bash
 scp SatellitePayload/thermal_camera_controller.py <rpi-user>@<rpi-ip>:~/
+scp SatellitePayload/boson_controller.py <rpi-user>@<rpi-ip>:~/
 ```
 >Enter RPi password if prompted.
 
@@ -58,10 +59,11 @@ Reboot when prompted.
 
 ## 4. Create the systemd Service
 
-Create the service file:
+Create the service file by replacing <pi_username> and <controller_file.py>:
 
 ```bash
 sudo nano /etc/systemd/system/thermal-camera.service
+sudo nano /etc/systemd/system/boson-camera.service
 ```
 
 Paste the following:
@@ -72,11 +74,11 @@ Description=Thermal Camera Controller
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/pi/thermal_camera_controller.py
-WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/<pi_username>/<controller_file.py>
+WorkingDirectory=/home/<pi_username>
 Restart=always
 RestartSec=5
-User=pi
+User=<pi_username>
 
 [Install]
 WantedBy=multi-user.target
@@ -97,6 +99,7 @@ Verify it is running:
 
 ```bash
 sudo systemctl status thermal-camera.service
+sudo systemctl status boson-camera.service
 ```
 
 You should see `Active: active (running)`.
