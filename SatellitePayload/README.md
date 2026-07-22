@@ -18,7 +18,7 @@ Make sure the following are installed on your RPi:
 
 ## 1. Copy files to the RPi
 
-From your development machine, in the repo root:
+On the development machine's  repo root, copy `thermal_camera_controller.py` or `boson_controller.py`:
 
 ```bash
 scp SatellitePayload/thermal_camera_controller.py <rpi-user>@<rpi-ip>:~/
@@ -59,14 +59,14 @@ Reboot when prompted.
 
 ## 4. Create the systemd Service
 
-Create the service file by replacing <pi_username> and <controller_file.py>:
+Create the service file for either the FLIR Lepton (thermal-camera.service) or Boson 320+ (boson-camera.service):
 
 ```bash
 sudo nano /etc/systemd/system/thermal-camera.service
 sudo nano /etc/systemd/system/boson-camera.service
 ```
 
-Paste the following:
+Paste the following and replacing <pi_username> and <controller_file.py>. If using the FLIR Lepton, use `thermal_camera_controller.py` for <controller_file.py>. If using the Boson 320+, use `boson_controller.py`.
 
 ```ini
 [Unit]
@@ -93,6 +93,12 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable thermal-camera.service
 sudo systemctl start thermal-camera.service
+```
+or
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable boson-camera.service
+sudo systemctl start boson-camera.service
 ```
 
 Verify it is running:
