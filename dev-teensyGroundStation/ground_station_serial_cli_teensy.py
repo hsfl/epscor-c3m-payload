@@ -52,11 +52,14 @@ _tc = {
 
 # Livestream protocol constants (binary protocol)
 STREAM_FRAME_MAGIC = b'WRM!'  # 4-byte magic header "WRM!" = 0x57 0x52 0x4D 0x21
-STREAM_FRAME_WIDTH = 80
-STREAM_FRAME_HEIGHT = 60
-STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4800 bytes
+STREAM_FRAME_WIDTH = 100
+STREAM_FRAME_HEIGHT = 80
+STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 8000 bytes
+STREAM_PACKET_DATA_SIZE = 45  # Bytes of frame data per radio packet
+# 178 packets at 100x80. Must match STREAM_PACKETS_PER_FRAME on both Teensys.
+STREAM_PACKETS_PER_FRAME = -(-STREAM_FRAME_SIZE // STREAM_PACKET_DATA_SIZE)
 STREAM_FRAME_HEADER_SIZE = 4 + 1 + 1 + 2  # magic + seq + pkts + checksum = 8 bytes
-STREAM_FRAME_TOTAL_SIZE = STREAM_FRAME_HEADER_SIZE + STREAM_FRAME_SIZE  # 8 + 4800 = 4808 bytes
+STREAM_FRAME_TOTAL_SIZE = STREAM_FRAME_HEADER_SIZE + STREAM_FRAME_SIZE  # 8 + 8000 = 8008 bytes
 
 # Stream frame queue for viewer (multiprocessing for cross-process sharing)
 stream_frame_queue = multiprocessing.Queue(maxsize=10)  # Buffer up to 10 frames
@@ -615,8 +618,8 @@ def _viewer_process(queue):
 
     fig, ax = plt.subplots(figsize=(10, 8))
 
-    # Initialize with blank image (80x60)
-    initial_data = np.zeros((60, 80), dtype=np.uint8)
+    # Initialize with blank image (100x80)
+    initial_data = np.zeros((STREAM_FRAME_HEIGHT, STREAM_FRAME_WIDTH), dtype=np.uint8)
     image = ax.imshow(initial_data, cmap='hot', vmin=0, vmax=255, aspect='equal',
                       interpolation='nearest')
     fig.colorbar(image, ax=ax, label='Intensity (0-255)')
@@ -635,7 +638,7 @@ def _viewer_process(queue):
             info = frame_data.get('info', '')
 
             frame_array = np.frombuffer(frame_bytes, dtype=np.uint8)
-            frame_array = frame_array.reshape((60, 80))
+            frame_array = frame_array.reshape((STREAM_FRAME_HEIGHT, STREAM_FRAME_WIDTH))
 
             image.set_data(frame_array)
             frame_count[0] += 1
@@ -703,7 +706,7 @@ def read_serial(ser, stop_event):
                             raw_buffer = raw_buffer[magic_pos:]
                             magic_pos = 0
 
-                        # Check if we have a complete frame (4808 bytes total)
+                        # Check if we have a complete frame (8008 bytes total)
                         frame_data_needed = STREAM_FRAME_TOTAL_SIZE
                         if len(raw_buffer) >= frame_data_needed:
                             # Extract frame
@@ -711,7 +714,7 @@ def read_serial(ser, stop_event):
                             raw_buffer = raw_buffer[frame_data_needed:]
 
                             # Parse binary frame
-                            # Format: [magic:4][seq:1][pkts:1][checksum:2][data:4800]
+                            # Format: [magic:4][seq:1][pkts:1][checksum:2][data:8000]
                             seq = frame_packet[4]
                             pkts = frame_packet[5]
                             checksum_received = frame_packet[6] | (frame_packet[7] << 8)
@@ -720,8 +723,8 @@ def read_serial(ser, stop_event):
                             # Validate checksum
                             checksum_computed = sum(frame_data) & 0xFFFF
 
-                            # Validate pkts is reasonable (50-107)
-                            if pkts < 50 or pkts > 107:
+                            # Validate pkts is reasonable (half a frame up to a full one)
+                            if pkts < STREAM_PACKETS_PER_FRAME // 2 or pkts > STREAM_PACKETS_PER_FRAME:
                                 print(f"[STREAM] Bad pkts={pkts}, skipping")
                                 continue
 
@@ -731,10 +734,10 @@ def read_serial(ser, stop_event):
                                     stream_frame_queue.put_nowait({
                                         'seq': seq,
                                         'data': frame_data,
-                                        'info': f'pkts={pkts}/107'
+                                        'info': f'pkts={pkts}/{STREAM_PACKETS_PER_FRAME}'
                                     })
                                     if stream_frames_received % 10 == 1:
-                                        print(f"[STREAM] Frame {seq} OK (pkts={pkts}/107, chk={checksum_computed})")
+                                        print(f"[STREAM] Frame {seq} OK (pkts={pkts}/{STREAM_PACKETS_PER_FRAME}, chk={checksum_computed})")
                                 except:
                                     pass  # Queue full, drop frame
                             else:

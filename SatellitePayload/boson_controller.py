@@ -54,6 +54,18 @@ FRAME_REQUEST_COMMAND = b'FRAME\n'        # Command to request a single stream f
 BOSON_IMAGE_HEIGHT = 256
 BOSON_TELEMETRY_ROWS = 2
 
+# Livestream frame configuration.
+# The Teensy and ground station both hardcode a 100x80 8-bit frame (8000 bytes),
+# so these values must not change without updating satellite_teensy.ino and
+# ground_station_serial_cli_teensy.py together.
+STREAM_MAGIC = bytes([0xCA, 0xFE, 0xBA, 0xBE])  # Distinguishes stream frames from captures
+STREAM_FRAME_WIDTH = 100
+STREAM_FRAME_HEIGHT = 80
+STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 8000 bytes per frame
+
+# Leave stream mode if the Teensy stops asking for frames (it may have reset).
+STREAM_IDLE_TIMEOUT_S = 30.0
+
 # Scan /dev/video* devices and return the index whose USB vendor ID matches the FLIR Boson Camera 
 def find_boson_index(vendor_id="09cb"):
     context = pyudev.Context()
@@ -145,6 +157,221 @@ def record_boson_frame(camera_index, uart_port, debug=False):
         send_status_uart(f"frame16 bytes: {len(bytes)}", uart_port)
 
         return bytes
+    finally:
+        cap.release()
+
+# Open the Boson for capture with the pixel format the payload expects.
+# Caller is responsible for releasing the capture.
+def open_boson_capture(camera_index):
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'Y16 '))
+    # Ask for the shallowest buffer available; V4L2 may ignore this, which is
+    # why grab_fresh_frame also drains explicitly.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+# Drop the telemetry rows the Boson prepends to each frame
+def strip_telemetry_rows(frame16):
+    if frame16.shape[0] > BOSON_IMAGE_HEIGHT:
+        return frame16[-BOSON_IMAGE_HEIGHT:, :]
+    return frame16
+
+# Return the newest frame available from an already-open capture, as 16-bit data
+# with telemetry rows removed. V4L2 hands back the OLDEST buffered frame, and the
+# radio relays only about one frame per second, so the driver's queue fills with
+# stale frames between requests. Draining the queue first keeps the preview live.
+# Note cap.grab() blocks when the queue is empty, so this costs a few frame
+# intervals (~70ms) at worst - negligible against the radio's pace.
+# Kept low deliberately: the Teensy only waits STREAM_HEADER_TIMEOUT_MS (1s) after
+# sending FRAME, and each drained grab costs one frame interval - 111ms on a 9Hz
+# export-restricted Boson. Raising this risks blowing that budget.
+STREAM_MAX_DRAIN = 2
+
+def grab_fresh_frame(cap, max_drain=STREAM_MAX_DRAIN):
+    for _ in range(max_drain):
+        if not cap.grab():
+            break
+
+    ret, frame = cap.read()
+    if not ret:
+        return None
+
+    frame = np.squeeze(frame)
+    if frame.dtype != np.uint16:
+        frame = np.left_shift(frame.astype(np.uint16), 8)
+
+    return strip_telemetry_rows(frame)
+
+# Reduce a full-resolution 16-bit Boson frame to a 100x80 8-bit stream frame.
+# The source is centre-cropped to the stream's aspect ratio before resizing so the
+# preview is not distorted, then area-averaged down. Both steps are derived from
+# the frame's own shape, so this holds for the 320x256 and 640x512 Boson variants.
+def downsample_for_stream(frame16):
+    if frame16 is None:
+        return None
+
+    if frame16.ndim != 2:
+        print(f"Stream: unexpected frame shape {frame16.shape}")
+        return None
+
+    height, width = frame16.shape
+    target_aspect = STREAM_FRAME_WIDTH / STREAM_FRAME_HEIGHT
+
+    if width / height > target_aspect:
+        crop_w = round(height * target_aspect)
+        x0 = (width - crop_w) // 2
+        frame16 = frame16[:, x0:x0 + crop_w]
+    else:
+        crop_h = round(width / target_aspect)
+        y0 = (height - crop_h) // 2
+        frame16 = frame16[y0:y0 + crop_h, :]
+
+    small = cv2.resize(frame16,
+                       (STREAM_FRAME_WIDTH, STREAM_FRAME_HEIGHT),
+                       interpolation=cv2.INTER_AREA)
+
+    # Per-frame percentile normalization. The Boson's Y16 output is raw counts
+    # rather than radiometric Kelvin, so a fixed temperature window would clip
+    # badly; the trade-off is that the preview's contrast floats with the scene.
+    return normalize_thermal(small)
+
+def send_stream_frame_uart(frame_8bit, frame_seq, uart_port):
+    """
+    Send one downsampled stream frame via UART.
+
+    Uses STREAM_MAGIC rather than the capture header so the Teensy can tell
+    livestream frames from a thermal capture. The Teensy relays these to the
+    ground station for live viewing and does not store them.
+
+    Args:
+        frame_8bit: numpy array of shape (80, 100) with uint8 values
+        frame_seq: frame sequence number (0-255, wrapping)
+        uart_port: Serial port object for UART communication
+
+    Returns:
+        bool: True if transmission successful, False otherwise
+    """
+    if frame_8bit is None:
+        return False
+
+    try:
+        data = frame_8bit.tobytes()
+        if len(data) != STREAM_FRAME_SIZE:
+            print(f"Warning: stream frame size {len(data)}, expected {STREAM_FRAME_SIZE}")
+            return False
+
+        # [STREAM_MAGIC 4B][Frame Seq 1B][Frame Size 2B][Frame Data 8000B][End 2B]
+        header = bytearray()
+        header.extend(STREAM_MAGIC)
+        header.append(frame_seq & 0xFF)
+        header.extend([STREAM_FRAME_SIZE & 0xFF, (STREAM_FRAME_SIZE >> 8) & 0xFF])
+
+        uart_port.write(header)
+        uart_port.write(data)
+        uart_port.write(bytearray([0xFF, 0xFF]))
+        uart_port.flush()
+
+        return True
+
+    except Exception as e:
+        print(f"Stream frame UART error: {e}")
+        return False
+
+def run_stream_loop(uart_port, camera_index):
+    """
+    Run the request-response livestream loop until the Teensy stops it.
+
+    The Teensy sets the pace: it sends FRAME for each frame it is ready to relay,
+    which stops the Pi from overrunning the UART. The camera is opened once for
+    the whole session because opening a V4L2 capture costs far more than a frame
+    interval - it must not happen per request.
+
+    Protocol:
+    1. Teensy sends STREAM_START to enter stream mode
+    2. Teensy sends FRAME to request each frame
+    3. Pi grabs the freshest frame, downsamples it, and sends it
+    4. Teensy relays the frame over radio, then requests the next
+    5. Teensy sends STREAM_STOP to exit
+
+    Args:
+        uart_port: Serial port object for UART communication
+        camera_index: /dev/video index of the Boson
+
+    Returns:
+        str: Reason for exit ('stop_command', 'timeout', 'camera_error',
+             'interrupted', 'error')
+    """
+    cap = open_boson_capture(camera_index)
+    if not cap.isOpened():
+        print(f"Stream: could not open camera at index {camera_index}")
+        return 'camera_error'
+
+    print("Stream mode: waiting for frame requests from Teensy...")
+
+    frame_seq = 0
+    frames_sent = 0
+    start_time = time.time()
+    last_request = time.time()
+    rx_buffer = b''
+
+    try:
+        while True:
+            if uart_port.in_waiting > 0:
+                rx_buffer += uart_port.read(uart_port.in_waiting)
+
+            if STREAM_STOP_COMMAND in rx_buffer or b'STREAM_STOP' in rx_buffer:
+                print("Stream stop command received")
+                return 'stop_command'
+
+            if b'FRAME' not in rx_buffer:
+                # Give up if the Teensy has gone quiet - it may have reset, and
+                # without this the Pi would sit in stream mode indefinitely.
+                if time.time() - last_request > STREAM_IDLE_TIMEOUT_S:
+                    print("Stream: no frame requests received, leaving stream mode")
+                    return 'timeout'
+
+                if len(rx_buffer) > 256:
+                    rx_buffer = rx_buffer[-128:]
+                time.sleep(0.01)
+                continue
+
+            # Consume the request, tolerating a missing trailing newline
+            idx = rx_buffer.find(b'FRAME')
+            rx_buffer = rx_buffer[idx + len(b'FRAME'):]
+            if rx_buffer.startswith(b'\n'):
+                rx_buffer = rx_buffer[1:]
+            last_request = time.time()
+
+            frame = grab_fresh_frame(cap)
+            if frame is None:
+                print("Stream: failed to read frame from camera")
+                continue
+
+            frame_8bit = downsample_for_stream(frame)
+            if frame_8bit is None:
+                print("Stream: downsample failed")
+                continue
+
+            if send_stream_frame_uart(frame_8bit, frame_seq, uart_port):
+                frames_sent += 1
+                frame_seq = (frame_seq + 1) & 0xFF
+
+                if frames_sent % 10 == 0:
+                    elapsed = time.time() - start_time
+                    fps = frames_sent / elapsed if elapsed > 0 else 0
+                    print(f"Streaming: {frames_sent} frames, {fps:.1f} fps")
+            else:
+                print("Stream: failed to send frame")
+
+    except KeyboardInterrupt:
+        print("Stream interrupted by user")
+        return 'interrupted'
+
+    except Exception as e:
+        print(f"Stream error: {e}")
+        return 'error'
+
     finally:
         cap.release()
 
@@ -345,6 +572,32 @@ def main():
 
                 print("\nReady for next command...")
                 print("="*40)
+                send_status_uart("IDLE", uart)
+
+            elif command == 'stream_start':
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"\n[{timestamp}] Stream mode started via UART!")
+                print("="*40)
+
+                try:
+                    index = find_boson_index()
+                    print(f"Found boson camera at index {index}")
+                except Exception as index_error:
+                    print(f"Camera not found: {index_error}")
+                    send_status_uart("NO_CAMERA", uart)
+                    send_status_uart("IDLE", uart)
+                    continue
+
+                exit_reason = run_stream_loop(uart, index)
+                print(f"Stream ended: {exit_reason}")
+
+                print("\nReady for next command...")
+                print("="*40)
+                send_status_uart("IDLE", uart)
+
+            elif command == 'stream_stop':
+                # Stop arrived outside stream mode - nothing to unwind, just ack
+                print("Stream stop received (not in stream mode)")
                 send_status_uart("IDLE", uart)
 
     except KeyboardInterrupt:

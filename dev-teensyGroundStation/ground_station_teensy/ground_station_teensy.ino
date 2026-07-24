@@ -127,8 +127,8 @@ const uint16_t RETRY_MISSING_PACKET_THRESHOLD = 10; // Only trigger retries when
 
 // Livestream protocol constants
 const uint8_t STREAM_FRAME_TYPE = 0xCC;       // Message type for livestream frame packets
-const uint16_t STREAM_FRAME_SIZE = 4800;      // 80x60 8-bit = 4800 bytes per frame
-const uint8_t STREAM_PACKETS_PER_FRAME = 107; // ~107 packets per frame (4800/45)
+const uint16_t STREAM_FRAME_SIZE = 8000;      // 100x80 8-bit = 8000 bytes per frame
+const uint8_t STREAM_PACKETS_PER_FRAME = 178; // 178 packets per frame (8000/45, rounded up)
 
 // Retry timeout tracking
 unsigned long lastRetryRequestTime = 0;           // When we last sent a retry request
@@ -213,7 +213,7 @@ struct PACKED StreamFrameHeaderPacket
 {
   uint8_t type;         // STREAM_FRAME_TYPE (0xCC)
   uint8_t frameSeq;     // Frame sequence number (0-255, wrapping)
-  uint16_t frameSize;   // Frame size in bytes (4800)
+  uint16_t frameSize;   // Frame size in bytes (8000)
   uint16_t totalPackets; // Number of data packets for this frame
 };
 
@@ -2799,9 +2799,9 @@ void handleStreamFrameData(uint8_t *buf, uint8_t len)
  *   [PKTS]                - 1 byte packet count received
  *   [CHECKSUM_LO]         - 1 byte checksum low byte
  *   [CHECKSUM_HI]         - 1 byte checksum high byte
- *   [4800 bytes]          - raw frame data
+ *   [8000 bytes]          - raw frame data
  *
- * Total: 4 + 1 + 1 + 2 + 4800 = 4808 bytes per frame
+ * Total: 4 + 1 + 1 + 2 + 8000 = 8008 bytes per frame
  */
 void outputStreamFrame()
 {
@@ -2839,7 +2839,7 @@ void outputStreamFrame()
   Serial.write((uint8_t)(checksum & 0xFF));
   Serial.write((uint8_t)(checksum >> 8));
 
-  // Raw frame data - 4800 bytes
+  // Raw frame data - 8000 bytes
   Serial.write(streamFrameBuffer, STREAM_FRAME_SIZE);
 
   // Flush to ensure data is sent

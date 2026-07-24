@@ -53,8 +53,8 @@
 /**  Build configuration flags
  *  Uncomment ONE of these for your build target:
  * */
-#define DEBUG    // Verbose logging for development
-// #define FLIGHT // Flight mode - minimal logging
+// #define DEBUG    // Verbose logging for development
+#define FLIGHT // Flight mode - minimal logging
 
 /** Bench debugging without the radio.
  *  When defined, the RF23 is never initialised and no SPI/RF traffic is
@@ -136,8 +136,10 @@ const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing 
 // Livestream protocol constants
 const uint8_t STREAM_FRAME_TYPE = 0xCC;                                 // Message type for livestream frame packets
 const uint8_t STREAM_MAGIC[4] = {0xCA, 0xFE, 0xBA, 0xBE};               // Magic header for livestream frames from Pi
-const uint16_t STREAM_FRAME_SIZE = 4800;                                // 80x60 8-bit = 4800 bytes per frame
-const uint8_t STREAM_PACKETS_PER_FRAME = (STREAM_FRAME_SIZE + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;  // ~107 packets
+const uint16_t STREAM_FRAME_SIZE = 8000;                                // 100x80 8-bit = 8000 bytes per frame
+// 178 packets at 100x80. Must stay <= 255: StreamDataPacket.packetIndex is a uint8_t,
+// which caps a stream frame at 256 packets (11,520 bytes).
+const uint8_t STREAM_PACKETS_PER_FRAME = (STREAM_FRAME_SIZE + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;
 const char STREAM_START_CMD[] = "STREAM_START\n";                       // Command to RPi to start streaming
 const char STREAM_STOP_CMD[] = "STREAM_STOP\n";                         // Command to RPi to stop streaming
 const char FRAME_REQUEST_CMD[] = "FRAME\n";                             // Command to RPi to send one frame
@@ -222,7 +224,7 @@ struct PACKED StreamFrameHeaderPacket
 {
   uint8_t type;         // STREAM_FRAME_TYPE (0xCC)
   uint8_t frameSeq;     // Frame sequence number (0-255, wrapping)
-  uint16_t frameSize;   // Frame size in bytes (4800)
+  uint16_t frameSize;   // Frame size in bytes (8000)
   uint16_t totalPackets; // Number of data packets for this frame
 };
 
@@ -2354,7 +2356,7 @@ bool waitForStreamMagic(uint32_t timeout_ms)
 
 /**
  * Receive one stream frame from Pi via UART
- * Stream frame format: [STREAM_MAGIC 4B][Frame Seq 1B][Size 2B][Data 4800B][End 2B]
+ * Stream frame format: [STREAM_MAGIC 4B][Frame Seq 1B][Size 2B][Data 8000B][End 2B]
  * Uses byte-by-byte scanning to find magic header (handles misalignment)
  *
  * @param frameSeq Output parameter for frame sequence number
@@ -2363,7 +2365,7 @@ bool waitForStreamMagic(uint32_t timeout_ms)
 bool recvStreamFrameFromPi(uint8_t &frameSeq)
 {
   const uint32_t STREAM_HEADER_TIMEOUT_MS = 1000; // 1s timeout for streaming
-  const uint32_t STREAM_DATA_TIMEOUT_MS = 2000;   // 2s for frame data (4800 bytes)
+  const uint32_t STREAM_DATA_TIMEOUT_MS = 2000;   // 2s for frame data (8000 bytes = ~700ms at 115200)
 
   // Don't even try if no data available
   if (!Serial2.available())
