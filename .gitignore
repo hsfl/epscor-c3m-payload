@@ -10,5 +10,5 @@ __pycache__
 # data
 thermal_data_*.csv
 testcomms_results_*.csv
-captures/* 
-capture_queue/*
+SatellitePayload/captures/* 
+SatellitePayload/capture_queue/*
