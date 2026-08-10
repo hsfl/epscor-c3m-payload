@@ -14,11 +14,9 @@ import time
 import cv2  # type: ignore
 from picamera2 import Picamera2  # type: ignore
 
-# Full 1080p still capture. Raw RGB888 at this resolution is ~6.2MB, far too
-# large to downlink as-is at the radio's ~38.4kbps link - capture() JPEG-
-# compresses before returning, which is what actually keeps this practical.
-CAPTURE_WIDTH = 1920
-CAPTURE_HEIGHT = 1080
+# image resolution
+CAPTURE_WIDTH = 640
+CAPTURE_HEIGHT = 480
 JPEG_QUALITY = 85  # cv2.IMWRITE_JPEG_QUALITY (0-100)
 
 AWB_SETTLE_S = 0.2  # time to let AEC/AWB converge after starting the camera
@@ -82,6 +80,7 @@ class RpiCamera:
         self.last_frame = frame  # kept for debug CSV/image dumps, not UART
         return encoded.tobytes()
 
+    # TODO: either gracefully fail when streaming is requested, or implement a livestream protocol for RPi camera frames
     def get_stream_frame(self, max_age_s=1.0):
         # No livestream protocol defined for this camera yet.
         return None
