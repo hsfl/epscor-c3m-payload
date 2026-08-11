@@ -6,7 +6,7 @@
  * to the ground station via radio communication.
  *
  * Key Features:
- * - Triggers RPI thermal capture via UART command ("TRIGGER\n")
+ * - Triggers RPI thermal capture via UART command ("CAPTURE\n")
  * - Receives thermal image data from RPI via UART at 115200 baud
  * - Transmits image data via RFM23BP radio module in packetized format
  * - Handles reliable packet transmission with retry logic
@@ -20,7 +20,7 @@
  * - UART connection between Teensy and RPI
  *
  * Communication Protocol:
- * - UART Trigger: Sends "TRIGGER\n" command to initiate RPI capture  
+ * - UART Trigger: Sends "CAPTURE\n" command to initiate RPI capture
  * - UART Data: Receives thermal data with header/end markers
  * - Radio: Transmits packetized data with header/data/end packets
  *
@@ -49,6 +49,7 @@
 #include <RHHardwareSPI1.h>
 #include <Wire.h>
 #include <Adafruit_INA219.h>
+#include "rpi_uart.hpp"
 
 /**  Build configuration flags
  *  Uncomment ONE of these for your build target:
@@ -71,8 +72,7 @@ const uint8_t RPI_ENABLE = 36; // Power control pin for Raspberry Pi
 const uint8_t LED_PIN = 13;
 
 // UART pins: Serial2 uses pins 7 (RX) and 8 (TX) automatically
-// UART trigger command to signal RPI for capture
-const char UART_TRIGGER_CMD[] = "TRIGGER\n";
+// UART capture command (UART_CAPTURE_CMD) defined in rpi_uart.hpp
 
 // Radio configuration pins and object
 const int RADIO_CS = 38;  // Chip select pin for RF22 module
@@ -85,18 +85,8 @@ const uint8_t RADIO_TX_ON_PIN = 31;
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 const int RADIO_WAIT_PACKET_SENT_MS = 500;
 
-// === UART / Framing constants ===
-#define UART_BAUD 115200 // <-- set this to match the Pi; 921600 is fine on Teensy 4.1
-
-const uint8_t UART_MAGIC[4] = {0xDE, 0xAD, 0xBE, 0xEF};
-const uint8_t UART_END[2] = {0xFF, 0xFF};
-
-// New Jaycee 07/08/26
-const uint8_t UART_HEADER_SIZE = 7;
-
-const uint32_t UART_HEADER_TIMEOUT_MS = 15000;  // 15s to see header (Pi capture + prep time)
-const uint32_t UART_PAYLOAD_TIMEOUT_MS = 30000; // 30s to receive payload
-const uint32_t UART_END_TIMEOUT_MS = 1000;      // 1s to see end markers
+// UART / framing constants (UART_BAUD, UART_MAGIC, UART_END, UART_HEADER_SIZE,
+// UART_*_TIMEOUT_MS) defined in rpi_uart.hpp
 
 // Simple max for STATUS messages
 const uint16_t MAX_STATUS_LEN = 256;
@@ -134,15 +124,12 @@ const uint8_t SERIAL_CONTINUATION_FLAG = 0x80;                // High bit indica
 const uint8_t RETRY_REQUEST_TYPE = 0xBB; // Message type for requesting missing packets
 
 // Livestream protocol constants
-const uint8_t STREAM_FRAME_TYPE = 0xCC;                                 // Message type for livestream frame packets
-const uint8_t STREAM_MAGIC[4] = {0xCA, 0xFE, 0xBA, 0xBE};               // Magic header for livestream frames from Pi
-const uint16_t STREAM_FRAME_SIZE = 8000;                                // 100x80 8-bit = 8000 bytes per frame
+// STREAM_MAGIC, STREAM_FRAME_SIZE, STREAM_START_CMD, STREAM_STOP_CMD, FRAME_REQUEST_CMD
+// defined in rpi_uart.hpp
+const uint8_t STREAM_FRAME_TYPE = 0xCC; // Message type for livestream frame packets
 // 178 packets at 100x80. Must stay <= 255: StreamDataPacket.packetIndex is a uint8_t,
 // which caps a stream frame at 256 packets (11,520 bytes).
 const uint8_t STREAM_PACKETS_PER_FRAME = (STREAM_FRAME_SIZE + PACKET_DATA_SIZE - 1) / PACKET_DATA_SIZE;
-const char STREAM_START_CMD[] = "STREAM_START\n";                       // Command to RPi to start streaming
-const char STREAM_STOP_CMD[] = "STREAM_STOP\n";                         // Command to RPi to stop streaming
-const char FRAME_REQUEST_CMD[] = "FRAME\n";                             // Command to RPi to send one frame
 
 // Stream mode state
 bool streamModeActive = false;
@@ -309,8 +296,6 @@ void startStreamMode();
 void stopStreamMode();
 void handleStreamMode();
 void requestFrameFromPi();
-bool waitForStreamMagic(uint32_t timeout_ms);
-bool recvStreamFrameFromPi(uint8_t &frameSeq);
 void sendStreamFrameViaRadio(uint8_t frameSeq);
 
 /**
@@ -1562,52 +1547,7 @@ void loop()
 #endif
 }
 
-// Read exactly 'len' bytes from 'port' with a deadline
-bool readExact(HardwareSerial &port, uint8_t *buf, size_t len, uint32_t timeout_ms)
-{
-  uint32_t start = millis();
-  size_t got = 0;
-  while (got < len)
-  {
-    if (millis() - start > timeout_ms)
-      return false;
-    int avail = port.available();
-    if (avail > 0)
-    {
-      size_t toRead = (size_t)avail;
-      size_t needed = len - got;
-      if (toRead > needed)
-        toRead = needed;
-
-      size_t r = port.readBytes(buf + got, toRead);
-      if (r > 0)
-      {
-        got += r;
-      }
-      else
-      {
-        delay(1);
-      }
-    }
-    else
-    {
-      delay(1);
-    }
-  }
-  return true;
-}
-
-// Validate magic
-bool magicOK(const uint8_t *h)
-{
-  return h[0] == UART_MAGIC[0] && h[1] == UART_MAGIC[1] && h[2] == UART_MAGIC[2] && h[3] == UART_MAGIC[3];
-}
-
-// Validate end markers
-bool endOK(const uint8_t *e)
-{
-  return e[0] == UART_END[0] && e[1] == UART_END[1];
-}
+// readExact, magicOK, endOK defined in rpi_uart.hpp
 
 // Standard CRC-16/CCITT-FALSE for cross-checking packet integrity
 uint16_t crc16_ccitt(const uint8_t *data, size_t len)
@@ -1631,114 +1571,10 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t len)
   return crc;
 }
 
-// Identify STATUS vs IMAGE by looking for ASCII "STATUS:" prefix
-bool payloadIsStatus(const uint8_t *payload, uint16_t len)
-{
-  const char *prefix = "STATUS:";
-  const size_t L = 7; // includes colon
-  if (len < L)
-    return false;
-  for (size_t i = 0; i < L; ++i)
-  {
-    if ((char)payload[i] != prefix[i])
-      return false;
-  }
-  return true;
-}
-
-// Receive ONE framed message from the Pi into 'dest' (up to destMax)
-// Returns: true on success; writes outLen and sets isStatus accordingly.
-bool recvFramedFromPi(HardwareSerial &port,
-                      uint8_t *dest, uint32_t destMax,
-                      uint32_t &outLen, bool &isStatus)
-{
-  outLen = 0;
-  isStatus = false;
-
-  // Jaycee change 2 length to 3 length
-  // 1) Header: 4 magic + 4 length
-  uint8_t header[UART_HEADER_SIZE];
-  if (!readExact(port, header, UART_HEADER_SIZE, UART_HEADER_TIMEOUT_MS))
-  {
-    radioPrintln("ERROR: UART header timeout");
-    return false;
-  }
-  if (!magicOK(header))
-  {
-    radioPrint("ERROR: Bad magic: ");
-    for (int i = 0; i < 4; i++)
-    {
-      radioPrint("0x");
-      radioPrint(String(header[i], HEX));
-      radioPrint(" ");
-    }
-    radioPrintln();
-    return false;
-  }
-
-  uint32_t len = (uint32_t)header[4] | ((uint32_t)header[5] << 8) | ((uint32_t)header[6] << 16);
-  if (len == 0)
-  {
-    radioPrintln("ERROR: Zero-length payload");
-    return false;
-  }
-
-  if (len > destMax)
-  {
-    radioPrint("ERROR: Payload too large (");
-    radioPrint(String(len));
-    radioPrintln(" bytes) for buffer");
-    // Drain and discard payload + end markers to resync
-    uint8_t dump[64];
-    uint32_t remaining = (uint32_t)len + 2;
-    uint32_t start = millis();
-    while (remaining > 0 && (millis() - start) < UART_PAYLOAD_TIMEOUT_MS)
-    {
-      size_t toRead = (remaining < sizeof(dump)) ? (size_t)remaining : sizeof(dump);
-      size_t r = port.readBytes(dump, toRead);
-      if (r > 0)
-      {
-        remaining -= (uint32_t)r;
-      }
-      else
-      {
-        delay(1);
-      }
-    }
-    radioPrintln("ERROR: Discarded oversized payload; request retransmit.");
-    return false;
-  }
-
-  // 2) Payload
-  if (!readExact(port, dest, len, UART_PAYLOAD_TIMEOUT_MS))
-  {
-    radioPrintln("ERROR: UART payload timeout");
-    return false;
-  }
-
-  // 3) End markers
-  uint8_t ender[2];
-  if (!readExact(port, ender, 2, UART_END_TIMEOUT_MS))
-  {
-    radioPrintln("ERROR: UART end-marker timeout");
-    return false;
-  }
-  if (!endOK(ender))
-  {
-    radioPrint("ERROR: Bad end markers: 0x");
-    radioPrint(String(ender[0], HEX));
-    radioPrint(" 0x");
-    radioPrintln(String(ender[1], HEX));
-    return false;
-  }
-
-  outLen = len;
-  isStatus = payloadIsStatus(dest, len);
-  return true;
-}
+// payloadIsStatus, recvFramedFromPi defined in rpi_uart.hpp
 
 // Pretty-print a STATUS payload (strip "STATUS:")
-void handleStatusPayload(const uint8_t *payload, uint16_t len)
+String handleStatusPayload(const uint8_t *payload, uint16_t len)
 {
   const size_t L = 7;
   String msg;
@@ -1762,6 +1598,8 @@ void handleStatusPayload(const uint8_t *payload, uint16_t len)
   {
     RPI_IDLE_READY = true;
   }
+
+  return msg;
 }
 
 // Drain any unsolicited framed UART messages (typically STATUS packets) while idle
@@ -1793,11 +1631,16 @@ void pollPIUartStatus()
   }
 }
 /**
- * Captures thermal image data from Raspberry Pi via UART
+ * Triggers a capture on the Raspberry Pi via UART.
  *
- * Triggers the RPI to capture thermal data, receives the data via UART,
- * validates the transmission, and stores the image in the buffer.
- * Provides real-time progress updates and data quality assessment.
+ * Capture no longer streams image data back inline - the Pi saves each
+ * capture to its on-disk queue and only reports STATUS text (CAPTURE_START/
+ * CAPTURE_DONE/CAPTURE_ERROR/NO_FRAME per camera). This waits for the first
+ * CAPTURE_DONE/CAPTURE_ERROR/NO_FRAME status and returns; if more than one
+ * camera is capturing (plain "CAPTURE\n", no ID), remaining per-camera
+ * status lines are drained afterward by pollPIUartStatus() as usual.
+ * Retrieving the actual image data is a separate REQUEST <id> step (not yet
+ * wired up from the ground station side).
  */
 void captureThermalImageUART()
 {
@@ -1807,84 +1650,52 @@ void captureThermalImageUART()
     return;
   }
 
-  radioPrintln("--- UART THERMAL CAPTURE ---");
+  radioPrintln("--- UART CAPTURE ---");
   radioPrintln("Triggering RPI capture...");
-
-  memset(imgBuf, 0, MAX_IMG); // Clear previous frame residue
-  capturedImageLength = 0;
 
   piCaptureInProgress = true;
 
-  // Clear any pending UART bytes before sending trigger
+  // Clear any pending UART bytes before sending the command
   while (Serial2.available())
     Serial2.read();
 
-  // Send UART trigger command to Raspberry Pi
-  Serial2.print(UART_TRIGGER_CMD);
+  // Send UART capture command to Raspberry Pi
+  Serial2.print(UART_CAPTURE_CMD);
   Serial2.flush(); // Ensure command is sent immediately
 
-  radioPrintln("Waiting for framed message from RPI...");
+  radioPrintln("Waiting for capture status from RPI...");
 
-  bool imageReceived = false;
+  bool captureComplete = false;
 
-  while (!imageReceived)
+  while (!captureComplete)
   {
     uint32_t rxLen = 0;
     bool isStatus = false;
 
-    if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
+    if (!recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus))
     {
-      radioPrintln("ERROR: Failed to receive framed message");
+      radioPrintln("ERROR: Failed to receive capture status");
       piCaptureInProgress = false;
       return;
     }
 
-    if (isStatus)
+    if (!isStatus)
     {
-      handleStatusPayload(imgBuf, rxLen);
-      continue;
+      radioPrintln("ERROR: Unexpected non-status payload during capture");
+      piCaptureInProgress = false;
+      return;
     }
 
-    capturedImageLength = rxLen;
-    imageReceived = true;
+    String msg = handleStatusPayload(piStatusBuf, rxLen);
+    if (msg.startsWith("CAPTURE_DONE") || msg.startsWith("CAPTURE_ERROR") || msg.startsWith("NO_FRAME"))
+    {
+      captureComplete = true;
+    }
   }
 
   piCaptureInProgress = false;
 
-  radioPrintln("--- UART IMAGE RECEPTION COMPLETE ---");
-  radioPrint("Received ");
-  radioPrint(String(capturedImageLength));
-  radioPrintln(" image bytes");
-
-  // Quick quality check (same logic you already had)
-  // Removed per-pixel valid-temperature check: image is now treated as raw
-  // 16-bit sensor values, so the Kelvin*100 validity metric no longer applies.
-  // if (capturedImageLength >= 38400)
-  // {
-  //   int validPixels = 0;
-  //   for (uint32_t i = 0; i + 1 < capturedImageLength; i += 2)
-  //   {
-  //     uint16_t pixel = imgBuf[i] | (uint16_t(imgBuf[i + 1]) << 8);
-  //     float tempC = (pixel - 27315) / 100.0f;
-  //     if (tempC >= 0 && tempC <= 60)
-  //       validPixels++;
-  //   }
-  //   float validPct = (float)validPixels * 100.0f / (capturedImageLength / 2);
-  //   radioPrint("Data quality: ");
-  //   radioPrint(String(validPct, 1));
-  //   radioPrintln("% valid temperature pixels");
-  //
-  //   if (validPct > 95)
-  //     radioPrintln("✓ Excellent data quality! Ready for radio transmission - press 'r'");
-  //   else if (validPct > 50)
-  //     radioPrintln("⚠️ Moderate data quality - may still be usable");
-  //   else
-  //     radioPrintln("❌ Poor data quality detected");
-  // }
-  // else
-  // {
-  //   radioPrintln("⚠️ Received size smaller than expected for thermal image");
-  // }
+  radioPrintln("--- UART CAPTURE COMPLETE ---");
 
   // Drain any post-capture status messages immediately
   pollPIUartStatus();
@@ -2260,14 +2071,7 @@ void sendThermalDataViaRadio()
 // LIVESTREAM MODE FUNCTIONS
 // ============================================================================
 
-/**
- * Check if the buffer starts with stream magic header
- */
-bool isStreamMagic(const uint8_t *buf)
-{
-  return buf[0] == STREAM_MAGIC[0] && buf[1] == STREAM_MAGIC[1] &&
-         buf[2] == STREAM_MAGIC[2] && buf[3] == STREAM_MAGIC[3];
-}
+// isStreamMagic defined in rpi_uart.hpp
 
 /**
  * Start livestream mode - send command to Pi and enter stream state
@@ -2315,136 +2119,7 @@ void stopStreamMode()
   radioPrintln("STREAM: Mode stopped");
 }
 
-/**
- * Scan UART byte-by-byte looking for STREAM_MAGIC header
- * This allows recovery from partial data or misalignment
- *
- * @param timeout_ms Maximum time to wait for magic header
- * @return true if stream magic was found
- */
-bool waitForStreamMagic(uint32_t timeout_ms)
-{
-  uint32_t start = millis();
-  uint8_t matchIndex = 0;
-
-  while (millis() - start < timeout_ms)
-  {
-    if (Serial2.available())
-    {
-      uint8_t b = Serial2.read();
-      if (b == STREAM_MAGIC[matchIndex])
-      {
-        matchIndex++;
-        if (matchIndex == 4)
-        {
-          return true; // Found complete magic header
-        }
-      }
-      else
-      {
-        // Mismatch - check if this byte could be start of new magic
-        matchIndex = (b == STREAM_MAGIC[0]) ? 1 : 0;
-      }
-    }
-    else
-    {
-      delay(1);
-    }
-  }
-  return false; // Timeout
-}
-
-/**
- * Receive one stream frame from Pi via UART
- * Stream frame format: [STREAM_MAGIC 4B][Frame Seq 1B][Size 2B][Data 8000B][End 2B]
- * Uses byte-by-byte scanning to find magic header (handles misalignment)
- *
- * @param frameSeq Output parameter for frame sequence number
- * @return true if frame received successfully
- */
-bool recvStreamFrameFromPi(uint8_t &frameSeq)
-{
-  const uint32_t STREAM_HEADER_TIMEOUT_MS = 1000; // 1s timeout for streaming
-  const uint32_t STREAM_DATA_TIMEOUT_MS = 2000;   // 2s for frame data (8000 bytes = ~700ms at 115200)
-
-  // Don't even try if no data available
-  if (!Serial2.available())
-  {
-    return false;
-  }
-
-  // Scan for stream magic byte-by-byte
-  if (!waitForStreamMagic(STREAM_HEADER_TIMEOUT_MS))
-  {
-    return false; // Timeout or no magic found
-  }
-
-  // Magic found, now read rest of header: 1 seq + 2 size = 3 bytes
-  uint8_t headerRest[3];
-  if (!readExact(Serial2, headerRest, 3, STREAM_HEADER_TIMEOUT_MS))
-  {
-    radioPrintln("STREAM: Header rest timeout");
-    return false;
-  }
-
-  frameSeq = headerRest[0];
-  uint16_t frameSize = (uint16_t)headerRest[1] | ((uint16_t)headerRest[2] << 8);
-
-#ifdef DEBUG
-  radioPrint("STREAM: seq=");
-  radioPrint(String(frameSeq));
-  radioPrint(" size=");
-  radioPrintln(String(frameSize));
-#endif
-
-  if (frameSize != STREAM_FRAME_SIZE)
-  {
-    radioPrint("STREAM: Bad frame size ");
-    radioPrint(String(frameSize));
-    radioPrint(" (expected ");
-    radioPrint(String(STREAM_FRAME_SIZE));
-    radioPrint(", got bytes 0x");
-    radioPrint(String(headerRest[1], HEX));
-    radioPrint(" 0x");
-    radioPrint(String(headerRest[2], HEX));
-    radioPrintln(")");
-    // Drain remaining data to resync
-    while (Serial2.available()) Serial2.read();
-    return false;
-  }
-
-  // Read frame data
-  if (!readExact(Serial2, streamFrameBuffer, STREAM_FRAME_SIZE, STREAM_DATA_TIMEOUT_MS))
-  {
-    radioPrintln("STREAM: Frame data timeout");
-    // Drain buffer to resync
-    while (Serial2.available()) Serial2.read();
-    return false;
-  }
-
-  // Read end markers
-  uint8_t ender[2];
-  if (!readExact(Serial2, ender, 2, 500))
-  {
-    radioPrintln("STREAM: End marker timeout");
-    // Drain buffer to resync
-    while (Serial2.available()) Serial2.read();
-    return false;
-  }
-
-  if (ender[0] != 0xFF || ender[1] != 0xFF)
-  {
-    radioPrint("STREAM: Bad end markers 0x");
-    radioPrint(String(ender[0], HEX));
-    radioPrint(" 0x");
-    radioPrintln(String(ender[1], HEX));
-    // Drain buffer to resync for next frame
-    while (Serial2.available()) Serial2.read();
-    return false;
-  }
-
-  return true;
-}
+// waitForStreamMagic, recvStreamFrameFromPi defined in rpi_uart.hpp
 
 /**
  * Send a stream frame via radio to ground station
@@ -2573,7 +2248,7 @@ void handleStreamMode()
 
   // Wait for and receive the frame
   uint8_t frameSeq;
-  if (recvStreamFrameFromPi(frameSeq))
+  if (recvStreamFrameFromPi(Serial2, streamFrameBuffer, STREAM_FRAME_SIZE, frameSeq))
   {
     // Successfully received frame - transmit over radio to GS
     sendStreamFrameViaRadio(frameSeq);

@@ -12,17 +12,25 @@ one camera), this controller probes every camera in CAMERA_CLASSES at startup
 and drives whichever ones respond through a common interface
 (initialize/start_streaming/capture/get_stream_frame/cleanup) defined by
 lepton_camera.LeptonCamera, boson_camera.BosonCamera, and rpi_camera.RpiCamera.
-A TRIGGER captures from every connected camera in sequence; livestream is
-serviced by the first connected camera that supports it.
+A CAPTURE (with no ID) captures from every connected camera in sequence and
+queues each result on disk; livestream is serviced by the first connected
+camera that supports it.
 
 Communication Protocol:
 - UART: 115200 baud, 8N1
-- Trigger: "TRIGGER\n" command from Teensy
+- Commands (ASCII, newline-terminated) from Teensy:
+    "CAPTURE\n"       - capture from every connected camera
+    "CAPTURE <id>\n"  - capture from one camera (see CAMERA_IDS); error if
+                        <id> is unknown or that camera isn't connected
+    "REQUEST <id>\n"  - send the most recently captured image for camera <id>
+    "STREAM_START\n" / "STREAM_STOP\n" - livestream mode
+  Captures are saved to CAPTURE_QUEUE_DIR on disk, not transmitted
+  immediately - only REQUEST triggers a UART data transfer.
 - Header: Magic bytes (0xDE 0xAD 0xBE 0xEF) + camera-ID (1 byte, see CAMERA_IDS) + 24-bit length
 - Data: Raw thermal image data
 - End: Magic bytes (0xFF 0xFF)
 
-@author EPSCOR C3M Team
+@author Samantha Mallari
 @date 2026-08-04
 @version 1.0.0
 """
@@ -35,26 +43,29 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import cv2
-import numpy as np
 import serial
 
 from lepton_camera import LeptonCamera
 from boson_camera import BosonCamera
 from rpi_camera import RpiCamera
 
-# Verbose logging: on TRIGGER, also dump each captured frame's raw values as a
-# CSV and a rendered PNG/JPG onto the Pi's disk under DEBUG_SAVE_DIR.
-# Set from the --debug CLI flag in main() - don't edit directly.
-DEBUG = False
-DEBUG_SAVE_DIR = Path("captures")
+# Captured images are persisted here (one file per capture, newest-last by
+# filename) so a later REQUEST <id> can find the most recent one for a camera.
+CAPTURE_QUEUE_DIR = Path("capture_queue")
 
 # UART Configuration for Teensy communication
 UART_PORT = '/dev/serial0'  # Primary UART (GPIO14/15, pins 8/10)
 UART_BAUD = 115200         # High-speed UART to match Teensy baud rate
-TRIGGER_COMMAND = b'TRIGGER\n'  # UART command from Teensy to initiate capture
-STREAM_START_COMMAND = b'STREAM_START\n'  # Command to start livestream mode
-STREAM_STOP_COMMAND = b'STREAM_STOP\n'    # Command to stop livestream mode
+
+# Newline-terminated ASCII commands from the Teensy. CAPTURE and REQUEST take
+# an optional/required camera-ID argument (see CAMERA_IDS), parsed separately
+# in wait_for_uart_command() - these are just the recognized command words.
+CMD_CAPTURE = 'CAPTURE'
+CMD_REQUEST = 'REQUEST'
+CMD_STREAM_START = 'STREAM_START'
+CMD_STREAM_STOP = 'STREAM_STOP'
+KNOWN_COMMANDS = {CMD_CAPTURE, CMD_REQUEST, CMD_STREAM_START, CMD_STREAM_STOP}
+
 FRAME_REQUEST_COMMAND = b'FRAME\n'        # Command to request a single stream frame
 
 STREAM_MAGIC = bytes([0xCA, 0xFE, 0xBA, 0xBE])  # Magic header for livestream frames
@@ -79,7 +90,16 @@ CAMERA_IDS = {
     'boson': 1,
     'rpicam': 2,
 }
-CAMERA_ID_NONE = 0xFF  # sentinel for non-image UART payloads (e.g. STATUS messages)
+CAMERA_ID_NONE = 0xF0  # sentinel for non-image UART payloads (e.g. STATUS messages);
+                       # must match PAYLOAD_ID::STATUS_MSG in rpi_uart.hpp
+
+
+def camera_name_for_id(camera_id):
+    """Reverse-lookup into CAMERA_IDS; None if camera_id isn't a known value."""
+    for name, cid in CAMERA_IDS.items():
+        if cid == camera_id:
+            return name
+    return None
 
 
 def detect_connected_cameras():
@@ -109,46 +129,26 @@ def detect_connected_cameras():
     return connected
 
 
-def save_debug_frame(camera_name, camera):
-    """
-    Dump the camera's last captured frame to disk: raw pixel values as a CSV,
-    plus a rendered PNG/JPG (whichever encodes smaller) for quick visual
-    inspection. Requires camera.last_frame to have been set by capture().
-    """
-    frame = getattr(camera, "last_frame", None)
-    if frame is None:
-        print(f"{camera_name}: no frame array available to save for debug")
-        return
-
-    DEBUG_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+def save_capture(camera_name, frame_data):
+    """Persist one capture's raw bytes to CAPTURE_QUEUE_DIR, timestamped so
+    filename sort order matches capture order (used by find_latest_capture)."""
+    CAPTURE_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    stem = DEBUG_SAVE_DIR / f"{camera_name}_{ts}"
+    path = CAPTURE_QUEUE_DIR / f"{camera_name}_{ts}.bin"
+    path.write_bytes(frame_data)
+    print(f"{camera_name}: saved capture -> {path.name}")
+    return path
 
-    # Raw values as CSV. A 2D (grayscale) frame is written as-is; a 3D (e.g.
-    # BGR) frame is flattened so each row is still one image row.
-    csv_path = stem.with_suffix(".csv")
-    csv_frame = frame.reshape(frame.shape[0], -1) if frame.ndim > 2 else frame
-    np.savetxt(csv_path, csv_frame, delimiter=",", fmt="%d")
 
-    # Rendered image. Thermal frames are raw uint16 counts, not 0-255, so they
-    # need normalizing before either encoder can touch them.
-    render = frame if frame.dtype == np.uint8 else cv2.normalize(
-        frame, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
-    )
-
-    ok_png, png_bytes = cv2.imencode(".png", render)
-    ok_jpg, jpg_bytes = cv2.imencode(".jpg", render, [cv2.IMWRITE_JPEG_QUALITY, 90])
-
-    image_path = None
-    if ok_png and (not ok_jpg or len(png_bytes) <= len(jpg_bytes)):
-        image_path = stem.with_suffix(".png")
-        image_path.write_bytes(png_bytes.tobytes())
-    elif ok_jpg:
-        image_path = stem.with_suffix(".jpg")
-        image_path.write_bytes(jpg_bytes.tobytes())
-
-    print(f"{camera_name}: saved debug frame -> {csv_path.name}"
-          + (f", {image_path.name}" if image_path else " (image render failed)"))
+def find_latest_capture(camera_id):
+    """Return (camera_name, path) for the most recent capture of camera_id.
+    camera_name is None if camera_id is unknown; path is None if that camera
+    has no captures queued yet."""
+    name = camera_name_for_id(camera_id)
+    if name is None:
+        return None, None
+    matches = sorted(CAPTURE_QUEUE_DIR.glob(f"{name}_*.bin"))
+    return name, (matches[-1] if matches else None)
 
 
 def pick_streaming_camera(connected):
@@ -165,42 +165,67 @@ def pick_streaming_camera(connected):
     return None, None
 
 
-def run_trigger(connected, uart_port):
+def run_capture(camera_id, connected, uart_port):
     """
-    Capture once from every connected camera.
+    Capture and persist to CAPTURE_QUEUE_DIR - either from every connected
+    camera (camera_id is None) or from one specific camera (camera_id given).
 
-    If uart_port is given, each capture is sent over UART and status is
-    reported back to the Teensy, same as before. If uart_port is None
-    (--no-teensy), the same capture/debug-save pipeline runs locally and
-    frames are dropped instead of transmitted - lets the camera side be
-    bench-tested with no serial hardware attached at all.
+    Unlike the old immediate-transmit flow, captures are NOT sent over UART
+    here; they're saved to disk and only relayed later via a REQUEST <id>.
+    An unknown or unconnected camera_id reports an error status and captures
+    nothing. If uart_port is None (--no-teensy), status is printed instead of
+    framed and sent - lets the camera side be bench-tested with no serial
+    hardware attached at all.
     """
-    for name, camera in connected.items():
+    if camera_id is None:
+        targets = list(connected.items())
+    else:
+        name = camera_name_for_id(camera_id)
+        if name is None:
+            send_status_uart(f"CAPTURE_ERROR:UNKNOWN_ID:{camera_id}", uart_port)
+            return
+        if name not in connected:
+            send_status_uart(f"CAPTURE_ERROR:NOT_CONNECTED:{name}", uart_port)
+            return
+        targets = [(name, connected[name])]
+
+    for name, camera in targets:
         send_status_uart(f"CAPTURE_START:{name}", uart_port)
 
         frame_data = camera.capture()
 
         if frame_data is None:
             print(f"{name}: no frame available.")
-            send_status_uart(f"NO_FRAMES:{name}", uart_port)
+            send_status_uart(f"NO_FRAME:{name}", uart_port)
             continue
 
-        if DEBUG:
-            save_debug_frame(name, camera)
+        save_capture(name, frame_data)
+        print(f"{name}: captured {len(frame_data)} bytes")
+        send_status_uart(f"CAPTURE_DONE:{name}", uart_port)
 
-        if uart_port is None:
-            print(f"{name}: captured {len(frame_data)} bytes (not sent - --no-teensy)")
-            continue
 
-        print(f"\n{name}: waiting 3 seconds for Teensy to prepare...")
-        time.sleep(3)
-        success = send_data_uart(frame_data, uart_port, camera_id=CAMERA_IDS[name])
-        if success:
-            print(f"{name}: data transmission successful!")
-            send_status_uart(f"CAPTURE_DONE:{name}", uart_port)
-        else:
-            print(f"{name}: data transmission failed!")
-            send_status_uart(f"TX_FAIL:{name}", uart_port)
+def run_request(camera_id, uart_port):
+    """
+    Look up the most recently captured image for camera_id in
+    CAPTURE_QUEUE_DIR and send it to the Teensy over UART.
+    """
+    name, path = find_latest_capture(camera_id)
+    if name is None:
+        send_status_uart(f"REQUEST_ERROR:UNKNOWN_ID:{camera_id}", uart_port)
+        return
+    if path is None:
+        send_status_uart(f"REQUEST_ERROR:NO_CAPTURE:{name}", uart_port)
+        return
+
+    frame_data = path.read_bytes()
+    print(f"\n{name}: sending {path.name} ({len(frame_data)} bytes)...")
+    success = send_data_uart(frame_data, uart_port, camera_id=camera_id)
+    if success:
+        print(f"{name}: data transmission successful!")
+        send_status_uart(f"REQUEST_DONE:{name}", uart_port)
+    else:
+        print(f"{name}: data transmission failed!")
+        send_status_uart(f"REQUEST_FAIL:{name}", uart_port)
 
 
 def send_status_uart(message: str, uart_port):
@@ -338,38 +363,47 @@ def send_stream_frame_uart(frame_8bit, frame_seq, frame_size, uart_port):
 
 def wait_for_uart_command(uart_port, timeout=None):
     """
-    Wait for UART command from Teensy (TRIGGER or STREAM_START/STOP)
+    Wait for a newline-terminated ASCII command from the Teensy and parse it
+    as `cmd, *args = line.split()`.
 
     Args:
         uart_port: Serial port object for UART communication
         timeout: Optional timeout in seconds (None for blocking)
 
     Returns:
-        str: 'trigger', 'stream_start', 'stream_stop', or None on timeout
+        (cmd, args): cmd is one of KNOWN_COMMANDS, args is the list of
+        whitespace-split tokens after it (e.g. ('CAPTURE', ['0'])).
+        (None, []) on timeout. Unrecognized lines are logged and skipped.
     """
     start_time = time.time()
     buffer = b''
 
     while True:
-        if timeout is not None:
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                return None
+        if timeout is not None and time.time() - start_time > timeout:
+            return None, []
 
         if uart_port.in_waiting > 0:
-            chunk = uart_port.read(uart_port.in_waiting)
-            buffer += chunk
+            buffer += uart_port.read(uart_port.in_waiting)
 
-            if TRIGGER_COMMAND in buffer:
-                return 'trigger'
-            if STREAM_START_COMMAND in buffer:
-                return 'stream_start'
-            if STREAM_STOP_COMMAND in buffer:
-                return 'stream_stop'
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                line = line.strip()
+                if not line:
+                    continue
 
-            # Keep buffer size manageable (only last 100 bytes)
-            if len(buffer) > 100:
-                buffer = buffer[-100:]
+                parts = line.decode('ascii', 'ignore').split()
+                if not parts:
+                    continue
+
+                cmd, args = parts[0].upper(), parts[1:]
+                if cmd in KNOWN_COMMANDS:
+                    return cmd, args
+
+                print(f"UART: unrecognized command line: {line!r}")
+
+            # Keep buffer size manageable in case of line noise with no '\n'
+            if len(buffer) > 256:
+                buffer = buffer[-128:]
         else:
             time.sleep(0.01)  # Small delay to avoid busy-waiting
 
@@ -409,7 +443,7 @@ def run_stream_loop(camera, uart_port):
             if uart_port.in_waiting > 0:
                 rx_buffer += uart_port.read(uart_port.in_waiting)
 
-            if STREAM_STOP_COMMAND in rx_buffer or b'STREAM_STOP' in rx_buffer:
+            if b'STREAM_STOP' in rx_buffer:
                 print("Stream stop command received")
                 return 'stop_command'
 
@@ -470,9 +504,6 @@ def run_stream_loop(camera, uart_port):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RPi Multicam Controller")
-    parser.add_argument("--debug", action="store_true",
-                         help="Save each captured frame's raw values (CSV) and a rendered "
-                              f"PNG/JPG under {DEBUG_SAVE_DIR}/")
     parser.add_argument("--no-teensy", action="store_true",
                          help="Run the capture pipeline locally without opening UART or "
                               "sending to the Teensy: detects cameras, captures once from "
@@ -481,13 +512,9 @@ def parse_args():
 
 
 def main():
-    global DEBUG
-
     args = parse_args()
-    DEBUG = args.debug
 
     print("RPi Multicam Controller - UART Output")
-    print(f"Debug frame dumps: {'ON -> ' + str(DEBUG_SAVE_DIR) if DEBUG else 'OFF'}")
     print("="*40)
 
     if args.no_teensy:
@@ -502,7 +529,7 @@ def main():
             time.sleep(2)  # allow cameras to stabilize
             print(f"Connected cameras: {', '.join(connected.keys())}")
 
-            run_trigger(connected, None)
+            run_capture(None, connected, None)
         finally:
             for camera in connected.values():
                 try:
@@ -537,27 +564,52 @@ def main():
 
         print(f"\nSystem ready. Connected cameras: {', '.join(connected.keys())}")
         print("Waiting for UART commands:")
-        print(f"  - {TRIGGER_COMMAND.decode('ascii').strip()}: Capture from every connected camera")
-        print(f"  - {STREAM_START_COMMAND.decode('ascii').strip()}: Start livestream")
-        print(f"  - {STREAM_STOP_COMMAND.decode('ascii').strip()}: Stop livestream")
+        print(f"  - {CMD_CAPTURE} [id]: Capture (all cameras, or just [id])")
+        print(f"  - {CMD_REQUEST} <id>: Send most recent capture for camera <id>")
+        print(f"  - {CMD_STREAM_START}: Start livestream")
+        print(f"  - {CMD_STREAM_STOP}: Stop livestream")
         print(f"Data will be sent via UART: {UART_PORT} at {UART_BAUD} baud")
         send_status_uart("IDLE", uart)
 
         while True:
-            command = wait_for_uart_command(uart)
+            cmd, args = wait_for_uart_command(uart)
 
-            if command == 'trigger':
+            if cmd == CMD_CAPTURE:
                 timestamp = time.strftime("%H:%M:%S")
                 print(f"\n[{timestamp}] Capture triggered via UART!")
                 print("="*40)
 
-                run_trigger(connected, uart)
+                camera_id = None
+                if args:
+                    try:
+                        camera_id = int(args[0])
+                    except ValueError:
+                        send_status_uart(f"CAPTURE_ERROR:BAD_ID:{args[0]}", uart)
+                        continue
+
+                run_capture(camera_id, connected, uart)
 
                 print("\nReady for next command...")
                 print("="*40)
                 send_status_uart("IDLE", uart)
 
-            elif command == 'stream_start':
+            elif cmd == CMD_REQUEST:
+                if not args:
+                    send_status_uart("REQUEST_ERROR:MISSING_ID", uart)
+                    continue
+                try:
+                    camera_id = int(args[0])
+                except ValueError:
+                    send_status_uart(f"REQUEST_ERROR:BAD_ID:{args[0]}", uart)
+                    continue
+
+                run_request(camera_id, uart)
+
+                print("\nReady for next command...")
+                print("="*40)
+                send_status_uart("IDLE", uart)
+
+            elif cmd == CMD_STREAM_START:
                 timestamp = time.strftime("%H:%M:%S")
                 print(f"\n[{timestamp}] Stream mode started via UART!")
                 print("="*40)
@@ -575,7 +627,7 @@ def main():
                 print("="*40)
                 send_status_uart("IDLE", uart)
 
-            elif command == 'stream_stop':
+            elif cmd == CMD_STREAM_STOP:
                 # Stop command received outside of stream mode - just acknowledge
                 print("Stream stop received (not in stream mode)")
                 send_status_uart("IDLE", uart)
