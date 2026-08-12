@@ -62,9 +62,9 @@ const uint32_t UART_END_TIMEOUT_MS = 1000;      // 1s to see end markers
 
 // UART commands to the Pi. CAPTURE with no ID captures every connected
 // camera; REQUEST needs a camera-ID argument appended by the caller (e.g.
-// "REQUEST 0\n") - not yet wired up from the ground station side.
+// "REQUEST 0\n").
 const char UART_CAPTURE_CMD[] = "CAPTURE\n";
-const char UART_REQUEST_CMD[] = "REQUEST\n";
+const char UART_REQUEST_CMD[] = "REQUEST";
 
 // Livestream protocol constants
 const uint8_t STREAM_MAGIC[4] = {

@@ -557,7 +557,17 @@ void listenForCommands()
     }
     else if (cmd == 'r' || cmd == 'R')
     {
-      sendThermalDataViaRadio();
+      // 'r' alone resends the cached image; 'r' + ASCII digit fetches a
+      // specific camera's latest image from the Pi first.
+      if (len >= 2)
+      {
+        uint8_t cameraId = (uint8_t)(radioRxBuffer[1] - '0');
+        requestThermalImageFromPi(cameraId);
+      }
+      else
+      {
+        sendThermalDataViaRadio();
+      }
     }
     else if (cmd == 'd' || cmd == 'D')
     {
@@ -1419,7 +1429,15 @@ void loop()
 
         case 'r':
         case 'R':
-          sendThermalDataViaRadio();
+          if (len >= 2)
+          {
+            uint8_t cameraId = (uint8_t)(buf[1] - '0');
+            requestThermalImageFromPi(cameraId);
+          }
+          else
+          {
+            sendThermalDataViaRadio();
+          }
           break;
 
         case 'p':
@@ -1511,11 +1529,12 @@ void loop()
 
         default:
           radioPrintln("Unknown command.");
-          radioPrintln("GS cmds : u / r / p1 / p0 / ps / sg / si / sb / sG / sI / v1 / v0 / g / ~");
+          radioPrintln("GS cmds : u / r / r<id> / p1 / p0 / ps / sg / si / sb / sG / sI / v1 / v0 / g / ~");
           radioPrintln("DBG only: t / c / d");
 
           Serial.println("  u       - Capture thermal image (UART trigger to RPi)");
-          Serial.println("  r       - Transmit captured thermal data via radio");
+          Serial.println("  r       - Resend cached thermal data via radio");
+          Serial.println("  r<id>   - Fetch camera <id>'s latest image from RPi, then transmit via radio");
           Serial.println("  p1      - RPI power ON");
           Serial.println("  p0      - RPI power OFF");
           Serial.println("  ps      - RPI power status");
@@ -1642,6 +1661,86 @@ void pollPIUartStatus()
  * Retrieving the actual image data is a separate REQUEST <id> step (not yet
  * wired up from the ground station side).
  */
+/**
+ * Requests a specific camera's most recent image from the Raspberry Pi via
+ * UART, caches it into imgBuf, and relays it to the ground station over
+ * radio via sendThermalDataViaRadio(). Companion to captureThermalImageUART(),
+ * which only triggers a capture and leaves the image on the Pi's disk queue -
+ * this is the step that actually pulls image bytes back onto the Teensy.
+ *
+ * @param cameraId Camera id to request (0=lepton, 1=boson, 2=rpicam)
+ */
+void requestThermalImageFromPi(uint8_t cameraId)
+{
+  if (!RPI_IDLE_READY)
+  {
+    radioPrintln("Raspberry Pi is not ready yet, retry once in RPI STATUS: IDLE");
+    return;
+  }
+
+  radioPrintln("--- UART REQUEST ---");
+  radioPrint("Requesting image for camera ");
+  radioPrintln(String(cameraId));
+
+  piCaptureInProgress = true;
+
+  // Clear any pending UART bytes before sending the command
+  while (Serial2.available())
+    Serial2.read();
+
+  Serial2.print(UART_REQUEST_CMD);
+  Serial2.print(' ');
+  Serial2.print(cameraId);
+  Serial2.print('\n');
+  Serial2.flush();
+
+  bool gotImage = false;
+  bool requestFailed = false;
+  bool done = false;
+
+  while (!done)
+  {
+    uint32_t rxLen = 0;
+    bool isStatus = false;
+
+    if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
+    {
+      radioPrintln("ERROR: Failed to receive requested image");
+      piCaptureInProgress = false;
+      return;
+    }
+
+    if (isStatus)
+    {
+      String msg = handleStatusPayload(imgBuf, rxLen);
+      if (msg.startsWith("REQUEST_ERROR"))
+        requestFailed = true;
+      if (msg == "IDLE")
+        done = true;
+    }
+    else
+    {
+      capturedImageLength = rxLen;
+      gotImage = true;
+    }
+  }
+
+  piCaptureInProgress = false;
+
+  if (!gotImage || requestFailed)
+  {
+    radioPrintln("--- UART REQUEST FAILED ---");
+    return;
+  }
+
+  radioPrint("Image received: ");
+  radioPrint(String(capturedImageLength));
+  radioPrintln(" bytes");
+  radioPrintln("--- UART REQUEST COMPLETE ---");
+
+  sendThermalDataViaRadio();
+}
+
 void captureThermalImageUART()
 {
   if (!RPI_IDLE_READY)

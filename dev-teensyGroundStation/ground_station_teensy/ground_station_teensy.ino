@@ -71,6 +71,8 @@ uint16_t receivedPackets = 0;        // Number of packets successfully received
 bool headerReceived = false;         // Flag indicating header packet was received
 bool downloadingThermalData = false; // Flag indicating active thermal data packet transfer
 bool imageComplete = false;          // Flag indicating all data was received
+uint8_t lastRequestedCameraId = 0xFF; // Camera id from the most recent 'request <id>' (0xFF = unknown/legacy)
+bool autoExportOnComplete = false;    // Single-shot: auto-run exportThermalData() when this reception finishes
 uint16_t expectedImageCrc = 0;       // CRC expected from satellite end packet
 uint16_t lastComputedImageCrc = 0;   // CRC calculated locally after reception
 uint32_t crcErrorCount = 0;          // Count of packets dropped due to CRC mismatch
@@ -241,6 +243,9 @@ const int RASPBERRY_PI_GPIO_PIN = 36;
 const String THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---";
 const String THERMAL_CSV_START = "=== START CSV ===";
 const String THERMAL_CSV_END = "=== END CSV ===";
+// Must match THERMAL_JPG_START/THERMAL_JPG_END in ground_station_serial_cli_teensy.py exactly.
+const String THERMAL_JPG_START = "=== START JPG ===";
+const String THERMAL_JPG_END = "=== END JPG ===";
 
 
 // Livestream state
@@ -275,7 +280,10 @@ void handleThermalDataPacket(uint8_t *buf, uint8_t len);
 bool handleSerialMessage(uint8_t *buf, uint8_t len, String *messageOut = nullptr);
 void showReceptionSummary();
 void exportThermalData();
+void printBase64(const uint8_t *data, uint32_t len);
 void forwardToSatellite(char cmd);
+void setRadioAmpTransmit();
+void setRadioAmpReceive();
 void dumpRf23PendingPacketsToSerial();
 void printRf23HexLines(const uint8_t *data, uint8_t length);
 bool requestMissingPackets();
@@ -333,7 +341,7 @@ const Command commands[] = {
     {"radio", "Radio control (radio <init|status|tx|rx|dump>)", cmdRadio},
     {"export", "Export thermal data as CSV", cmdExport},
     {"capture", "Command satellite to capture thermal data", cmdCapture},
-    {"request", "Request thermal data downlink from satellite", cmdRequest},
+    {"request", "Request thermal data downlink for a camera (request <camera_id>)", cmdRequest},
     {"rstatus", "Show radio reception status", cmdRadioStatus},
     {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor},
     {"stream", "Control livestream mode (stream <start|stop>)", cmdStream},
@@ -694,9 +702,20 @@ void processPacket(uint8_t *buf, uint8_t len)
   else
   {
     // should never hit this but leave for debugging radio packets.
-    Serial.println("Header received: " + String(headerReceived));
-    Serial.println("imageComplete: " + String(imageComplete));
-    Serial.println("buf len: " + String(len));
+    // NOTE: intentionally NOT calling dumpRf23PendingPacketsToSerial() here.
+    // That helper puts the radio in idle mode and does ~15-20 blocking
+    // Serial.println() calls; while it runs, any real incoming packet is
+    // missed or torn mid-transmission, which then shows up as the *next*
+    // "unknown packet" too - one bad packet was cascading into a long run
+    // of them. Log a short summary instead and keep receiving. Use the
+    // 'dump'/'debug' CLI command to manually inspect the FIFO if needed.
+    Serial.print("Unknown radio packet (header=");
+    Serial.print(headerReceived);
+    Serial.print(" complete=");
+    Serial.print(imageComplete);
+    Serial.print(" len=");
+    Serial.print(len);
+    Serial.print("): ");
 
     for (uint8_t i = 0; i < len; i++)
     {
@@ -705,8 +724,6 @@ void processPacket(uint8_t *buf, uint8_t len)
     }
 
     Serial.println();
-    Serial.println("Unknown radio packet?! Dumping radio packets.");
-    dumpRf23PendingPacketsToSerial();
   }
 }
 
@@ -1254,9 +1271,19 @@ void showReceptionSummary()
     Serial.println("\n❌ Poor reception");
   }
 
-  // Indicate if thermal image is ready for export
-  // Changed to boson size jaycee
-  if (expectedLength == 163840)
+  // Auto-export when this reception was triggered by an interactive
+  // 'request <id>' (single-shot flag set in cmdRequest(), consumed here).
+  // testcomms drives its own doExport-gated export and never sets this flag,
+  // so its calls to showReceptionSummary() are unaffected.
+  if (autoExportOnComplete)
+  {
+    autoExportOnComplete = false;
+    if (headerReceived)
+    {
+      exportThermalData();
+    }
+  }
+  else if (expectedLength == 163840)
   {
     Serial.println("\nThermal image ready! Type 'export' to export as CSV");
   }
@@ -1298,11 +1325,47 @@ void showReceptionSummary()
   thermalDataTransferDuration = 0;
 }
 
-// Modified for boson camera
+// Standard base64 (RFC 4648) encoder, line-wrapped at 76 chars with
+// Serial.println() so the Python CLI's line-based serial reader
+// (process_text_data()) can capture it exactly like CSV rows.
+void printBase64(const uint8_t *data, uint32_t len)
+{
+  static const char b64Table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  uint8_t lineChars = 0;
+
+  for (uint32_t i = 0; i < len; i += 3)
+  {
+    uint32_t remaining = len - i;
+    uint8_t b0 = data[i];
+    uint8_t b1 = (remaining > 1) ? data[i + 1] : 0;
+    uint8_t b2 = (remaining > 2) ? data[i + 2] : 0;
+
+    char out[4];
+    out[0] = b64Table[b0 >> 2];
+    out[1] = b64Table[((b0 & 0x03) << 4) | (b1 >> 4)];
+    out[2] = (remaining > 1) ? b64Table[((b1 & 0x0F) << 2) | (b2 >> 6)] : '=';
+    out[3] = (remaining > 2) ? b64Table[b2 & 0x3F] : '=';
+
+    Serial.write(out, 4);
+    lineChars += 4;
+    if (lineChars >= 76)
+    {
+      Serial.println();
+      lineChars = 0;
+    }
+  }
+
+  if (lineChars > 0)
+    Serial.println();
+}
+
+// Exports the most recently downlinked image in the correct format for
+// lastRequestedCameraId: CSV thermal grid for lepton (0) / boson (1),
+// base64-encoded JPEG for rpicam (2). Falls back to the legacy boson-only
+// CSV path if no 'request <id>' has been issued this session (0xFF).
 void exportThermalData()
 {
-  // Changed 38400 to 163840 bits
-  if (!headerReceived || expectedLength != 163840)
+  if (!headerReceived)
   {
     Serial.println("No complete thermal image to export");
     return;
@@ -1313,48 +1376,45 @@ void exportThermalData()
     Serial.println("⚠️ Warning: image CRC mismatch – export may contain corrupt data");
   }
 
+  if (lastRequestedCameraId == 2)
+  {
+    // rpicam: raw JPEG bytes, no pixel-grid interpretation
+    Serial.println("\n--- EXPORTING RPICAM IMAGE ---");
+    Serial.println(THERMAL_JPG_START);
+    printBase64(imgBuffer, expectedLength);
+    Serial.println(THERMAL_JPG_END);
+    return;
+  }
+
+  // Lepton (0) and boson (1): 16-bit thermal grid, printed as CSV.
+  // Default to the legacy boson dimensions (320x256) when no 'request <id>'
+  // has set lastRequestedCameraId (e.g. a bare 'export'/'r' resend).
+  uint16_t width = 320;
+  uint16_t height = 256;
+  uint32_t expectedBytes = 163840;
+  if (lastRequestedCameraId == 0)
+  {
+    width = 160;
+    height = 120;
+    expectedBytes = 38400;
+  }
+
+  if (expectedLength != expectedBytes)
+  {
+    Serial.println("⚠️ Warning: image size doesn't match expected camera resolution – export may be misaligned");
+  }
+
   Serial.println("\n--- EXPORTING THERMAL DATA ---");
   Serial.println("Copying data below to a 'thermal_image.csv'");
   Serial.println(THERMAL_CSV_START);
 
-  // change 120x160 to 320x256
-  // Export thermal data as CSV (120x160 pixel grid)
-  // for (int row = 0; row < 320; row++)
-  // {
-  //   for (int col = 0; col < 256; col++)
-  //   {
-  //     uint32_t idx = (row * 256 + col) * 2; // 2 bytes per pixel
-  //     if (idx < MAX_IMG - 1)
-  //     {
-  //       // Convert raw 16-bit value to temperature in Celsius
-  //       uint16_t pixel = imgBuffer[idx] | (imgBuffer[idx + 1] << 8);
-  //       // if (pixel >= 27315 && pixel <= 37315)
-  //       // {                                        // Valid temperature range (0-100°C)
-  //       //   float tempC = (pixel - 27315) / 100.0; // Convert from Kelvin*100 to Celsius
-  //       //   Serial.print(tempC, 2);
-  //       // }
-  //       // else
-  //       // {
-  //       //   Serial.print("NaN"); // Invalid temperature value
-  //       // }
-  //     }
-  //     else
-  //     {
-  //       Serial.print("NaN"); // Buffer overflow protection
-  //     }
-  //     if (col < 319)
-  //       Serial.print(","); // CSV separator
-  //   }
-  //   Serial.println(); // New line for each row
-  // }
-
-  // Export raw thermal data as CSV (320x256 pixel grid, one raw 16-bit value per pixel)
+  // Export raw thermal data as CSV (one raw 16-bit value per pixel).
   // Comma-separated so it still parses as CSV; no temperature conversion applied.
-  for (int row = 0; row < 256; row++)
+  for (int row = 0; row < height; row++)
   {
-    for (int col = 0; col < 320; col++)
+    for (int col = 0; col < width; col++)
     {
-      uint32_t idx = (row * 320 + col) * 2; // 2 bytes per pixel
+      uint32_t idx = (row * width + col) * 2; // 2 bytes per pixel
       if (idx < MAX_IMG - 1)
       {
         // Print raw 16-bit sensor value (little-endian)
@@ -1365,20 +1425,13 @@ void exportThermalData()
       {
         Serial.print("NaN"); // Buffer overflow protection
       }
-      if (col < 319)
+      if (col < width - 1)
         Serial.print(","); // CSV separator
     }
     Serial.println(); // New line for each row
   }
 
   Serial.println(THERMAL_CSV_END);
-  // Serial.println("\nVisualize with Python:");
-  // Serial.println(" import numpy as np");
-  // Serial.println(" import matplotlib.pyplot as plt");
-  // Serial.println(" data = np.loadtxt('thermal_image.csv', delimiter=',')");
-  // Serial.println(" plt.imshow(data, cmap='hot')");
-  // Serial.println(" plt.colorbar(label='Temperature (°C)')");
-  // Serial.println(" plt.show()");
 }
 
 void forwardToSatellite(char cmd)
@@ -2141,7 +2194,30 @@ void cmdCapture(const char *args)
 
 void cmdRequest(const char *args)
 {
-  forwardToSatellite('r');
+  String argStr = args;
+  argStr.trim();
+
+  if (argStr.length() != 1 || argStr[0] < '0' || argStr[0] > '2')
+  {
+    Serial.println("Usage: request <camera_id>  (0=lepton, 1=boson, 2=rpicam)");
+    return;
+  }
+
+  Serial.println("\n--- REQUESTING THERMAL DATA DOWNLINK ---");
+  thermalDataDownloadDuration = millis(); // Start measuring user latency from request
+  thermalDataTransferDuration = 0;        // Reset transfer timer (will be set when header arrives)
+
+  lastRequestedCameraId = (uint8_t)(argStr[0] - '0');
+  autoExportOnComplete = true;
+
+  uint8_t buf[2] = {'r', (uint8_t)argStr[0]};
+  Serial.print("Forwarding command to satellite: request ");
+  Serial.println(argStr);
+
+  if (sendBytesToSatellite(buf, 2))
+    Serial.println("Command sent successfully");
+  else
+    Serial.println("Failed to send command");
 }
 
 void cmdTestComms(const char *args)

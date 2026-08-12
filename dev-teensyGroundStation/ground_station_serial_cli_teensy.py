@@ -23,6 +23,7 @@ import os
 import subprocess
 import glob
 import re
+import base64
 from serial.tools import list_ports
 from datetime import datetime
 
@@ -31,6 +32,11 @@ BAUD_RATE = 115200
 # CSV export detection constants
 THERMAL_CSV_START = "=== START CSV ==="
 THERMAL_CSV_END = "=== END CSV ==="
+
+# JPG export detection constants (rpicam). Must match THERMAL_JPG_START/
+# THERMAL_JPG_END in ground_station_teensy.ino exactly.
+THERMAL_JPG_START = "=== START JPG ==="
+THERMAL_JPG_END = "=== END JPG ==="
 THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---"
 ThermalCaptureTimestamp = datetime.now()
 
@@ -361,6 +367,26 @@ def get_next_thermal_filename():
     next_num = max_num + 1
     return f"thermal_data_{next_num:03d}.csv"
 
+def get_next_image_filename():
+    """Get the next available rpicam image filename with incrementing number"""
+    existing_files = glob.glob("thermal_data_*.jpg")
+
+    if not existing_files:
+        return "thermal_data_001.jpg"
+
+    max_num = 0
+    for filename in existing_files:
+        try:
+            num_str = filename.split('_')[2].split('.')[0]
+            num = int(num_str)
+            if num > max_num:
+                max_num = num
+        except (IndexError, ValueError):
+            continue
+
+    next_num = max_num + 1
+    return f"thermal_data_{next_num:03d}.jpg"
+
 def get_testcomms_filename():
     """Return a testcomms CSV filename stamped with the current date and time."""
     return datetime.now().strftime("testcomms_results_%Y%m%d_%H%M%S.csv")
@@ -605,6 +631,25 @@ def run_thermal_viewer(filename):
         return False
 
 
+def run_image_viewer(filename):
+    """Run the rpicam image viewer with the specified file, in its own
+    non-blocking process (same pattern as run_thermal_viewer)."""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        viewer_script = os.path.join(script_dir, "rpicam_image_viewer.py")
+
+        if not os.path.exists(viewer_script):
+            print(f"❌ Image viewer script not found: {viewer_script}")
+            return False
+
+        print(f"🖼️  Opening image viewer for: {filename}")
+        subprocess.Popen([sys.executable, viewer_script, filename])
+        return True
+    except Exception as e:
+        print(f"❌ Error running image viewer: {e}")
+        return False
+
+
 def _viewer_process(queue):
     """
     Viewer process function - runs matplotlib in its own process (main thread).
@@ -679,7 +724,9 @@ def read_serial(ser, stop_event):
     global ThermalCaptureTimestamp
     csv_capture_mode = False
     csv_data = []
-    partial_line_buffer = ""  # Buffer for incomplete lines during CSV capture
+    jpg_capture_mode = False
+    jpg_data = []
+    partial_line_buffer = ""  # Buffer for incomplete lines during CSV/JPG capture
 
     # Buffer for handling mixed text/binary data
     raw_buffer = bytearray()
@@ -702,7 +749,7 @@ def read_serial(ser, stop_event):
                         # First, process any text data BEFORE the magic
                         if magic_pos > 0:
                             text_chunk = raw_buffer[:magic_pos]
-                            csv_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, partial_line_buffer)
+                            csv_capture_mode, jpg_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, jpg_capture_mode, jpg_data, partial_line_buffer)
                             raw_buffer = raw_buffer[magic_pos:]
                             magic_pos = 0
 
@@ -751,12 +798,12 @@ def read_serial(ser, stop_event):
                         if len(raw_buffer) > 3:
                             text_chunk = raw_buffer[:-3]
                             raw_buffer = raw_buffer[-3:]
-                            csv_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, partial_line_buffer)
+                            csv_capture_mode, jpg_capture_mode, partial_line_buffer = process_text_data(text_chunk, csv_capture_mode, csv_data, jpg_capture_mode, jpg_data, partial_line_buffer)
                         break
             else:
                 # No data waiting - flush any remaining text in buffer
                 if len(raw_buffer) > 0 and raw_buffer.find(STREAM_FRAME_MAGIC) < 0:
-                    csv_capture_mode, partial_line_buffer = process_text_data(raw_buffer, csv_capture_mode, csv_data, partial_line_buffer)
+                    csv_capture_mode, jpg_capture_mode, partial_line_buffer = process_text_data(raw_buffer, csv_capture_mode, csv_data, jpg_capture_mode, jpg_data, partial_line_buffer)
                     raw_buffer.clear()
                 time.sleep(0.01)
         except Exception as e:
@@ -764,10 +811,10 @@ def read_serial(ser, stop_event):
             break
 
 
-def process_text_data(data_bytes, csv_capture_mode, csv_data, partial_line_buffer):
-    """Process text data from serial, handling CSV capture and display.
+def process_text_data(data_bytes, csv_capture_mode, csv_data, jpg_capture_mode, jpg_data, partial_line_buffer):
+    """Process text data from serial, handling CSV/JPG capture and display.
 
-    Returns updated (csv_capture_mode, partial_line_buffer) tuple.
+    Returns updated (csv_capture_mode, jpg_capture_mode, partial_line_buffer) tuple.
     partial_line_buffer holds incomplete lines that don't end with newline.
     """
     global ThermalCaptureTimestamp
@@ -775,7 +822,7 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, partial_line_buffe
     try:
         text = data_bytes.decode('utf-8', errors='ignore')
     except:
-        return csv_capture_mode, partial_line_buffer
+        return csv_capture_mode, jpg_capture_mode, partial_line_buffer
 
     # Prepend any buffered partial line from previous call
     if partial_line_buffer:
@@ -862,11 +909,47 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, partial_line_buffe
             if clean_data:
                 csv_data.append(clean_data)
 
+        # Check for JPG start marker
+        if THERMAL_JPG_START in line:
+            print(f"\n🎯 JPG export detected! Starting image capture...")
+            jpg_capture_mode = True
+            jpg_data.clear()
+            continue
+
+        # Check for JPG end marker
+        if THERMAL_JPG_END in line:
+            if jpg_capture_mode:
+                print(f"\n🏁 JPG export complete! Processing image...")
+                jpg_capture_mode = False
+
+                try:
+                    image_bytes = base64.b64decode(''.join(jpg_data))
+                    jpg_filename = get_next_image_filename()
+                    with open(jpg_filename, 'wb') as f:
+                        f.write(image_bytes)
+                    print(f"\n✅ Image saved to: {jpg_filename}")
+                    run_image_viewer(jpg_filename)
+                except Exception as e:
+                    print(f"\n❌ Error decoding/saving image: {e}")
+
+                jpg_data.clear()
+            continue
+
+        # If in JPG capture mode, collect the base64 data
+        if jpg_capture_mode:
+            clean_data = (
+                line.replace("Teensy: ", "")
+                .replace("SAT> ", "")
+                .rstrip('\n\r')
+            )
+            if clean_data:
+                jpg_data.append(clean_data)
+
         # Check for reset message
         if "Resetting system..." in line:
             print("\nDetected system reset. Press 'Enter' twice to exit.")
 
-    return csv_capture_mode, partial_line_buffer
+    return csv_capture_mode, jpg_capture_mode, partial_line_buffer
 
 
 
