@@ -144,8 +144,11 @@ class LeptonCamera:
                 except Full:
                     pass
 
-        except Exception:
-            # Never propagate exceptions across the C callback boundary.
+        except Exception as e:
+            # Never propagate exceptions across the C callback boundary, but
+            # do surface what broke - a silently-swallowed exception here
+            # looks identical to "no frames arriving" from capture()'s POV.
+            print(f"lepton: frame callback error: {e}")
             return
 
     def initialize(self):
@@ -260,20 +263,28 @@ class LeptonCamera:
         print(f"Capturing up to {MAX_FRAMES} frames (timeout {timeout_s:.1f}s)...")
         deadline = time.time() + timeout_s
 
+        total_seen = 0
+        rejected = 0
         while len(frames) < MAX_FRAMES:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             try:
                 frame = self.thermal_queue.get(timeout=min(0.5, max(0.05, remaining)))
+                total_seen += 1
                 if is_valid_frame(frame): #TODO check if this works
                     frames.append(frame)
+                else:
+                    rejected += 1
+                    print(f"lepton: rejected frame (min={frame.min()}, max={frame.max()}, "
+                          f"zero_count={int(np.sum(frame < 1000))}/{frame.size})")
                 #print(f"Captured {len(frames)}/{MAX_FRAMES} frames")
             except Empty:
                 continue
 
         if not frames:
-            print("No frames captured before timeout.")
+            print(f"No frames captured before timeout. "
+                  f"(saw {total_seen} frame(s) from callback, {rejected} rejected by is_valid_frame)")
             return None
 
         if len(frames) < MAX_FRAMES:
