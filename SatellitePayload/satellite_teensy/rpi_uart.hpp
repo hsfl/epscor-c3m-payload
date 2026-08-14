@@ -109,12 +109,6 @@ inline bool readExact(HardwareSerial &port, uint8_t *buf, size_t len,
   return true;
 }
 
-// Validate magic
-inline bool magicOK(const uint8_t *h) {
-  return h[0] == UART_MAGIC[0] && h[1] == UART_MAGIC[1] &&
-         h[2] == UART_MAGIC[2] && h[3] == UART_MAGIC[3];
-}
-
 // Validate end markers
 inline bool endOK(const uint8_t *e) {
   return e[0] == UART_END[0] && e[1] == UART_END[1];
@@ -125,28 +119,58 @@ inline bool payloadIsStatus(uint8_t payload_id) {
   return payload_id == (uint8_t)PAYLOAD_ID::STATUS_MSG;
 }
 
+// Scan UART byte-by-byte looking for UART_MAGIC (0xDEADBEEF), discarding
+// anything before it. Without this, a single stray byte ahead of a frame
+// (e.g. a UART line-idle glitch when the Pi's TX first comes up) desyncs
+// every frame after it forever, since a plain readExact() has no way to
+// tell "8 arbitrary bytes" from "a real header" once it's off by one.
+inline bool waitForMagic(HardwareSerial &port, uint32_t timeout_ms) {
+  uint32_t start = millis();
+  uint8_t matchIndex = 0;
+
+  while (millis() - start < timeout_ms) {
+    if (port.available()) {
+      uint8_t b = port.read();
+      if (b == UART_MAGIC[matchIndex]) {
+        matchIndex++;
+        if (matchIndex == 4)
+          return true;
+      } else {
+        matchIndex = (b == UART_MAGIC[0]) ? 1 : 0;
+      }
+    } else {
+      delay(1);
+    }
+  }
+  return false;
+}
+
 // Receive ONE framed message from the Pi into 'dest' (up to destMax)
 // Returns: true on success; writes outLen and sets isStatus accordingly.
+// headerTimeoutMs bounds both the magic scan and the header read; callers
+// that only want to opportunistically drain already-buffered bytes (e.g.
+// an idle-loop poller) should pass a short value instead of the default
+// 15s, so a run of non-magic bytes doesn't stall the caller's loop.
 inline bool recvFramedFromPi(HardwareSerial &port, uint8_t *dest,
                              uint32_t destMax, uint32_t &outLen,
-                             bool &isStatus) {
+                             bool &isStatus,
+                             uint32_t headerTimeoutMs = UART_HEADER_TIMEOUT_MS) {
   outLen = 0;
   isStatus = false;
 
-  // 1) Header: 4 magic + 3 length
+  // 1) Header: 4 magic + 1 payload_id + 3 length. Scan for magic first so a
+  // stray leading byte can't desync every frame after it.
   uint8_t header[UART_HEADER_SIZE];
-  if (!readExact(port, header, UART_HEADER_SIZE, UART_HEADER_TIMEOUT_MS)) {
-    radioPrintln("ERROR: UART header timeout");
+  header[0] = UART_MAGIC[0];
+  header[1] = UART_MAGIC[1];
+  header[2] = UART_MAGIC[2];
+  header[3] = UART_MAGIC[3];
+  if (!waitForMagic(port, headerTimeoutMs)) {
+    radioPrintln("ERROR: UART header timeout (no magic found)");
     return false;
   }
-  if (!magicOK(header)) {
-    radioPrint("ERROR: Bad magic: ");
-    for (int i = 0; i < 4; i++) {
-      radioPrint("0x");
-      radioPrint(String(header[i], HEX));
-      radioPrint(" ");
-    }
-    radioPrintln();
+  if (!readExact(port, header + 4, UART_HEADER_SIZE - 4, headerTimeoutMs)) {
+    radioPrintln("ERROR: UART header timeout");
     return false;
   }
 
