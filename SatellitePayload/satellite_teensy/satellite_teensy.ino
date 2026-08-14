@@ -85,6 +85,12 @@ const uint8_t RADIO_TX_ON_PIN = 31;
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 const int RADIO_WAIT_PACKET_SENT_MS = 500;
 
+// C3M RadioHead addressing - lets the driver silently drop packets not meant for this node
+const uint8_t RADIO_ADDR_GROUND = 0xA1;
+const uint8_t RADIO_ADDR_SATELLITE = 0xA2;
+const uint8_t RADIO_NETWORK_ID = 0xC3;
+const uint8_t RADIO_PROTOCOL_VERSION = 0x01;
+
 // UART / framing constants (UART_BAUD, UART_MAGIC, UART_END, UART_HEADER_SIZE,
 // UART_*_TIMEOUT_MS) defined in rpi_uart.hpp
 
@@ -1321,7 +1327,20 @@ void initRadio()
   // rf23.setModemConfig(RH_RF22::GFSK_Rb2Fd5);        // 2 kbps, 5 kHz deviation (slowest, maximum range)
 
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
-  rf23.setModeIdle();                          // Set radio to idle mode
+
+  // C3M addressing: setThisAddress() makes the driver auto-drop any received
+  // packet whose "to" header isn't us (or broadcast) before it ever reaches
+  // available()/recv(). setPromiscuous(false) is the default but stated
+  // explicitly since correctness here depends on it.
+  rf23.setThisAddress(RADIO_ADDR_SATELLITE);
+  rf23.setPromiscuous(false);
+  // Default outgoing headers for every send() from here on: satellite -> ground.
+  rf23.setHeaderFrom(RADIO_ADDR_SATELLITE);
+  rf23.setHeaderTo(RADIO_ADDR_GROUND);
+  rf23.setHeaderId(RADIO_NETWORK_ID);
+  rf23.setHeaderFlags(RADIO_PROTOCOL_VERSION);
+
+  rf23.setModeIdle(); // Set radio to idle mode
   delay(10);
   radioReady = true;
   radioPrintln("Satellite Radio is ready.");

@@ -60,6 +60,12 @@ const uint8_t RADIO_TX_ON_PIN = 31;
 RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 const int RADIO_WAIT_PACKET_SENT_MS = 500;
 
+// C3M RadioHead addressing - lets the driver silently drop packets not meant for this node
+const uint8_t RADIO_ADDR_GROUND = 0xA1;
+const uint8_t RADIO_ADDR_SATELLITE = 0xA2;
+const uint8_t RADIO_NETWORK_ID = 0xC3;
+const uint8_t RADIO_PROTOCOL_VERSION = 0x01;
+
 const uint8_t LED_PIN = 13;
 
 // Image reception buffer and tracking variables
@@ -596,7 +602,20 @@ void initRadio()
 
   // rf23.setTxPower(RH_RF22_RF23BP_TXPOW_28DBM); // 28dBm lowest available power for RFM23BP
   rf23.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); // 30dBm (1000mW) - max for RFM23BP
-  rf23.setModeIdle();                          // Set radio to idle mode
+
+  // C3M addressing: setThisAddress() makes the driver auto-drop any received
+  // packet whose "to" header isn't us (or broadcast) before it ever reaches
+  // available()/recv(). setPromiscuous(false) is the default but stated
+  // explicitly since correctness here depends on it.
+  rf23.setThisAddress(RADIO_ADDR_GROUND);
+  rf23.setPromiscuous(false);
+  // Default outgoing headers for every send() from here on: ground -> satellite.
+  rf23.setHeaderFrom(RADIO_ADDR_GROUND);
+  rf23.setHeaderTo(RADIO_ADDR_SATELLITE);
+  rf23.setHeaderId(RADIO_NETWORK_ID);
+  rf23.setHeaderFlags(RADIO_PROTOCOL_VERSION);
+
+  rf23.setModeIdle(); // Set radio to idle mode
   Serial.println("GS Radio hardcoded config: 433MHz, GFSK_Rb38_4Fd19_6 38.4 kbps, 19.6 kHz deviation, 30dBm tx power.");
   delay(10);
   Serial.println("GS Radio ready");
