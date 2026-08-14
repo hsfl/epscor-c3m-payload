@@ -81,8 +81,20 @@ const int RADIO_INT = 40; // Interrupt pin for RF22 module
 const uint8_t RADIO_RX_ON_PIN = 30;
 /** Pin 31 from Arduino to RFM23BP RX_ON PIN */
 const uint8_t RADIO_TX_ON_PIN = 31;
+// RH_RF22::setThisAddress() is declared protected in this RadioHead version
+// (RHGenericDriver's is public, but RH_RF22 re-scopes it - a base-class
+// upcast would skip its CHECK_HEADER3 register write, so a thin public
+// wrapper is needed instead of calling it directly on rf23).
+class RH_RF22_Addressed : public RH_RF22
+{
+public:
+  RH_RF22_Addressed(uint8_t slaveSelectPin, uint8_t interruptPin, RHGenericSPI &spi)
+      : RH_RF22(slaveSelectPin, interruptPin, spi) {}
+  void setThisAddressPublic(uint8_t thisAddress) { setThisAddress(thisAddress); }
+};
+
 // note that hardware_spi1 uses the RHHardwareSPI1.h library (same as using SPI1 bus but more explicit for the RH_RF22 library driver)
-RH_RF22 rf23(RADIO_CS, RADIO_INT, hardware_spi1);
+RH_RF22_Addressed rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 const int RADIO_WAIT_PACKET_SENT_MS = 500;
 
 // C3M RadioHead addressing - lets the driver silently drop packets not meant for this node
@@ -353,7 +365,7 @@ void radioPrint(const String &message)
  *
  * @param message The message string to send (optional)
  */
-void radioPrintln(const String &message = "")
+void radioPrintln(const String &message)
 {
   radioPrint(message + "\n");
 
@@ -1332,7 +1344,7 @@ void initRadio()
   // packet whose "to" header isn't us (or broadcast) before it ever reaches
   // available()/recv(). setPromiscuous(false) is the default but stated
   // explicitly since correctness here depends on it.
-  rf23.setThisAddress(RADIO_ADDR_SATELLITE);
+  rf23.setThisAddressPublic(RADIO_ADDR_SATELLITE);
   rf23.setPromiscuous(false);
   // Default outgoing headers for every send() from here on: satellite -> ground.
   rf23.setHeaderFrom(RADIO_ADDR_SATELLITE);
@@ -1646,12 +1658,12 @@ void pollPIUartStatus()
   if (piCaptureInProgress)
     return;
 
-  while (Serial2.available() >= 6)
+  while (Serial2.available() >= UART_HEADER_SIZE)
   {
     uint32_t rxLen = 0;
     bool isStatus = false;
 
-    if (!recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus))
+    if (!recvFramedFromPi(Serial2, piStatusBuf, MAX_STATUS_LEN, rxLen, isStatus, 200))
     {
       return; // recvFramedFromPi already reported the error
     }
