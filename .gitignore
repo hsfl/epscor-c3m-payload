@@ -8,6 +8,8 @@ __pycache__
 .venv
 
 # data
+*.jpg
+*.csv
 thermal_data_*.csv
 testcomms_results_*.csv
 SatellitePayload/captures/* 
