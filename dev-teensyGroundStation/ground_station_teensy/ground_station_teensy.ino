@@ -1435,7 +1435,21 @@ void exportThermalData()
     Serial.println("⚠️ Warning: image size doesn't match expected camera resolution – export may be misaligned");
   }
 
-  Serial.println("\n--- EXPORTING THERMAL DATA ---");
+  // Camera-source tag the Python CLI reads to name the output file
+  // (lepton_capture_NNN.csv / boson_capture_NNN.csv). Omitted for the
+  // legacy 0xFF fallback so the CLI keeps its generic thermal_data_ name.
+  if (lastRequestedCameraId == 0)
+  {
+    Serial.println("\n--- EXPORTING LEPTON THERMAL DATA ---");
+  }
+  else if (lastRequestedCameraId == 1)
+  {
+    Serial.println("\n--- EXPORTING BOSON THERMAL DATA ---");
+  }
+  else
+  {
+    Serial.println("\n--- EXPORTING THERMAL DATA ---");
+  }
   Serial.println("Copying data below to a 'thermal_image.csv'");
   Serial.println(THERMAL_CSV_START);
 

@@ -154,7 +154,9 @@ inline bool waitForMagic(HardwareSerial &port, uint32_t timeout_ms) {
 inline bool recvFramedFromPi(HardwareSerial &port, uint8_t *dest,
                              uint32_t destMax, uint32_t &outLen,
                              bool &isStatus,
-                             uint32_t headerTimeoutMs = UART_HEADER_TIMEOUT_MS) {
+                             uint32_t headerTimeoutMs = UART_HEADER_TIMEOUT_MS,
+                             uint8_t *statusDest = nullptr,
+                             uint32_t statusDestMax = 0) {
   outLen = 0;
   isStatus = false;
 
@@ -181,7 +183,20 @@ inline bool recvFramedFromPi(HardwareSerial &port, uint8_t *dest,
     return false;
   }
 
-  if (len > destMax) {
+  // Determine status vs image from the header (before touching the payload)
+  // so status frames can be routed to their own buffer. Without this, a
+  // STATUS frame arriving after an image frame (e.g. the "IDLE" that follows
+  // REQUEST_DONE) would overwrite the front of a shared image buffer, since
+  // both frame types would otherwise write into the same 'dest'.
+  isStatus = payloadIsStatus(header[4]);
+  uint8_t *payloadDest = dest;
+  uint32_t payloadMax = destMax;
+  if (isStatus && statusDest != nullptr) {
+    payloadDest = statusDest;
+    payloadMax = statusDestMax;
+  }
+
+  if (len > payloadMax) {
     radioPrint("ERROR: Payload too large (");
     radioPrint(String(len));
     radioPrintln(" bytes) for buffer");
@@ -204,7 +219,7 @@ inline bool recvFramedFromPi(HardwareSerial &port, uint8_t *dest,
   }
 
   // 2) Payload
-  if (!readExact(port, dest, len, UART_PAYLOAD_TIMEOUT_MS)) {
+  if (!readExact(port, payloadDest, len, UART_PAYLOAD_TIMEOUT_MS)) {
     radioPrintln("ERROR: UART payload timeout");
     return false;
   }
@@ -224,7 +239,6 @@ inline bool recvFramedFromPi(HardwareSerial &port, uint8_t *dest,
   }
 
   outLen = len;
-  isStatus = payloadIsStatus(header[4]);
   return true;
 }
 

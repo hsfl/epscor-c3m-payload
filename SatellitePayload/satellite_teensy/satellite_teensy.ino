@@ -1734,7 +1734,8 @@ void requestThermalImageFromPi(uint8_t cameraId)
     uint32_t rxLen = 0;
     bool isStatus = false;
 
-    if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus))
+    if (!recvFramedFromPi(Serial2, imgBuf, MAX_IMG, rxLen, isStatus,
+                          UART_HEADER_TIMEOUT_MS, piStatusBuf, MAX_STATUS_LEN))
     {
       radioPrintln("ERROR: Failed to receive requested image");
       piCaptureInProgress = false;
@@ -1743,7 +1744,11 @@ void requestThermalImageFromPi(uint8_t cameraId)
 
     if (isStatus)
     {
-      String msg = handleStatusPayload(imgBuf, rxLen);
+      // Status frames are written to piStatusBuf (not imgBuf) by
+      // recvFramedFromPi so they can't clobber an already-received image -
+      // e.g. the "IDLE" status that follows REQUEST_DONE would otherwise
+      // overwrite the front of imgBuf after gotImage was already set.
+      String msg = handleStatusPayload(piStatusBuf, rxLen);
       if (msg.startsWith("REQUEST_ERROR"))
         requestFailed = true;
       if (msg == "IDLE")
