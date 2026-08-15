@@ -30,6 +30,34 @@ STREAM_FRAME_WIDTH = 80
 STREAM_FRAME_HEIGHT = 60
 STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4800 bytes
 
+
+def infer_camera_source(filename):
+    """Return 'lepton'/'boson' from a '<source>_capture_NNN.csv' filename,
+    or None for the generic 'thermal_data_NNN.csv' (unknown/legacy) name.
+    """
+    basename = os.path.basename(filename)
+    if basename.startswith("lepton_capture"):
+        return "lepton"
+    if basename.startswith("boson_capture"):
+        return "boson"
+    return None
+
+
+def normalize_thermal_grid(grid, low_pct=1, high_pct=99):
+    """Percentile-clip a raw thermal grid to 0-255 uint8 for viewing.
+
+    Mirrors normalize_thermal() in boson_controller.py. Boson data is raw,
+    non-radiometric sensor counts with no absolute temperature meaning, so
+    this is a contrast stretch for visualization only, computed here rather
+    than stored to disk.
+    """
+    lo, hi = np.nanpercentile(grid, (low_pct, high_pct))
+    if hi <= lo:
+        hi = lo + 1  # avoid div-by-zero on a flat frame
+    clipped = np.clip(grid, lo, hi)
+    norm = ((clipped - lo) / (hi - lo) * 255).astype(np.uint8)
+    return norm
+
 def _parse_ddmm_mmmm(coord):
     """Return DMS text and decimal degrees from DDMM.MMMM coordinate strings."""
     coord = coord.strip()
@@ -269,20 +297,38 @@ def view_thermal_file(filename):
         print(f"Loading thermal data from: {filename}")
         data, metadata = load_thermal_file(filename)
 
+        # Lepton is radiometric, and its CSV already holds real °C values
+        # (converted at save time in the CLI, not here) - display as-is.
+        # Boson is non-radiometric, so its raw counts get a percentile
+        # contrast stretch instead; an unrecognized/legacy filename falls
+        # back to the same treatment as boson since its camera source (and
+        # therefore whether the values are physically meaningful) is unknown.
+        source = infer_camera_source(filename)
+        is_radiometric = (source == "lepton")
+
+        if is_radiometric:
+            display_data = data
+            colorbar_label = 'Temperature (°C)'
+            value_unit = '°C'
+        else:
+            display_data = normalize_thermal_grid(data)
+            colorbar_label = 'Intensity (normalized 0-255)'
+            value_unit = ''
+
         # Display as thermal image
         fig, ax = plt.subplots(figsize=(12, 8))
-        image = ax.imshow(data, cmap='hot', aspect='auto')
-        fig.colorbar(image, ax=ax, label='Temperature (°C)')
+        image = ax.imshow(display_data, cmap='hot', aspect='auto')
+        fig.colorbar(image, ax=ax, label=colorbar_label)
 
         # Add some statistics
-        min_temp = np.nanmin(data)
-        max_temp = np.nanmax(data)
-        mean_temp = np.nanmean(data)
+        min_temp = np.nanmin(display_data)
+        max_temp = np.nanmax(display_data)
+        mean_temp = np.nanmean(display_data)
 
         # Build title and subtitle
         main_title = f'Thermal Image from Flat Sat - {filename}'
 
-        subtitle_parts = [f'Min: {min_temp:.1f}°C, Max: {max_temp:.1f}°C, Mean: {mean_temp:.1f}°C']
+        subtitle_parts = [f'Min: {min_temp:.1f}{value_unit}, Max: {max_temp:.1f}{value_unit}, Mean: {mean_temp:.1f}{value_unit}']
 
         if metadata.get("captured_at"):
             subtitle_parts.append(f'Captured: {metadata["captured_at"]}')
@@ -341,8 +387,10 @@ def view_thermal_file(filename):
         plt.show()
 
         print(f"Thermal image displayed successfully!")
-        print(f"Temperature range: {min_temp:.1f}°C to {max_temp:.1f}°C")
-        print(f"Mean temperature: {mean_temp:.1f}°C")
+        range_label = "Temperature range" if is_radiometric else "Intensity range"
+        mean_label = "Mean temperature" if is_radiometric else "Mean intensity"
+        print(f"{range_label}: {min_temp:.1f}{value_unit} to {max_temp:.1f}{value_unit}")
+        print(f"{mean_label}: {mean_temp:.1f}{value_unit}")
         if metadata.get("captured_at"):
             print(f"Captured at (UTC): {metadata['captured_at']}")
         if gps_location_display:

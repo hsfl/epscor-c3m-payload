@@ -40,6 +40,28 @@ THERMAL_JPG_END = "=== END JPG ==="
 THERMAL_CAPTURE_TIMESTAMP_FLAG = "--- UART THERMAL CAPTURE ---"
 ThermalCaptureTimestamp = datetime.now()
 
+# Camera source ('lepton'/'boson'/'rpicam') latched from the most recent
+# EXPORT_SOURCE_TAGS line, consumed (and cleared) by the next START marker.
+PendingExportSource = None
+CurrentCsvSource = None
+CurrentJpgSource = None
+
+# Camera-source tag lines printed by exportThermalData() in
+# ground_station_teensy.ino just before each START marker. Used to name the
+# output file by source instead of the generic "thermal_data_" prefix. The
+# untagged "--- EXPORTING THERMAL DATA ---" line is the legacy/unknown-camera
+# fallback (no 'request <id>' issued this session) and intentionally maps to
+# no prefix, so those exports keep the old thermal_data_ naming.
+EXPORT_SOURCE_TAGS = {
+    "--- EXPORTING LEPTON THERMAL DATA ---": "lepton",
+    "--- EXPORTING BOSON THERMAL DATA ---": "boson",
+    "--- EXPORTING RPICAM IMAGE ---": "rpicam",
+    # Explicit None (rather than leaving this line unmatched) so a stray
+    # legacy export can't inherit a source tag left over from an export
+    # whose START marker never arrived (e.g. mid-export disconnect).
+    "--- EXPORTING THERMAL DATA ---": None,
+}
+
 # Testcomms result detection constants
 TESTCOMMS_START_MARKER   = "=== Test Comms:"
 TESTCOMMS_SUMMARY_MARKER = "=== TEST COMMS RESULTS ==="
@@ -343,49 +365,47 @@ def find_serial_port():
     # If no specific match, return first available port
     return ports[0].device
 
-def get_next_thermal_filename():
-    """Get the next available thermal data filename with incrementing number"""
-    # Look for existing thermal data files
-    existing_files = glob.glob("thermal_data_*.csv")
-    
-    if not existing_files:
-        return "thermal_data_001.csv"
-    
-    # Extract numbers from existing filenames and find the highest
+CAPTURES_DIR = "captures"
+
+def _capture_dir(source):
+    """Return (and create) the captures/<camera> directory for a source.
+
+    source=None (legacy/unknown camera, no 'request <id>' tag) lands in
+    captures/legacy rather than cluttering the top-level captures/ dir.
+    """
+    directory = os.path.join(CAPTURES_DIR, source if source else "legacy")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+def _next_numbered_filename(directory, prefix, extension):
+    """Return the next available 'directory/{prefix}_NNN.{extension}' path.
+
+    Each source (lepton/boson/rpicam/legacy) gets its own counter since it
+    globs only files matching its own prefix within its own directory.
+    """
+    pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.{re.escape(extension)}$")
     max_num = 0
-    for filename in existing_files:
-        try:
-            # Extract number from filename like "thermal_data_001.csv"
-            num_str = filename.split('_')[2].split('.')[0]
-            num = int(num_str)
-            if num > max_num:
-                max_num = num
-        except (IndexError, ValueError):
-            continue
-    
-    # Return next filename with zero-padded number
-    next_num = max_num + 1
-    return f"thermal_data_{next_num:03d}.csv"
+    for filename in glob.glob(os.path.join(directory, f"{prefix}_*.{extension}")):
+        match = pattern.match(os.path.basename(filename))
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+    return os.path.join(directory, f"{prefix}_{max_num + 1:03d}.{extension}")
 
-def get_next_image_filename():
-    """Get the next available rpicam image filename with incrementing number"""
-    existing_files = glob.glob("thermal_data_*.jpg")
+def get_next_thermal_filename(source=None):
+    """Get the next available thermal data CSV path under captures/<camera>/.
 
-    if not existing_files:
-        return "thermal_data_001.jpg"
+    source: 'lepton'/'boson'/None. None keeps the legacy 'thermal_data_' prefix.
+    """
+    prefix = f"{source}_capture" if source else "thermal_data"
+    return _next_numbered_filename(_capture_dir(source), prefix, "csv")
 
-    max_num = 0
-    for filename in existing_files:
-        try:
-            num_str = filename.split('_')[2].split('.')[0]
-            num = int(num_str)
-            if num > max_num:
-                max_num = num
-        except (IndexError, ValueError):
-            continue
+def get_next_image_filename(source=None):
+    """Get the next available image path under captures/<camera>/.
 
-    next_num = max_num + 1
-    return f"thermal_data_{next_num:03d}.jpg"
+    source: 'rpicam'/None. None keeps the legacy 'thermal_data_' prefix.
+    """
+    prefix = f"{source}_capture" if source else "thermal_data"
+    return _next_numbered_filename(_capture_dir(source), prefix, "jpg")
 
 def get_testcomms_filename():
     """Return a testcomms CSV filename stamped with the current date and time."""
@@ -562,6 +582,34 @@ def _parse_testcomms_line(line):
             return
 
 
+def lepton_rows_to_celsius(csv_rows):
+    """Convert Lepton's raw radiometric CSV rows (centi-Kelvin ints) to °C.
+
+    Lepton's raw counts are already an absolute temperature reading (just in
+    the wrong unit), so the stored CSV should hold real °C values rather than
+    the raw sensor encoding - unlike Boson, which has no absolute unit to
+    convert to. Non-numeric cells (e.g. the firmware's "NaN" overflow guard)
+    are passed through unchanged.
+    """
+    converted_rows = []
+    for row in csv_rows:
+        cells = []
+        for cell in row.split(','):
+            cell = cell.strip()
+            # float() accepts "nan"/"inf" text, which would silently pass
+            # the firmware's "NaN" overflow sentinel through as a real
+            # (garbage) conversion instead of leaving it untouched.
+            if cell.lower() in ("nan", "inf", "-inf", ""):
+                cells.append(cell)
+                continue
+            try:
+                cells.append(f"{float(cell) / 100.0 - 273.15:.2f}")
+            except ValueError:
+                cells.append(cell)
+        converted_rows.append(','.join(cells))
+    return converted_rows
+
+
 def save_thermal_data(csv_data, filename):
     """Save CSV data to file"""
     try:
@@ -573,43 +621,6 @@ def save_thermal_data(csv_data, filename):
         print(f"\n❌ Error saving thermal data: {e}")
         return False
 
-
-def normalize_thermal_grid(grid, low_pct=1, high_pct=99):
-    """Percentile-clip a raw thermal grid to 0-255 uint8 for viewing.
-
-    Mirrors normalize_thermal() in boson_controller.py. The downlinked data
-    is raw, non-radiometric sensor counts (full bit depth preserved), so this
-    is a contrast stretch for visualization only — not a temperature mapping.
-    """
-    import numpy as np
-    lo, hi = np.nanpercentile(grid, (low_pct, high_pct))
-    if hi <= lo:
-        hi = lo + 1  # avoid div-by-zero on a flat frame
-    clipped = np.clip(grid, lo, hi)
-    norm = ((clipped - lo) / (hi - lo) * 255).astype(np.uint8)
-    return norm
-
-
-def build_normalized_csv(csv_rows, metadata_lines):
-    """Return normalized (0-255) CSV text built from raw numeric CSV rows.
-
-    Parses the raw grid, normalizes it for viewing, and re-serializes as
-    integers with the same metadata header as the raw file. Returns None if
-    the grid cannot be parsed.
-    """
-    import numpy as np
-    from io import StringIO
-
-    grid = np.loadtxt(StringIO('\n'.join(csv_rows)), delimiter=',')
-    norm = normalize_thermal_grid(grid)
-
-    buf = StringIO()
-    np.savetxt(buf, norm, fmt='%d', delimiter=',')
-    norm_rows = buf.getvalue().rstrip('\n').split('\n')
-
-    if metadata_lines:
-        return '\n'.join(metadata_lines + [''] + norm_rows)
-    return '\n'.join(norm_rows)
 
 def run_thermal_viewer(filename):
     """Run the thermal data viewer with the specified file"""
@@ -817,7 +828,7 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, jpg_capture_mode, 
     Returns updated (csv_capture_mode, jpg_capture_mode, partial_line_buffer) tuple.
     partial_line_buffer holds incomplete lines that don't end with newline.
     """
-    global ThermalCaptureTimestamp
+    global ThermalCaptureTimestamp, PendingExportSource, CurrentCsvSource, CurrentJpgSource
 
     try:
         text = data_bytes.decode('utf-8', errors='ignore')
@@ -855,11 +866,20 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, jpg_capture_mode, 
             ThermalCaptureTimestamp = datetime.now()
             continue
 
+        # Check for a camera-source tag line (printed just before START CSV/JPG)
+        _NO_TAG_MATCH = object()
+        matched_source = next((src for tag, src in EXPORT_SOURCE_TAGS.items() if tag in line), _NO_TAG_MATCH)
+        if matched_source is not _NO_TAG_MATCH:
+            PendingExportSource = matched_source
+            continue
+
         # Check for CSV start marker
         if THERMAL_CSV_START in line:
             print(f"\n🎯 CSV export detected! Starting data capture...")
             csv_capture_mode = True
             csv_data.clear()
+            CurrentCsvSource = PendingExportSource
+            PendingExportSource = None
             if THERMAL_CAPTURE_TIMESTAMP_FLAG not in line:
                 ThermalCaptureTimestamp = datetime.now()
             continue
@@ -873,28 +893,28 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, jpg_capture_mode, 
                 # Save the captured data
                 metadata_lines = build_sensor_metadata_lines(ThermalCaptureTimestamp)
 
-                # 1) Raw, full-bit-depth CSV — preserved exactly as downlinked
+                # Lepton's raw counts are radiometric (centi-Kelvin) - convert
+                # to °C before saving so the file itself holds real
+                # temperature, not a raw sensor encoding. Boson stays as raw
+                # counts since it has no absolute unit to convert to.
+                output_rows = lepton_rows_to_celsius(csv_data) if CurrentCsvSource == "lepton" else csv_data
+
                 if metadata_lines:
-                    raw_content = '\n'.join(metadata_lines + [''] + csv_data)
+                    raw_content = '\n'.join(metadata_lines + [''] + output_rows)
                 else:
-                    raw_content = '\n'.join(csv_data)
-                raw_filename = get_next_thermal_filename()
+                    raw_content = '\n'.join(output_rows)
+                raw_filename = get_next_thermal_filename(CurrentCsvSource)
                 save_thermal_data(raw_content, raw_filename)
 
-                # 2) Normalized CSV (0-255) for viewing. This runs inside the
-                #    daemon read thread, so any failure must not kill reading —
-                #    on error we keep the raw file and fall back to viewing it.
-                view_filename = raw_filename
-                norm_filename = raw_filename.replace(".csv", "_normalized.csv")
-                try:
-                    norm_content = build_normalized_csv(list(csv_data), metadata_lines)
-                    if norm_content is not None and save_thermal_data(norm_content, norm_filename):
-                        view_filename = norm_filename
-                except Exception as e:
-                    print(f"\n⚠️ Normalization failed ({e}); viewing raw data instead.")
-
-                # Visualize the normalized data (raw as fallback)
-                run_thermal_viewer(view_filename)
+                # The saved file is the only artifact written to disk and is
+                # the source of truth for both cameras (°C for lepton, raw
+                # sensor counts for boson). Any further scaling for the
+                # quick-look image (percentile contrast stretch for boson)
+                # happens in-memory inside the viewer, keyed off the camera
+                # prefix in raw_filename - see thermal_data_viewer.py's
+                # infer_camera_source().
+                run_thermal_viewer(raw_filename)
+                CurrentCsvSource = None
 
                 csv_data.clear()
             continue
@@ -914,6 +934,8 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, jpg_capture_mode, 
             print(f"\n🎯 JPG export detected! Starting image capture...")
             jpg_capture_mode = True
             jpg_data.clear()
+            CurrentJpgSource = PendingExportSource
+            PendingExportSource = None
             continue
 
         # Check for JPG end marker
@@ -923,8 +945,17 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, jpg_capture_mode, 
                 jpg_capture_mode = False
 
                 try:
-                    image_bytes = base64.b64decode(''.join(jpg_data))
-                    jpg_filename = get_next_image_filename()
+                    image_bytes = base64.b64decode(''.join(jpg_data), validate=True)
+                    # JPEGs start with SOI (FFD8) and end with EOI (FFD9). A
+                    # mismatch means the payload was corrupted upstream (e.g.
+                    # RPi status text landing in the image buffer) - catch it
+                    # here instead of writing an unreadable file.
+                    if image_bytes[:2] != b'\xff\xd8' or image_bytes[-2:] != b'\xff\xd9':
+                        raise ValueError(
+                            f"decoded {len(image_bytes)} bytes but JPEG markers are missing/misplaced "
+                            f"(starts with {image_bytes[:8]!r}) - payload is corrupt, not a CLI parsing issue"
+                        )
+                    jpg_filename = get_next_image_filename(CurrentJpgSource)
                     with open(jpg_filename, 'wb') as f:
                         f.write(image_bytes)
                     print(f"\n✅ Image saved to: {jpg_filename}")
@@ -932,6 +963,7 @@ def process_text_data(data_bytes, csv_capture_mode, csv_data, jpg_capture_mode, 
                 except Exception as e:
                     print(f"\n❌ Error decoding/saving image: {e}")
 
+                CurrentJpgSource = None
                 jpg_data.clear()
             continue
 
