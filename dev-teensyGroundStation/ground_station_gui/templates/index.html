@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ground Station</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header>
+    <h1>EPSCOR C3M Ground Station</h1>
+    <div id="conn-bar">
+      <select id="port-select"></select>
+      <input id="port-manual" type="text" placeholder="or type a port path (e.g. /tmp/ttyGS)" autocomplete="off" />
+      <button id="refresh-ports">Refresh</button>
+      <button id="connect-btn">Connect</button>
+      <span id="conn-status" class="status disconnected">Disconnected</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="controls">
+      <div class="quick-actions">
+        <button data-cmd="capture">Capture</button>
+        <button data-cmd="request 0">Request Lepton</button>
+        <button data-cmd="request 1">Request Boson</button>
+        <button data-cmd="request 2">Request RPiCam</button>
+        <button data-cmd="export">Export</button>
+        <button data-cmd="status">Status</button>
+        <button data-cmd="ping">Ping</button>
+      </div>
+      <form id="cmd-form">
+        <input id="cmd-input" type="text" placeholder="Type a command (e.g. request 0)" autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+
+      <div class="progress-block">
+        <label>Capture <span id="capture-label" class="phase">idle</span></label>
+        <div class="progress-bar"><div id="capture-bar" class="progress-fill indeterminate"></div></div>
+      </div>
+      <div class="progress-block">
+        <label>Request / Download <span id="request-label" class="phase">idle</span></label>
+        <div class="progress-bar"><div id="request-bar" class="progress-fill" style="width:0%"></div></div>
+      </div>
+
+      <div id="console"></div>
+    </section>
+
+    <section id="viewers"></section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

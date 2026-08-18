@@ -12,5 +12,7 @@ __pycache__
 *.csv
 thermal_data_*.csv
 testcomms_results_*.csv
-SatellitePayload/captures/* 
+SatellitePayload/captures/*
 SatellitePayload/capture_queue/*
+dev-teensyGroundStation/captures/*
+dev-teensyGroundStation/webapp/rotation_state.json
