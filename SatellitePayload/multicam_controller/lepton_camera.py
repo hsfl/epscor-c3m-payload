@@ -3,8 +3,8 @@
 Defines a LeptonCamera class that interfaces with the Lepton camera using libuvc.
 basic functionality:
 1. Initialize the camera and start streaming.
-2. Capture frames via a callback and store them in a queue for averaging.
-3. Provide methods to retrieve the latest frame for streaming and to capture and average multiple frames for noise reduction.
+2. Capture frames via a callback and store them in a queue.
+3. Provide methods to retrieve the latest frame for streaming and to capture a single still frame.
 
 @author: Samantha Mallari
 @date: 2026-08-04
@@ -21,8 +21,7 @@ import ctypes
 import threading
 
 # Camera Configuration
-MAX_FRAMES = 10           # Number of frames to capture and average
-THERMAL_QUEUE_SIZE = 20   # Size of frame queue for thermal data (2x the avg capture frame needs)
+THERMAL_QUEUE_SIZE = 20   # Size of frame queue for thermal data
 
 FRAME_CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.POINTER(uvc_frame), ctypes.c_void_p)
 
@@ -239,52 +238,37 @@ class LeptonCamera:
 
     def capture(self, timeout_s=2.0):
         """
-        Capture and average multiple thermal frames for noise reduction
+        Capture and return a single thermal frame.
 
-        Collects MAX_FRAMES thermal frames from the camera queue, averages them
-        to reduce noise, and returns the averaged data as bytes. Provides
-        real-time progress updates and temperature statistics.
+        Pulls one valid (non-FFC) frame from the camera queue and returns
+        it as raw bytes.
 
         Returns:
-            bytes: Averaged thermal image data as raw bytes
+            bytes: Thermal image data as raw bytes, or None if no valid
+            frame arrived before timeout_s.
         """
-        frames = []
-
-        # Empty the queue first.
+        # Empty the queue first so we grab the freshest frame, not a stale one.
         while True:
             try:
                 self.thermal_queue.get_nowait()
             except Empty:
                 break
 
-        print(f"Capturing up to {MAX_FRAMES} frames (timeout {timeout_s:.1f}s)...")
+        print(f"Capturing 1 frame (timeout {timeout_s:.1f}s)...")
         deadline = time.time() + timeout_s
 
-        while len(frames) < MAX_FRAMES:
+        while True:
             remaining = deadline - time.time()
             if remaining <= 0:
-                break
+                print("No frame captured before timeout.")
+                return None
             try:
                 frame = self.thermal_queue.get(timeout=min(0.5, max(0.05, remaining)))
-                if is_valid_frame(frame): #TODO check if this works
-                    frames.append(frame)
-                #print(f"Captured {len(frames)}/{MAX_FRAMES} frames")
             except Empty:
                 continue
-
-        if not frames:
-            print("No frames captured before timeout.")
-            return None
-
-        if len(frames) < MAX_FRAMES:
-            print(f"Only captured {len(frames)} frame(s); averaging nonetheless.")
-
-        print("Averaging frames...")
-        stacked = np.stack(frames, axis=0).astype(np.float64)
-        averaged = np.mean(stacked, axis=0).astype(np.uint16)
-
-        self.last_frame = averaged  # kept for debug CSV/image dumps, not UART
-        return averaged.tobytes()  # Return as raw bytes for UART transmission
+            if is_valid_frame(frame):
+                self.last_frame = frame  # kept for debug CSV/image dumps, not UART
+                return frame.tobytes()  # Return as raw bytes for UART transmission
 
     def cleanup(self):
         try:
