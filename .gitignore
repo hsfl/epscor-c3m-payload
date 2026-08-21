@@ -16,3 +16,8 @@ SatellitePayload/captures/*
 SatellitePayload/capture_queue/*
 dev-teensyGroundStation/captures/*
 dev-teensyGroundStation/webapp/rotation_state.json
+dev-teensyGroundStation/captures_demo/*
+
+# outreach demo secrets
+dev-teensyGroundStation/ground_station_gui_demo/.env
+dev-teensyGroundStation/ground_station_gui_demo/rotation_state.json

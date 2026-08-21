@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ground Station - Outreach Demo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header>
+    <h1>EPSCOR C3M Ground Station — Outreach Demo</h1>
+    <div id="conn-bar">
+      <select id="port-select"></select>
+      <input id="port-manual" type="text" placeholder="or type a port path (e.g. /tmp/ttyGS)" autocomplete="off" />
+      <button id="refresh-ports">Refresh</button>
+      <button id="connect-btn">Connect</button>
+      <span id="conn-status" class="status disconnected">Disconnected</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="controls">
+      <div class="sidebar-logos">
+        <img src="{{ url_for('static', filename='logos/hsfl_logo.png') }}" alt="HSFL logo" onerror="this.style.display='none'" />
+        <img src="{{ url_for('static', filename='logos/c3m_logo.png') }}" alt="C3M logo" onerror="this.style.display='none'" />
+      </div>
+      <div class="quick-actions">
+        <button data-cmd="capture">Capture</button>
+        <button data-cmd="request 0">Request Lepton</button>
+        <button data-cmd="request 2">Request RPiCam</button>
+        <button data-cmd="export">Export</button>
+        <button data-cmd="status">Status</button>
+        <button data-cmd="ping">Ping</button>
+      </div>
+      <form id="cmd-form">
+        <input id="cmd-input" type="text" placeholder="Type a command (e.g. request 0)" autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+
+      <div class="progress-block">
+        <label>Capture <span id="capture-label" class="phase">idle</span></label>
+        <div class="progress-bar"><div id="capture-bar" class="progress-fill indeterminate"></div></div>
+      </div>
+      <div class="progress-block">
+        <label>Request / Download <span id="request-label" class="phase">idle</span></label>
+        <div class="progress-bar"><div id="request-bar" class="progress-fill" style="width:0%"></div></div>
+      </div>
+
+      <div id="console"></div>
+    </section>
+
+    <div class="camera-column">
+      <section id="viewers"></section>
+
+      <section id="outreach" class="viewer-card">
+        <div class="viewer-head">
+          <h2>Send to Visitor</h2>
+        </div>
+
+        <div class="outreach-body">
+          <div class="outreach-preview">
+            <img id="combined-preview" class="hidden" />
+            <div id="preview-hint" class="meta">Capture an RPi photo and a Lepton thermal image first.</div>
+            <div id="logo-hint" class="meta hidden">Logo(s) not added yet — see static/logos/README.md.</div>
+            <label class="colorbar-toggle">
+              <span class="switch">
+                <input id="colorbar-toggle" type="checkbox" />
+                <span class="switch-track"></span>
+              </span>
+              Show temperature scale
+            </label>
+          </div>
+
+          <div class="outreach-form-col">
+            <form id="outreach-form">
+              <div class="field">
+                <label for="visitor-name">Name</label>
+                <input id="visitor-name" type="text" placeholder="Visitor's name" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="visitor-email">Email</label>
+                <input id="visitor-email" type="email" placeholder="visitor@example.com" autocomplete="off" required />
+              </div>
+              <div class="actions">
+                <button id="send-email-btn" type="submit" disabled>Send Email</button>
+                <button id="save-photo-btn" type="button" disabled>Save Photo</button>
+              </div>
+            </form>
+
+            <div id="send-status" class="send-status"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

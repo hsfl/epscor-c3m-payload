@@ -1,0 +1,14 @@
+Hi {{ visitor_name or "there" }},
+
+Thanks for stopping by the HSFL booth! Attached is the thermal photo we captured of you during the C3M: CubeSats for Climate Change Monitoring demo.
+
+Want to learn more about the mission? Check us out here: {{ website_url }}
+
+Thanks,
+C3M Team
+
+Hawaii Space Flight Laboratory
+University of Hawai‘i at Mānoa
+1680 East-West Road, POST 501
+Honolulu, HI 96822
+info@hsfl.hawaii.edu
