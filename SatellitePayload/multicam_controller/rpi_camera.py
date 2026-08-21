@@ -17,7 +17,7 @@ from picamera2 import Picamera2  # type: ignore
 # image resolution
 CAPTURE_WIDTH = 640
 CAPTURE_HEIGHT = 480
-JPEG_QUALITY = 85  # cv2.IMWRITE_JPEG_QUALITY (0-100)
+JPEG_QUALITY = 75  # cv2.IMWRITE_JPEG_QUALITY (0-100)
 
 AWB_SETTLE_S = 0.2  # time to let AEC/AWB converge after starting the camera
 
@@ -40,12 +40,17 @@ class RpiCamera:
 
     def initialize(self):
         self.picam = Picamera2()
+        # Pin the raw stream to the sensor's full resolution so Picamera2 reads
+        # out the entire sensor area (full FoV) instead of auto-selecting a
+        # cropped mode to match the smaller main size; the ISP then scales
+        # that full-FoV raw frame down to CAPTURE_WIDTH x CAPTURE_HEIGHT.
         self.picam.configure(
             self.picam.create_still_configuration(
-                main={"format": "RGB888", "size": (CAPTURE_WIDTH, CAPTURE_HEIGHT)}
+                main={"format": "RGB888", "size": (CAPTURE_WIDTH, CAPTURE_HEIGHT)},
+                raw={"size": self.picam.sensor_resolution},
             )
         )
-        print(f"RPi camera initialized: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}")
+        print(f"RPi camera initialized: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} (full FoV, sensor {self.picam.sensor_resolution})")
 
     def start_streaming(self):
         self.picam.start()
