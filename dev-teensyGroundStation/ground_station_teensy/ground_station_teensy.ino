@@ -73,8 +73,8 @@ RH_RF22_Addressed rf23(RADIO_CS, RADIO_INT, hardware_spi1);
 const int RADIO_WAIT_PACKET_SENT_MS = 500;
 
 // C3M RadioHead addressing - lets the driver silently drop packets not meant for this node
-const uint8_t RADIO_ADDR_GROUND = 0xA1;
-const uint8_t RADIO_ADDR_SATELLITE = 0xA2;
+const uint8_t RADIO_ADDR_GROUND = 0xA3;
+const uint8_t RADIO_ADDR_SATELLITE = 0xA4;
 const uint8_t RADIO_NETWORK_ID = 0xC3;
 const uint8_t RADIO_PROTOCOL_VERSION = 0x01;
 
