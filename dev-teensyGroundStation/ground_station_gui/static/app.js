@@ -14,8 +14,9 @@ const requestLabel = document.getElementById("request-label");
 
 let connected = false;
 const viewerCards = {}; // viewer -> {card, img, meta}
+let requestResetTimer = null;
 
-const VIEWER_TITLES = { rpicam: "RPi Camera", lepton: "Lepton Thermal", boson: "Boson Thermal" };
+const VIEWER_TITLES = { rpicam: "RPi Camera Module 2", lepton: "FLIR Lepton", boson: "Boson Thermal" };
 
 function logLine(text) {
   const atBottom = consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight < 20;
@@ -96,11 +97,16 @@ function ensureViewer(viewer) {
 
   const card = document.createElement("div");
   card.className = "viewer-card";
+  card.dataset.viewer = viewer;
 
   const head = document.createElement("div");
   head.className = "viewer-head";
   const h2 = document.createElement("h2");
   h2.textContent = VIEWER_TITLES[viewer] || viewer;
+
+  const actions = document.createElement("div");
+  actions.className = "viewer-actions";
+
   const rotateBtn = document.createElement("button");
   rotateBtn.className = "rotate-btn";
   rotateBtn.textContent = "⟳ Rotate";
@@ -112,8 +118,20 @@ function ensureViewer(viewer) {
     });
     updateViewerImage(viewer);
   });
+
+  const closeBtn = document.createElement("button");
+  closeBtn.className = "close-btn";
+  closeBtn.textContent = "×";
+  closeBtn.title = "Close viewer";
+  closeBtn.addEventListener("click", () => {
+    card.remove();
+    delete viewerCards[viewer];
+  });
+
+  actions.appendChild(rotateBtn);
+  actions.appendChild(closeBtn);
   head.appendChild(h2);
-  head.appendChild(rotateBtn);
+  head.appendChild(actions);
 
   const img = document.createElement("img");
   const meta = document.createElement("div");
@@ -181,7 +199,11 @@ function handleEvent(event, data) {
       }
       break;
     case "request_progress":
+      clearTimeout(requestResetTimer);
       setProgressBar(requestBar, requestLabel, data.phase, data.percent);
+      if (data.phase === "done") {
+        requestResetTimer = setTimeout(() => setProgressBar(requestBar, requestLabel, "idle"), 1500);
+      }
       break;
     case "image_ready":
       updateViewerImage(data.viewer, data.source);

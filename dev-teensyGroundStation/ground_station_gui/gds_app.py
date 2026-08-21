@@ -352,6 +352,13 @@ rotation_state = load_rotation_state()
 
 app = Flask(__name__)
 
+# matplotlib's pyplot module uses shared global figure state, which isn't
+# thread-safe. With threaded=True, concurrent image_ready events (e.g. lepton
+# and boson refreshing close together) can both be rendering a figure at
+# once - serialize figure creation/save/close to avoid a race between two
+# threads inside plt.subplots()/savefig()/close().
+_thermal_render_lock = threading.Lock()
+
 
 @app.route("/")
 def index():
@@ -446,16 +453,21 @@ def _render_thermal_png(entry, source, degrees):
         display_data = normalize_thermal_grid(data)
         colorbar_label = "Intensity (0-255)"
 
-    fig, ax = plt.subplots(figsize=(5, 4), dpi=110)
-    im = ax.imshow(display_data, cmap="hot", aspect="equal")
-    fig.colorbar(im, ax=ax, label=colorbar_label)
-    ax.set_title(f"Thermal ({source or 'unknown'})")
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
+    with _thermal_render_lock:
+        fig, ax = plt.subplots(figsize=(5, 4), dpi=110)
+        im = ax.imshow(display_data, cmap="hot", aspect="equal")
+        fig.colorbar(im, ax=ax, label=colorbar_label)
+        if source != "lepton":
+            ax.set_title(f"Thermal ({source or 'unknown'})")
+        else:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
 
 
 def _render_rpicam_png(entry, degrees):

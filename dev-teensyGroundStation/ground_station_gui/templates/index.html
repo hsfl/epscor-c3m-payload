@@ -19,6 +19,10 @@
 
   <main>
     <section id="controls">
+      <div class="sidebar-logos">
+        <img src="{{ url_for('static', filename='logos/hsfl_logo.png') }}" alt="HSFL logo" onerror="this.style.display='none'" />
+        <img src="{{ url_for('static', filename='logos/c3m_logo.png') }}" alt="C3M logo" onerror="this.style.display='none'" />
+      </div>
       <div class="quick-actions">
         <button data-cmd="capture">Capture</button>
         <button data-cmd="request 0">Request Lepton</button>
