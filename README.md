@@ -195,6 +195,14 @@ Edit in `satellite_teensy.ino`:
 // #define FLIGHT  // Minimal logging for production (default)
 ```
 
+With `DEBUG` enabled, connect directly to the satellite Teensy's USB serial
+console at 115200 baud and send `pingloop` followed by Enter. It immediately
+prints `pong from satellite` and repeats every two seconds. Send `q` or `quit`
+followed by Enter to stop. This works without a ground station; when the radio
+is initialized, the pong is also transmitted through the existing radio logging
+path. The loop runs during normal command processing; livestream mode and other
+blocking operations pause it.
+
 ## File Structure
 
 ```

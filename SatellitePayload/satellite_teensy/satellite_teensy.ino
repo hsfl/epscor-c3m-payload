@@ -56,13 +56,7 @@
  * */
 // #define DEBUG    // Verbose logging for development
 #define FLIGHT // Flight mode - minimal logging
-
-/** Bench debugging without the radio.
- *  When defined, the RF23 is never initialised and no SPI/RF traffic is
- *  generated: radio output is redirected to USB Serial and commands are driven
- *  from the DEBUG serial console in loop(). Comment out to restore the radio.
- */
-// #define RADIO_DISABLED
+// #define RADIO_DISABLED // Disable radio for standalone USB Serial debugging
 
 // Packed struct attribute for ensuring no padding bytes
 #define PACKED __attribute__((packed))
@@ -1401,6 +1395,11 @@ void setRadioAmpIdle()
  */
 void loop()
 {
+#ifdef DEBUG
+  static bool debugPingLoopActive = false;
+  static uint32_t debugPingLastMs = 0;
+  const uint32_t debugPingIntervalMs = 2000;
+#endif
   serviceGPS();
 
   // Handle stream mode if active
@@ -1434,6 +1433,23 @@ void loop()
         serialLine.trim();
         if (serialLine.length() == 0)
           continue;
+
+        // Match full debug commands before the single-byte dispatch (p = power).
+        if (serialLine.equalsIgnoreCase("pingloop"))
+        {
+          debugPingLoopActive = true;
+          debugPingLastMs = millis() - debugPingIntervalMs;
+          Serial.println("Ping loop started (every 2s). Send q or quit to stop.");
+          serialLine = "";
+          continue;
+        }
+        if (serialLine.equalsIgnoreCase("q") || serialLine.equalsIgnoreCase("quit"))
+        {
+          debugPingLoopActive = false;
+          Serial.println("Ping loop stopped.");
+          serialLine = "";
+          continue;
+        }
 
         radioPrint("command: ");
         radioPrintln(serialLine);
@@ -1560,8 +1576,8 @@ void loop()
 
         default:
           radioPrintln("Unknown command.");
-          radioPrintln("GS cmds : u / r / r<id> / p1 / p0 / ps / sg / si / sb / sG / sI / v1 / v0 / g / ~");
-          radioPrintln("DBG only: t / c / d / a");
+          radioPrintln("GS cmds : u / r / p1 / p0 / ps / sg / si / sb / sG / sI / v1 / v0 / g / ~");
+          radioPrintln("DBG only: t / c / d");
 
           Serial.println("  u       - Capture thermal image (UART trigger to RPi)");
           Serial.println("  r       - Resend cached thermal data via radio");
@@ -1577,6 +1593,8 @@ void loop()
           Serial.println("  v1      - Start livestream mode");
           Serial.println("  v0      - Stop livestream mode");
           Serial.println("  g       - Ping (pong reply)");
+          Serial.println("  pingloop - [DBG] Repeat ping every 2s");
+          Serial.println("  q/quit  - [DBG] Stop ping loop");
           Serial.println("  ~       - Software reset");
           Serial.println("  t       - [DBG] Read temperature sensors");
           Serial.println("  c       - [DBG] Read current sensors");
@@ -1593,6 +1611,15 @@ void loop()
           serialLine = serialLine.substring(serialLine.length() - 16);
       }
     }
+  }
+  // Schedule from the last ping rather than delaying, so serial quit stays responsive.
+  if (debugPingLoopActive && (uint32_t)(millis() - debugPingLastMs) >= debugPingIntervalMs)
+  {
+    debugPingLastMs = millis();
+    if (radioReady)
+      radioPrintln("pong from satellite");
+    else
+      Serial.println("pong from satellite (radio not initialized)");
   }
 #endif
 }
