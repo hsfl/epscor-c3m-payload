@@ -6,6 +6,7 @@
 # python
 __pycache__
 .venv
+.env
 
 # data
 *.jpg
@@ -17,6 +18,7 @@ SatellitePayload/capture_queue/*
 dev-teensyGroundStation/captures/*
 dev-teensyGroundStation/webapp/rotation_state.json
 dev-teensyGroundStation/captures_demo/*
+dev-teensyGroundStation/data/*
 
 # outreach demo secrets
 dev-teensyGroundStation/ground_station_gui_demo/.env
