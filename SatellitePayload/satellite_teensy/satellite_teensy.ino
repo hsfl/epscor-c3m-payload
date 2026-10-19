@@ -54,9 +54,8 @@
 /**  Build configuration flags
  *  Uncomment ONE of these for your build target:
  * */
-// #define DEBUG    // Verbose logging for development
-#define FLIGHT // Flight mode - minimal logging
-// #define RADIO_DISABLED // Disable radio for standalone USB Serial debugging
+#define DEBUG    // Verbose logging for development
+// #define FLIGHT // Flight mode - minimal logging
 
 // Packed struct attribute for ensuring no padding bytes
 #define PACKED __attribute__((packed))
@@ -196,7 +195,7 @@ struct PACKED ThermalEndPacket
  */
 struct PACKED SerialMessagePacket
 {
-  uint8_t messageType;              // SERIAL_MSG_TYPE (0xAA)
+  uint8_t messageType;              // SERIAL_MSG_TYPE (0xAA) 
   uint8_t length;                   // Length with optional continuation flag (bit 7)
   uint8_t data[MAX_SERIAL_MSG_LEN]; // Message text
 };
@@ -664,7 +663,6 @@ void listenForCommands()
 
 /**
  * Setup function - initializes the satellite payload transmitter
- *
  * Configures serial communication, GPIO pins, radio module, and UART
  * interface. Powers up the Raspberry Pi and displays available commands.
  */
@@ -691,6 +689,7 @@ void setup()
   // initIMU();
 
   // TODO: Implement initPDU
+  // initPDU();
 
   // init the RPI for thermal images (default turned off)
   initRPI();
@@ -1248,6 +1247,16 @@ void handleSensorCommand(uint8_t *buf, uint8_t len)
     radioPrintln("Unknown sensor subcommand. Use sg, si, sb, sG, or sI");
     break;
   }
+}
+
+void initPDU() {
+  // TODO: Implement PDU initialization logic here. The code below was used to debug PDU/OBC SPI
+  int pduCS = 9;
+  pinMode(pduCS, OUTPUT);
+  digitalWrite(pduCS, HIGH); // Deselect PDU (CS idle high)
+  // Radio isn't initialized yet, so log over USB serial
+  Serial.println("Set PDU chip select (pin 9) HIGH");
+  
 }
 
 void initRPI()
