@@ -111,6 +111,24 @@ bus = EventBus()
 
 REQUEST_PROGRESS_RE = re.compile(r"(\d{1,3})%\s*$")
 CAPTURE_STATUS_RE = re.compile(r"\b(CAPTURE_DONE|CAPTURE_ERROR|NO_FRAME)\b")
+CAPTURE_DONE_RE = re.compile(r"\bCAPTURE_DONE:(\w+)")
+
+# Lines meaning a request ended without an image. "No image downlinked" comes
+# from outreach_teensy_no_rf.ino when the Pi never hands one over (not ready,
+# REQUEST_ERROR, UART timeout).
+REQUEST_FAILED_MARKERS = ("Invalid header!", "Failed to send command", "No image downlinked")
+
+# Camera name -> 'request <id>' argument. Must match CAMERA_IDS in
+# SatellitePayload/multicam_controller/multicam_controller.py.
+CAMERA_IDS = {"lepton": 0, "boson": 1, "rpicam": 2}
+
+# Pause between one finished request and the next in a Request sequence, so
+# the satellite finishes its post-downlink output (and, over RF, is back in
+# receive mode) before the next command arrives.
+SEQUENCE_NEXT_DELAY_S = 1.0
+# A sequence whose current request has produced neither an image nor a
+# failure line for this long is treated as stalled, so Request can restart it.
+SEQUENCE_STALL_S = 120.0
 
 
 class GroundStationSession:
@@ -142,6 +160,17 @@ class GroundStationSession:
         self.request_state = "idle"  # idle | requesting | downloading | done | error
         self.request_percent = 0
 
+        # Camera names in the order the last capture reported CAPTURE_DONE,
+        # replayed by the Request button (start_request_sequence()).
+        self.capture_order = []
+        self.sequence_active = False
+        self.sequence_queue = []  # camera names not yet requested
+        self.sequence_last_send = 0.0
+
+        # True between the firmware's "--- RPI STORAGE CLEAR ---" and its
+        # COMPLETE/FAILED line; capture/request are refused meanwhile.
+        self.storage_clearing = False
+
         # Latest rendered-image source data, kept in memory so rotation
         # changes can be re-rendered without a new capture.
         self.last_thermal = {"lepton": None, "boson": None}  # each: {"rows": [...], "ts": iso, "filename": str}
@@ -171,12 +200,61 @@ class GroundStationSession:
                 self.ser.close()
             self.ser = None
             self.port = None
+            self.sequence_active = False
+            self.sequence_queue = []
+            self.storage_clearing = False
         bus.publish("connection", {"connected": False, "port": None})
 
     def send_command(self, cmd):
         if not self.connected:
             raise RuntimeError("Not connected")
+        words = cmd.split()
+        if self.storage_clearing and words and words[0].lower() in ("capture", "request"):
+            raise RuntimeError("RPi storage is being cleared - wait for it to finish")
         self.ser.write((cmd + "\n").encode())
+
+    def start_request_sequence(self):
+        """Request every camera from the last capture, one at a time, in the
+        order the Pi captured them. Each next request is sent only once the
+        previous one finished (image saved) or failed - see _request_finished()."""
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        if self.storage_clearing:
+            raise RuntimeError("RPi storage is being cleared - wait for it to finish")
+        if not self.capture_order:
+            raise RuntimeError("No captured cameras yet - press Capture first")
+        if self.sequence_active and time.monotonic() - self.sequence_last_send < SEQUENCE_STALL_S:
+            raise RuntimeError("A request sequence is already running")
+
+        self.sequence_queue = list(self.capture_order)
+        self.sequence_active = True
+        bus.publish("log", {"text": f"[request sequence: {', '.join(self.sequence_queue)}]"})
+        self._send_next_in_sequence()
+        return list(self.capture_order)
+
+    def _send_next_in_sequence(self):
+        if not self.sequence_active or not self.sequence_queue or not self.connected:
+            self.sequence_active = False
+            return
+        name = self.sequence_queue.pop(0)
+        self.sequence_last_send = time.monotonic()
+        try:
+            self.send_command(f"request {CAMERA_IDS[name]}")
+        except (RuntimeError, serial.SerialException, OSError) as e:
+            self.sequence_active = False
+            self.sequence_queue = []
+            bus.publish("log", {"text": f"[request sequence stopped: {e}]"})
+
+    def _request_finished(self):
+        """Called whenever a request ends (image saved or failed); advances an
+        active Request sequence. A failed camera doesn't stop the rest."""
+        if not self.sequence_active:
+            return
+        if self.sequence_queue:
+            threading.Timer(SEQUENCE_NEXT_DELAY_S, self._send_next_in_sequence).start()
+        else:
+            self.sequence_active = False
+            bus.publish("log", {"text": "[request sequence complete]"})
 
     def _read_loop(self):
         lost_connection = False
@@ -216,8 +294,20 @@ class GroundStationSession:
         if gs_cli.THERMAL_CAPTURE_TIMESTAMP_FLAG in line:
             self.capture_timestamp = datetime.now()
 
+        if "--- RPI STORAGE CLEAR COMPLETE ---" in line:
+            self.storage_clearing = False
+            self.capture_order = []  # those captures no longer exist to request
+            bus.publish("storage_clear", {"phase": "done"})
+        elif "--- RPI STORAGE CLEAR FAILED ---" in line:
+            self.storage_clearing = False
+            bus.publish("storage_clear", {"phase": "error"})
+        elif "--- RPI STORAGE CLEAR ---" in line:
+            self.storage_clearing = True
+            bus.publish("storage_clear", {"phase": "start"})
+
         if "--- UART CAPTURE ---" in line:
             self.capture_state = "capturing"
+            self.capture_order = []
             bus.publish("capture_progress", {"phase": "start"})
         elif "--- UART CAPTURE COMPLETE ---" in line:
             self.capture_state = "done"
@@ -227,6 +317,9 @@ class GroundStationSession:
             if m:
                 if m.group(1) in ("CAPTURE_ERROR", "NO_FRAME"):
                     self.capture_state = "error"
+                done = CAPTURE_DONE_RE.search(line)
+                if done and done.group(1) in CAMERA_IDS and done.group(1) not in self.capture_order:
+                    self.capture_order.append(done.group(1))
                 bus.publish("capture_progress", {"phase": "status", "text": line})
 
         if "--- REQUESTING THERMAL DATA DOWNLINK ---" in line:
@@ -236,9 +329,10 @@ class GroundStationSession:
         elif "THERMAL IMAGE HEADER RECEIVED" in line:
             self.request_state = "downloading"
             bus.publish("request_progress", {"phase": "downloading", "percent": self.request_percent})
-        elif "Invalid header!" in line or "Failed to send command" in line:
+        elif any(marker in line for marker in REQUEST_FAILED_MARKERS):
             self.request_state = "error"
             bus.publish("request_progress", {"phase": "error", "percent": self.request_percent})
+            self._request_finished()
         else:
             m = REQUEST_PROGRESS_RE.search(line.strip())
             if m and self.request_state == "downloading":
@@ -311,6 +405,7 @@ class GroundStationSession:
 
         self.request_state = "done"
         bus.publish("request_progress", {"phase": "done", "percent": 100})
+        self._request_finished()
 
         if source not in ("lepton", "boson"):
             # Legacy/untagged capture (no 'request <id>' issued this
@@ -342,6 +437,7 @@ class GroundStationSession:
             bus.publish("log", {"text": f"Error decoding image: {e}"})
             self.request_state = "error"
             bus.publish("request_progress", {"phase": "error", "percent": self.request_percent})
+            self._request_finished()
             return
 
         filename = gs_cli.get_next_image_filename(source)
@@ -352,6 +448,7 @@ class GroundStationSession:
         self.request_state = "done"
         bus.publish("request_progress", {"phase": "done", "percent": 100})
         bus.publish("image_ready", {"viewer": "rpicam", "source": source, "filename": filename})
+        self._request_finished()
 
 
 session = GroundStationSession()
@@ -411,6 +508,15 @@ def api_send():
     return jsonify({"ok": True})
 
 
+@app.route("/api/request-sequence", methods=["POST"])
+def api_request_sequence():
+    try:
+        order = session.start_request_sequence()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "order": order})
+
+
 def _combined_ready():
     return bool(session.last_rpicam and session.last_thermal["lepton"])
 
@@ -424,6 +530,7 @@ def api_state():
             "capture_state": session.capture_state,
             "request_state": session.request_state,
             "request_percent": session.request_percent,
+            "storage_clearing": session.storage_clearing,
             "rotation": rotation_state,
             "viewers": {
                 "rpicam": session.last_rpicam is not None,

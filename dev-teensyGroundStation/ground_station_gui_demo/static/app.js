@@ -102,8 +102,36 @@ cmdForm.addEventListener("submit", (e) => {
   cmdInput.value = "";
 });
 
-document.querySelectorAll(".quick-actions button").forEach((btn) => {
+document.querySelectorAll(".quick-actions button[data-cmd]").forEach((btn) => {
   btn.addEventListener("click", () => sendCommand(btn.dataset.cmd));
+});
+
+const clearStorageBtn = document.getElementById("clear-storage-btn");
+// Buttons that trigger an RPi capture or request - disabled while storage is being cleared.
+const piImageButtons = [
+  ...document.querySelectorAll('.quick-actions button[data-cmd^="capture"], .quick-actions button[data-cmd^="request"]'),
+  document.getElementById("request-seq-btn"),
+];
+
+function setStorageClearing(clearing) {
+  piImageButtons.forEach((btn) => (btn.disabled = clearing));
+  clearStorageBtn.disabled = clearing;
+  clearStorageBtn.textContent = clearing ? "Clearing RPi Storage…" : "Clear RPi Storage";
+}
+
+clearStorageBtn.addEventListener("click", () => {
+  const ok = confirm(
+    "Delete ALL captured images stored on the Raspberry Pi?\n\nThis cannot be undone."
+  );
+  if (ok) sendCommand("clear_storage confirm");
+});
+
+document.getElementById("request-seq-btn").addEventListener("click", async () => {
+  const res = await fetch("/api/request-sequence", { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json();
+    logLine(`[request error] ${err.error}`);
+  }
 });
 
 function ensureViewer(viewer) {
@@ -207,6 +235,9 @@ function handleEvent(event, data) {
       updateViewerImage(data.viewer, data.source);
       if (data.viewer === "rpicam" || data.viewer === "lepton") refreshCombinedPreview();
       break;
+    case "storage_clear":
+      setStorageClearing(data.phase === "start");
+      break;
     default:
       break;
   }
@@ -306,6 +337,7 @@ async function loadInitialState() {
   setConnected(state.connected, state.port);
   setProgressBar(captureBar, captureLabel, state.capture_state === "capturing" ? "capturing" : state.capture_state);
   setProgressBar(requestBar, requestLabel, state.request_state, state.request_percent);
+  setStorageClearing(state.storage_clearing);
   if (state.viewers.rpicam) updateViewerImage("rpicam");
   if (state.viewers.lepton) updateViewerImage("lepton");
   if (state.viewers.boson) updateViewerImage("boson");

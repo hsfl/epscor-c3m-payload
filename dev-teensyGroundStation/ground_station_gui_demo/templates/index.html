@@ -25,11 +25,12 @@
       </div>
       <div class="quick-actions">
         <button data-cmd="capture">Capture</button>
+        <button id="request-seq-btn" title="Request every camera from the last capture, in capture order">Request</button>
         <button data-cmd="request 0">Request Lepton</button>
         <button data-cmd="request 2">Request RPiCam</button>
-        <button data-cmd="export">Export</button>
         <button data-cmd="status">Status</button>
         <button data-cmd="ping">Ping</button>
+        <button id="clear-storage-btn" class="danger">Clear RPi Storage</button>
       </div>
       <form id="cmd-form">
         <input id="cmd-input" type="text" placeholder="Type a command (e.g. request 0)" autocomplete="off" />

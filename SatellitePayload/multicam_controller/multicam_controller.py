@@ -23,6 +23,8 @@ Communication Protocol:
     "CAPTURE <id>\n"  - capture from one camera (see CAMERA_IDS); error if
                         <id> is unknown or that camera isn't connected
     "REQUEST <id>\n"  - send the most recently captured image for camera <id>
+    "CLEAR\n"         - delete every queued capture in CAPTURE_QUEUE_DIR
+                        (frees disk space; cannot be undone)
     "STREAM_START\n" / "STREAM_STOP\n" - livestream mode
   Captures are saved to CAPTURE_QUEUE_DIR on disk, not transmitted
   immediately - only REQUEST triggers a UART data transfer.
@@ -39,6 +41,7 @@ __version__ = "1.0.0"
 __build_date__ = "2026-08-04"
 
 import argparse
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -62,9 +65,10 @@ UART_BAUD = 115200         # High-speed UART to match Teensy baud rate
 # in wait_for_uart_command() - these are just the recognized command words.
 CMD_CAPTURE = 'CAPTURE'
 CMD_REQUEST = 'REQUEST'
+CMD_CLEAR = 'CLEAR'
 CMD_STREAM_START = 'STREAM_START'
 CMD_STREAM_STOP = 'STREAM_STOP'
-KNOWN_COMMANDS = {CMD_CAPTURE, CMD_REQUEST, CMD_STREAM_START, CMD_STREAM_STOP}
+KNOWN_COMMANDS = {CMD_CAPTURE, CMD_REQUEST, CMD_CLEAR, CMD_STREAM_START, CMD_STREAM_STOP}
 
 FRAME_REQUEST_COMMAND = b'FRAME\n'        # Command to request a single stream frame
 
@@ -226,6 +230,66 @@ def run_request(camera_id, uart_port):
     else:
         print(f"{name}: data transmission failed!")
         send_status_uart(f"REQUEST_FAIL:{name}", uart_port)
+
+
+def run_clear(uart_port):
+    """
+    Delete every queued capture (the *.bin files save_capture() writes) from
+    CAPTURE_QUEUE_DIR to free disk space. Cannot be undone - afterwards
+    REQUEST reports NO_CAPTURE until the next CAPTURE.
+
+    The command loop is single-threaded, so no CAPTURE/REQUEST can run while
+    files are being deleted. Any command that arrived over UART in the
+    meantime is rejected (not run later) via reject_commands_received_while_busy(),
+    then CLEAR_DONE / CLEAR_ERROR reports the result.
+    """
+    send_status_uart("CLEAR_START", uart_port)
+
+    deleted = 0
+    failed = 0
+    freed_bytes = 0
+    if CAPTURE_QUEUE_DIR.is_dir():
+        for path in CAPTURE_QUEUE_DIR.glob("*.bin"):
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                deleted += 1
+                freed_bytes += size
+            except OSError as e:
+                print(f"clear: could not delete {path.name}: {e}")
+                failed += 1
+
+    reject_commands_received_while_busy(uart_port)
+
+    free_mb = shutil.disk_usage(CAPTURE_QUEUE_DIR if CAPTURE_QUEUE_DIR.is_dir() else ".").free // (1024 * 1024)
+    print(f"clear: deleted {deleted} capture(s), freed {freed_bytes // 1024} KB, "
+          f"{failed} failed, {free_mb} MB free")
+    if failed:
+        send_status_uart(f"CLEAR_ERROR:{failed}_FAILED:{deleted}_DELETED:FREE_{free_mb}MB", uart_port)
+    else:
+        send_status_uart(f"CLEAR_DONE:{deleted}_FILES:{freed_bytes // 1024}KB:FREE_{free_mb}MB", uart_port)
+
+
+def reject_commands_received_while_busy(uart_port):
+    """Reject (rather than queue) any command lines already waiting on UART -
+    used by run_clear() so nothing sent mid-clear runs against storage that's
+    being deleted. CAPTURE/REQUEST get their usual error status prefix so the
+    Teensy's existing CAPTURE_ERROR/REQUEST_ERROR handling applies."""
+    if uart_port is None or uart_port.in_waiting == 0:
+        return
+    pending = uart_port.read(uart_port.in_waiting).decode('ascii', 'ignore')
+    for line in pending.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        cmd = parts[0].upper()
+        print(f"clear: rejecting {line.strip()!r} received while clearing")
+        if cmd == CMD_CAPTURE:
+            send_status_uart("CAPTURE_ERROR:BUSY_CLEARING", uart_port)
+        elif cmd == CMD_REQUEST:
+            send_status_uart("REQUEST_ERROR:BUSY_CLEARING", uart_port)
+        elif cmd in KNOWN_COMMANDS:
+            send_status_uart(f"BUSY_CLEARING:{cmd}", uart_port)
 
 
 def send_status_uart(message: str, uart_port):
@@ -566,6 +630,7 @@ def main():
         print("Waiting for UART commands:")
         print(f"  - {CMD_CAPTURE} [id]: Capture (all cameras, or just [id])")
         print(f"  - {CMD_REQUEST} <id>: Send most recent capture for camera <id>")
+        print(f"  - {CMD_CLEAR}: Delete all queued captures")
         print(f"  - {CMD_STREAM_START}: Start livestream")
         print(f"  - {CMD_STREAM_STOP}: Stop livestream")
         print(f"Data will be sent via UART: {UART_PORT} at {UART_BAUD} baud")
@@ -604,6 +669,17 @@ def main():
                     continue
 
                 run_request(camera_id, uart)
+
+                print("\nReady for next command...")
+                print("="*40)
+                send_status_uart("IDLE", uart)
+
+            elif cmd == CMD_CLEAR:
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"\n[{timestamp}] Clearing capture storage via UART!")
+                print("="*40)
+
+                run_clear(uart)
 
                 print("\nReady for next command...")
                 print("="*40)

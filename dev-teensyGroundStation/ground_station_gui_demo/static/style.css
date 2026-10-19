@@ -50,6 +50,9 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button:active { transform: translateY(1px); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.danger { color: var(--err); border-color: rgba(255,93,93,0.4); }
+button.danger:hover { border-color: var(--err); }
 
 .status {
   padding: 0.25rem 0.6rem;
