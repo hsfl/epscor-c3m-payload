@@ -358,7 +358,7 @@ const Command commands[] = {
     {"pingloop", "Continuously ping satellite and report RSSI (pingloop [interval_ms])", cmdTestLoopPing},
     {"radio", "Radio control (radio <init|status|tx|rx|dump>)", cmdRadio},
     {"export", "Export thermal data as CSV", cmdExport},
-    {"capture", "Command satellite to capture thermal data", cmdCapture},
+    {"capture", "Capture all connected cameras, or one: capture [camera_id] (0=lepton, 1=boson, 2=rpicam)", cmdCapture},
     {"request", "Request thermal data downlink for a camera (request <camera_id>)", cmdRequest},
     {"rstatus", "Show radio reception status", cmdRadioStatus},
     {"sensor", "Request satellite sensor data (sensor <gps|imu|both|gps_init|imu_init>)", cmdSensor},
@@ -2234,7 +2234,29 @@ void cmdExport(const char *args)
 
 void cmdCapture(const char *args)
 {
-  forwardToSatellite('u');
+  String argStr = args;
+  argStr.trim();
+
+  if (argStr.length() == 0)
+  {
+    forwardToSatellite('u');
+    return;
+  }
+
+  if (argStr.length() != 1 || argStr[0] < '0' || argStr[0] > '2')
+  {
+    Serial.println("Usage: capture [camera_id]  (omit for all; 0=lepton, 1=boson, 2=rpicam)");
+    return;
+  }
+
+  uint8_t buf[2] = {'u', (uint8_t)argStr[0]};
+  Serial.print("Forwarding command to satellite: capture ");
+  Serial.println(argStr);
+
+  if (sendBytesToSatellite(buf, 2))
+    Serial.println("Command sent successfully");
+  else
+    Serial.println("Failed to send command");
 }
 
 void cmdRequest(const char *args)

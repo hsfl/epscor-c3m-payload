@@ -571,7 +571,12 @@ void listenForCommands()
 
     if (cmd == 'u' || cmd == 'U')
     {
-      captureThermalImageUART();
+      if (len == 1)
+        captureThermalImageUART(-1);
+      else if (len == 2 && radioRxBuffer[1] >= '0' && radioRxBuffer[1] <= '2')
+        captureThermalImageUART(radioRxBuffer[1] - '0');
+      else
+        radioPrintln("Invalid capture camera ID (expected 0, 1, or 2)");
     }
     else if (cmd == 'r' || cmd == 'R')
     {
@@ -1455,7 +1460,12 @@ void loop()
         {
         case 'u':
         case 'U':
-          captureThermalImageUART();
+          if (len == 1)
+            captureThermalImageUART(-1);
+          else if (buf[1] >= '0' && buf[1] <= '2')
+            captureThermalImageUART(buf[1] - '0');
+          else
+            radioPrintln("Invalid capture camera ID (expected 0, 1, or 2)");
           break;
 
         case 'r':
@@ -1777,7 +1787,8 @@ void requestThermalImageFromPi(uint8_t cameraId)
   sendThermalDataViaRadio();
 }
 
-void captureThermalImageUART()
+// cameraId == -1 captures all connected cameras; 0..2 selects one camera.
+void captureThermalImageUART(int cameraId)
 {
   if (!RPI_IDLE_READY)
   {
@@ -1795,7 +1806,14 @@ void captureThermalImageUART()
     Serial2.read();
 
   // Send UART capture command to Raspberry Pi
-  Serial2.print(UART_CAPTURE_CMD);
+  if (cameraId < 0)
+    Serial2.print(UART_CAPTURE_CMD);
+  else
+  {
+    Serial2.print("CAPTURE ");
+    Serial2.print(cameraId);
+    Serial2.print('\n');
+  }
   Serial2.flush(); // Ensure command is sent immediately
 
   radioPrintln("Waiting for capture status from RPI...");
