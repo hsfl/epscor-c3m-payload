@@ -155,7 +155,8 @@ python ground_station_serial_cli_teensy.py
 
 In the ground station CLI:
 ```
-> capture          # Start averaging frames for thermal data
+> capture          # Capture from all connected cameras
+> capture 0        # Capture from one camera (0=lepton, 1=boson, 2=rpicam)
 > request          # Begin downlink of thermal data to ground station
 > export           # Export received data as CSV (auto-visualizes)
 > ping             # Test communication between GS and satellite
