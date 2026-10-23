@@ -78,6 +78,7 @@ async function sendCommand(cmd) {
     const err = await res.json();
     logLine(`[send error] ${err.error}`);
   }
+  return res.ok;
 }
 
 cmdForm.addEventListener("submit", (e) => {
@@ -88,7 +89,7 @@ cmdForm.addEventListener("submit", (e) => {
   cmdInput.value = "";
 });
 
-document.querySelectorAll(".quick-actions button").forEach((btn) => {
+document.querySelectorAll(".quick-actions button:not(#stream-toggle)").forEach((btn) => {
   btn.addEventListener("click", () => sendCommand(btn.dataset.cmd));
 });
 
@@ -103,6 +104,9 @@ function ensureViewer(viewer) {
   head.className = "viewer-head";
   const h2 = document.createElement("h2");
   h2.textContent = VIEWER_TITLES[viewer] || viewer;
+  const temperatures = document.createElement("span");
+  temperatures.className = "viewer-temperatures";
+  if (viewer === "lepton") h2.appendChild(temperatures);
 
   const actions = document.createElement("div");
   actions.className = "viewer-actions";
@@ -142,17 +146,94 @@ function ensureViewer(viewer) {
   card.appendChild(meta);
   viewersEl.appendChild(card);
 
-  const entry = { card, img, meta };
+  const entry = { card, img, meta, temperatures };
   viewerCards[viewer] = entry;
   return entry;
 }
 
-function updateViewerImage(viewer, sourceLabel) {
+function updateViewerImage(viewer, sourceLabel, temperatures) {
   const entry = ensureViewer(viewer);
+  if (viewer === "lepton" && temperatures !== undefined) {
+    entry.temperatures.textContent = temperatures
+      ? ` · Min ${temperatures.min.toFixed(1)} °C · Max ${temperatures.max.toFixed(1)} °C`
+      : "";
+  }
   entry.img.src = `/api/image/${viewer}?t=${Date.now()}`;
   const stamp = new Date().toLocaleTimeString();
   entry.meta.textContent = sourceLabel ? `${sourceLabel} · updated ${stamp}` : `updated ${stamp}`;
 }
+
+const streamViewer = document.getElementById("stream-viewer");
+const streamImage = document.getElementById("stream-image");
+const streamStatus = document.getElementById("stream-status");
+const streamMeta = document.getElementById("stream-meta");
+const streamClose = document.getElementById("stream-close");
+const streamToggle = document.getElementById("stream-toggle");
+let streamRotation = 0;
+let latestStreamFrame = null;
+document.getElementById("stream-rotate").addEventListener("click", () => {
+  streamRotation = (streamRotation + 90) % 360;
+  if (latestStreamFrame) updateStreamFrame(latestStreamFrame);
+});
+streamToggle.addEventListener("click", async () => {
+  const cmd = streamToggle.dataset.cmd;
+  const previousPhase = streamPhase;
+  const couldClose = !streamClose.hidden;
+  setStreamState(cmd === "stream start" ? "waiting" : "stopping");
+  try {
+    if (!await sendCommand(cmd)) setStreamState(previousPhase, couldClose);
+  } catch (error) {
+    logLine(`[send error] ${error.message}`);
+    setStreamState(previousPhase, couldClose);
+  }
+});
+streamClose.addEventListener("click", () => {
+  if (streamPhase === "stopped" && !streamClose.hidden) streamViewer.hidden = true;
+});
+let streamLoading = false;
+let pendingStreamFrame = null;
+let lastStreamTime = 0;
+let streamPhase = "stopped";
+
+function setStreamState(phase, canClose = false) {
+  streamClose.hidden = !(phase === "stopped" && canClose);
+  streamPhase = phase;
+  const active = ["waiting", "live", "stopping"].includes(phase);
+  streamToggle.textContent = active ? "Stream Stop" : "Stream Start";
+  streamToggle.dataset.cmd = active ? "stream stop" : "stream start";
+  if (phase !== "stopped" || !streamViewer.hidden) streamViewer.hidden = false;
+  streamStatus.textContent = phase === "stopping" ? "waiting for RPi idle" : phase;
+  if (phase === "waiting") {
+    streamImage.hidden = true;
+    streamMeta.textContent = "Waiting for frames…";
+  }
+}
+
+function updateStreamFrame(frame) {
+  latestStreamFrame = frame;
+  pendingStreamFrame = frame;
+  if (streamLoading) return; // Fetch only the newest frame after the current load.
+  streamLoading = true;
+  pendingStreamFrame = null;
+  streamImage.onload = () => {
+    streamLoading = false;
+    if (streamPhase === "live") {
+      streamImage.hidden = false;
+      lastStreamTime = Date.now();
+      streamStatus.textContent = "live";
+      streamMeta.textContent = `100 × 80 · frame ${frame.seq} · ${frame.packets} packets · ${new Date(frame.ts).toLocaleTimeString()}`;
+    }
+    if (pendingStreamFrame) updateStreamFrame(pendingStreamFrame);
+  };
+  streamImage.onerror = () => { streamLoading = false; };
+  streamImage.src = `/api/stream/image?rotation=${streamRotation}&t=${Date.now()}`;
+}
+
+setInterval(() => {
+  if (streamPhase === "live" && Date.now() - lastStreamTime > 10000) {
+    streamStatus.textContent = "waiting for next frame";
+  }
+}, 1000);
 
 function setProgressBar(barEl, labelEl, phase, percent) {
   labelEl.textContent = phase;
@@ -205,8 +286,14 @@ function handleEvent(event, data) {
         requestResetTimer = setTimeout(() => setProgressBar(requestBar, requestLabel, "idle"), 1500);
       }
       break;
+    case "stream_state":
+      setStreamState(data.state, data.can_close);
+      break;
+    case "stream_frame":
+      updateStreamFrame(data);
+      break;
     case "image_ready":
-      updateViewerImage(data.viewer, data.source);
+      updateViewerImage(data.viewer, data.source, data.temperatures);
       break;
     default:
       break;
@@ -219,8 +306,10 @@ async function loadInitialState() {
   setConnected(state.connected, state.port);
   setProgressBar(captureBar, captureLabel, state.capture_state === "capturing" ? "capturing" : state.capture_state);
   setProgressBar(requestBar, requestLabel, state.request_state, state.request_percent);
+  setStreamState(state.stream_state, state.stream_can_close);
+  if (state.stream_frame) updateStreamFrame(state.stream_frame);
   if (state.viewers.rpicam) updateViewerImage("rpicam");
-  if (state.viewers.lepton) updateViewerImage("lepton");
+  if (state.viewers.lepton) updateViewerImage("lepton", null, state.lepton_temperatures);
   if (state.viewers.boson) updateViewerImage("boson");
 }
 

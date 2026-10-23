@@ -31,7 +31,6 @@ from serial.tools import list_ports
 # inside a Flask worker thread, not the main thread.
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ground_station_serial_cli_teensy as gs_cli  # noqa: E402
@@ -106,6 +105,15 @@ REQUEST_PROGRESS_RE = re.compile(r"(\d{1,3})%\s*$")
 CAPTURE_STATUS_RE = re.compile(r"\b(CAPTURE_DONE|CAPTURE_ERROR|NO_FRAME)\b")
 
 
+def temperature_range(rows):
+    """Return finite Celsius extrema from converted Lepton CSV rows."""
+    values = np.loadtxt(io.StringIO("\n".join(rows)), delimiter=",")
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        return None
+    return {"min": float(finite.min()), "max": float(finite.max())}
+
+
 class GroundStationSession:
     """Owns the serial connection and turns incoming text into web events.
 
@@ -121,6 +129,12 @@ class GroundStationSession:
         self.read_thread = None
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
+
+        self.raw_buffer = bytearray()
+        self.text_buffer = bytearray()
+        self.stream_can_close = False
+        self.stream_state = "stopped"
+        self.last_stream = None
 
         self.csv_capture_mode = False
         self.csv_data = []
@@ -150,6 +164,10 @@ class GroundStationSession:
                 raise RuntimeError("Already connected")
             self.ser = serial.Serial(port, BAUD_RATE, timeout=0.2)
             self.port = port
+            self.raw_buffer.clear()
+            self.text_buffer.clear()
+            self.last_stream = None
+            self.set_stream_state("stopped")
             self.stop_event.clear()
             self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
             self.read_thread.start()
@@ -164,29 +182,30 @@ class GroundStationSession:
                 self.ser.close()
             self.ser = None
             self.port = None
+        self.set_stream_state("disconnected")
         bus.publish("connection", {"connected": False, "port": None})
 
     def send_command(self, cmd):
         if not self.connected:
             raise RuntimeError("Not connected")
         self.ser.write((cmd + "\n").encode())
+        parts = cmd.lower().split()
+        if parts in (["stream", "start"], ["stream", "1"]):
+            self.last_stream = None
+            self.set_stream_state("waiting")
+        elif parts in (["stream", "stop"], ["stream", "0"]):
+            self.set_stream_state("stopping")
 
     def _read_loop(self):
         lost_connection = False
         while not self.stop_event.is_set():
             try:
-                raw = self.ser.readline()
+                raw = self.ser.read(max(1, min(self.ser.in_waiting, 16384)))
             except (serial.SerialException, OSError):
                 lost_connection = True
                 break
-            if not raw:
-                continue
-            try:
-                line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
-            except UnicodeDecodeError:
-                continue
-            if line:
-                self._handle_line(line)
+            if raw:
+                self._process_bytes(raw)
 
         if lost_connection:
             # Reached only on an unexpected serial error, never on a normal
@@ -200,11 +219,78 @@ class GroundStationSession:
             self.ser = None
             self.port = None
             bus.publish("connection", {"connected": False, "port": None})
+            self.set_stream_state("disconnected")
             bus.publish("log", {"text": "[connection lost]"})
+
+    def set_stream_state(self, state, can_close=False):
+        self.stream_state = state
+        self.stream_can_close = can_close
+        bus.publish("stream_state", {"state": state, "can_close": can_close})
+
+    def _process_text(self, data):
+        self.text_buffer.extend(data)
+        while b"\n" in self.text_buffer:
+            line, _, rest = self.text_buffer.partition(b"\n")
+            self.text_buffer = bytearray(rest)
+            text = line.decode("utf-8", errors="replace").rstrip("\r")
+            if text:
+                self._handle_line(text)
+
+    def _process_bytes(self, data):
+        """Demultiplex serial text and fixed-size WRM! frames across reads."""
+        self.raw_buffer.extend(data)
+        magic = gs_cli.STREAM_FRAME_MAGIC
+        while self.raw_buffer:
+            pos = self.raw_buffer.find(magic)
+            if pos < 0:
+                # Retain only a possible partial magic prefix, even across timeouts.
+                keep = next((n for n in range(len(magic) - 1, 0, -1)
+                             if self.raw_buffer.endswith(magic[:n])), 0)
+                count = len(self.raw_buffer) - keep
+                self._process_text(self.raw_buffer[:count])
+                del self.raw_buffer[:count]
+                return
+            if pos:
+                self._process_text(self.raw_buffer[:pos])
+                del self.raw_buffer[:pos]
+            if len(self.raw_buffer) < gs_cli.STREAM_FRAME_TOTAL_SIZE:
+                return
+            packet = bytes(self.raw_buffer[:gs_cli.STREAM_FRAME_TOTAL_SIZE])
+            del self.raw_buffer[:gs_cli.STREAM_FRAME_TOTAL_SIZE]
+            seq, pkts = packet[4:6]
+            pixels = packet[8:]
+            checksum = int.from_bytes(packet[6:8], "little")
+            if (not gs_cli.STREAM_PACKETS_PER_FRAME // 2 <= pkts <= gs_cli.STREAM_PACKETS_PER_FRAME
+                    or sum(pixels) & 0xFFFF != checksum):
+                bus.publish("log", {"text": "[stream] Corrupt frame skipped"})
+                continue
+            if self.stream_state in ("stopping", "stopped", "disconnected"):
+                continue
+            grid = np.frombuffer(pixels, dtype=np.uint8).reshape(
+                gs_cli.STREAM_FRAME_HEIGHT, gs_cli.STREAM_FRAME_WIDTH)
+            # Match the still thermal viewer's hot palette, using the stream's
+            # fixed 8-bit intensity range so colors remain stable across frames.
+            colors = matplotlib.colormaps["hot"](grid / 255.0, bytes=True)
+            image = Image.fromarray(colors[:, :, :3])
+            out = io.BytesIO()
+            image.save(out, format="PNG")
+            self.last_stream = {"png": out.getvalue(), "seq": seq, "packets": pkts,
+                                "ts": datetime.now().isoformat()}
+            if self.stream_state != "live":
+                self.set_stream_state("live")
+            bus.publish("stream_frame", {k: v for k, v in self.last_stream.items() if k != "png"})
 
     def _handle_line(self, line):
         bus.publish("log", {"text": line})
         gs_cli.update_sensor_cache(line)
+        if "Stream start command sent" in line:
+            self.set_stream_state("waiting")
+        elif "Stream stop command sent" in line:
+            self.set_stream_state("stopping")
+        elif self.stream_state == "stopping" and re.search(r"\bRPI STATUS:\s*IDLE\b", line):
+            self.set_stream_state("stopped", can_close=True)
+        elif "Failed to send stream" in line:
+            self.set_stream_state("error")
 
         if gs_cli.THERMAL_CAPTURE_TIMESTAMP_FLAG in line:
             self.capture_timestamp = datetime.now()
@@ -316,8 +402,10 @@ class GroundStationSession:
             "rows": output_rows,
             "ts": datetime.now().isoformat(),
             "filename": filename,
+            "temperatures": temperature_range(output_rows) if source == "lepton" else None,
         }
-        bus.publish("image_ready", {"viewer": source, "source": source, "filename": filename})
+        bus.publish("image_ready", {"viewer": source, "source": source, "filename": filename,
+                                    "temperatures": self.last_thermal[source]["temperatures"]})
 
     def _finish_jpg(self):
         import base64
@@ -351,14 +439,6 @@ session = GroundStationSession()
 rotation_state = load_rotation_state()
 
 app = Flask(__name__)
-
-# matplotlib's pyplot module uses shared global figure state, which isn't
-# thread-safe. With threaded=True, concurrent image_ready events (e.g. lepton
-# and boson refreshing close together) can both be rendering a figure at
-# once - serialize figure creation/save/close to avoid a race between two
-# threads inside plt.subplots()/savefig()/close().
-_thermal_render_lock = threading.Lock()
-
 
 @app.route("/")
 def index():
@@ -412,6 +492,12 @@ def api_state():
             "request_state": session.request_state,
             "request_percent": session.request_percent,
             "rotation": rotation_state,
+            "lepton_temperatures": (session.last_thermal["lepton"].get("temperatures")
+                                    if session.last_thermal["lepton"] else None),
+            "stream_state": session.stream_state,
+            "stream_can_close": session.stream_can_close,
+            "stream_frame": ({k: v for k, v in session.last_stream.items() if k != "png"}
+                             if session.last_stream else None),
             "viewers": {
                 "rpicam": session.last_rpicam is not None,
                 "lepton": session.last_thermal["lepton"] is not None,
@@ -445,29 +531,15 @@ def _render_thermal_png(entry, source, degrees):
     k = (-(degrees // 90)) % 4  # clockwise rotation to match rpicam's visual sense
     data = np.rot90(data, k=k)
 
-    is_radiometric = source == "lepton"
-    if is_radiometric:
-        display_data = data
-        colorbar_label = "Temperature (°C)"
-    else:
-        display_data = normalize_thermal_grid(data)
-        colorbar_label = "Intensity (0-255)"
-
-    with _thermal_render_lock:
-        fig, ax = plt.subplots(figsize=(5, 4), dpi=110)
-        im = ax.imshow(display_data, cmap="hot", aspect="equal")
-        fig.colorbar(im, ax=ax, label=colorbar_label)
-        if source != "lepton":
-            ax.set_title(f"Thermal ({source or 'unknown'})")
-        else:
-            ax.set_xticks([])
-            ax.set_yticks([])
-        buf = io.BytesIO()
-        fig.tight_layout()
-        fig.savefig(buf, format="png")
-        plt.close(fig)
-        buf.seek(0)
-        return buf.getvalue()
+    display_data = data if source == "lepton" else normalize_thermal_grid(data)
+    # Preserve the plot's automatic contrast and hot palette, without axes,
+    # margins, or a colorbar: one output pixel per thermal sample.
+    normalized = matplotlib.colors.Normalize()(display_data)
+    colors = matplotlib.colormaps["hot"](normalized, bytes=True)
+    image = Image.fromarray(colors[:, :, :3])
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _render_rpicam_png(entry, degrees):
@@ -494,6 +566,23 @@ def api_image(viewer):
     else:
         return "", 404
     return Response(png_bytes, mimetype="image/png")
+
+
+@app.route("/api/stream/image")
+def api_stream_image():
+    frame = session.last_stream
+    if frame is None:
+        return "", 404
+    degrees = request.args.get("rotation", default=0, type=int)
+    if degrees not in (0, 90, 180, 270):
+        return jsonify({"error": "rotation must be 0, 90, 180, or 270"}), 400
+    png = frame["png"]
+    if degrees:
+        image = Image.open(io.BytesIO(png)).rotate(-degrees, expand=True)
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        png = out.getvalue()
+    return Response(png, mimetype="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.route("/api/events")

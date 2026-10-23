@@ -177,3 +177,69 @@ main {
   padding: 0.3rem 0.55rem;
 }
 .close-btn:hover { border-color: var(--err); color: var(--err); }
+
+[hidden] { display: none !important; }
+#stream-image { image-rendering: pixelated; }
+#stream-status { font-size: 0.8rem; color: var(--muted); }
+
+#stream-viewer {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+#stream-viewer .viewer-head, #stream-viewer .meta { flex-shrink: 0; }
+#stream-viewer #stream-image {
+  flex: 1;
+  min-height: 0;
+  height: 0;
+  object-fit: contain;
+}
+
+/* Fill the window below the header, including before any images arrive. */
+body {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+header { flex-shrink: 0; }
+main {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+#controls {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
+#controls > :not(#console) { flex-shrink: 0; }
+#console {
+  min-height: 100px;
+  max-height: none;
+}
+#viewers {
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  grid-auto-rows: 100%;
+  overflow: auto;
+}
+.viewer-card {
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.viewer-card .viewer-head, .viewer-card .meta { flex-shrink: 0; }
+.viewer-card img {
+  flex: 1;
+  min-height: 0;
+  height: 0;
+  object-fit: contain;
+}
+
+.viewer-temperatures { font-size: 0.75rem; font-weight: normal; color: var(--muted); text-transform: none; }
+.viewer-head { gap: 0.5rem; flex-wrap: wrap; }

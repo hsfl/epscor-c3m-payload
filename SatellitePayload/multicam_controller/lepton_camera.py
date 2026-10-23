@@ -25,9 +25,10 @@ THERMAL_QUEUE_SIZE = 20   # Size of frame queue for thermal data
 
 FRAME_CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.POINTER(uvc_frame), ctypes.c_void_p)
 
-STREAM_FRAME_WIDTH = 80   # Downsampled width (160/2)
-STREAM_FRAME_HEIGHT = 60  # Downsampled height (120/2)
-STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 4,800 bytes per frame
+# Match the fixed-size stream protocol used by both Teensys and the GUI.
+STREAM_FRAME_WIDTH = 100
+STREAM_FRAME_HEIGHT = 80
+STREAM_FRAME_SIZE = STREAM_FRAME_WIDTH * STREAM_FRAME_HEIGHT  # 8,000 bytes per frame
 
 
 def is_valid_frame(frame):
@@ -38,9 +39,9 @@ def is_valid_frame(frame):
 
 def downsample_frame(frame_16bit):
     """
-    Downsample 160x120 16-bit thermal frame to 80x60 8-bit for streaming.
+    Downsample 160x120 16-bit thermal frame to 100x80 8-bit for streaming.
 
-    Uses 2x2 block averaging and scales 16-bit values to 8-bit range.
+    Centre-crops to the stream aspect ratio, area-averages, and scales to 8-bit.
     The 16-bit thermal values are in Kelvin*100 (e.g., 29315 = 20°C).
     We map a reasonable temperature range (0-100°C = 27315-37315) to 0-255.
 
@@ -48,7 +49,7 @@ def downsample_frame(frame_16bit):
         frame_16bit: numpy array of shape (120, 160) with uint16 values
 
     Returns:
-        numpy array of shape (60, 80) with uint8 values
+        numpy array of shape (80, 100) with uint8 values
     """
     if frame_16bit is None:
         return None
@@ -58,10 +59,12 @@ def downsample_frame(frame_16bit):
         print(f"Warning: unexpected frame shape {frame_16bit.shape}, expected (120, 160)")
         return None
 
-    # Reshape to (60, 2, 80, 2) to get 2x2 blocks, then average
-    # This groups pixels into 2x2 blocks for averaging
-    reshaped = frame_16bit.reshape(60, 2, 80, 2)
-    averaged = reshaped.mean(axis=(1, 3)).astype(np.float32)
+    # Crop 160x120 to 150x120 so resizing to 100x80 preserves proportions.
+    crop_width = round(frame_16bit.shape[0] * STREAM_FRAME_WIDTH / STREAM_FRAME_HEIGHT)
+    x0 = (frame_16bit.shape[1] - crop_width) // 2
+    cropped = frame_16bit[:, x0:x0 + crop_width].astype(np.float32)
+    averaged = cv2.resize(cropped, (STREAM_FRAME_WIDTH, STREAM_FRAME_HEIGHT),
+                          interpolation=cv2.INTER_AREA)
 
     # Map from Kelvin*100 to 0-255 range
     # Temperature range: 0°C (27315) to 100°C (37315)
